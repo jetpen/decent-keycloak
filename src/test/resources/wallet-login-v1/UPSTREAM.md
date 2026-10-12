@@ -8,4 +8,4 @@ Upstream source paths:
 - `docs/protocol/wallet-login/v1/vectors/valid-basic.json`
 - `docs/protocol/wallet-login/v1/vectors/negative.json`
 
-The GitHub branch has not yet been pushed, so a remote commit SHA for the new vector files is not available. Once ecosystem PR #46 is reviewed/merged, update these vendored bytes and this provenance file to the exact merged commit. The tests verify the local fixture hashes against the copied upstream manifest.
+The vendored upstream vector commit is `ac72c3352b0e6d844689a16ff21bf786711981e1`. The tests verify the local fixture hashes against the copied upstream manifest. After ecosystem PR #46 is reviewed/merged, update these vendored bytes and this provenance file to the exact merge commit if it differs.
