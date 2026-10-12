@@ -1,4 +1,4 @@
-package org.decent.keycloak.wallet;
+package org.decentwallet.keycloak.wallet;
 
 import org.junit.jupiter.api.Test;
 
