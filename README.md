@@ -6,7 +6,7 @@ This repository owns the Keycloak-specific adapter for the approved, provider-ne
 
 ## Current evidence and limits
 
-- Keycloak 26.8.0 provider package: the current worktree's Maven clean package passed 86 tests across 12 suites (0 failures, errors or skips); `git diff --check` passed. Re-run after any source or test edit.
+- Keycloak 26.8.0 provider package: the current worktree's Maven clean package passed 87 tests across 12 suites (0 failures, errors or skips); `git diff --check` passed. The base PR commit has 86 tests; this branch adds a route/CORS response forwarding regression.
 - A fresh Keycloak 26.8.0 image returned 200 for OIDC discovery and the deterministic wallet-route probe through an HTTPS hostname/proxy simulation with `/auth` relative path. Invalid handles returned fail-closed 404; an 8,193-byte POST returned 413 through the streaming resource body limit. This is HTTP dispatch/body-bound evidence only, not a valid pending transaction or login.
 - No disposable realm/client/required flow, compatible wallet app, or configured Identity/Registry is currently running in the container. The sibling `decent-identity` development venv has a CLI entry point, but the Keycloak container does not have that runtime configured or mounted.
 - A separate host-side local acceptance probe used an ephemeral Registry node and synthetic test identity: publish, resolve via a separate CLI client, then resolve through the Java `ProcessIdentityResolver` with the exact UTF-8 identifier and current Ed25519 key. The temporary key and LMDB state were deleted at test exit. This verifies the adapter against host venv dependencies only; it does not qualify the Keycloak container's CLI runtime or an end-to-end login.
