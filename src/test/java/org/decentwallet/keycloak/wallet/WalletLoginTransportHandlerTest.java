@@ -688,6 +688,37 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void signupOccupancyLookupFailureReturnsUnavailableBeforeCreateAndLeavesTransactionPending() throws Exception {
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    byte[] proof = signedProof(issued.challenge(), "mailto:occupancy-outage@example.org", keyPair);
+    var createCalls = new java.util.concurrent.atomic.AtomicInteger();
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return false; }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        throw new IllegalStateException("occupancy lookup unavailable");
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        createCalls.incrementAndGet();
+        return org.mockito.Mockito.mock(org.keycloak.models.UserModel.class);
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+    var result = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+
+    assertEquals(503, result.status());
+    assertEquals(0, createCalls.get());
+    assertTrue(store.load(issued.handle()).isPresent());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  @Test
   void signupProvisioningNonSuccessDoesNotConsumeOrAcceptTransaction() throws Exception {
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());

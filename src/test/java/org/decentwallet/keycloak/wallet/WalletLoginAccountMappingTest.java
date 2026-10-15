@@ -190,6 +190,35 @@ final class WalletLoginAccountMappingTest {
   }
 
   @Test
+  void signupDoesNotProvisionWhenInitialIdentityLookupReturnsNoStream() {
+    String identityId = "mailto:lookup-stream-unavailable@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)).thenReturn(null);
+
+    org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.ensureEnabledUser(users, realm, identityId, true));
+
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).addUser(
+        org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.isNull(),
+        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.eq(true),
+        org.mockito.ArgumentMatchers.eq(true));
+  }
+
+  @Test
+  void signupOccupancyLookupDoesNotTreatUnavailableSearchAsNoExistingMapping() {
+    String identityId = "mailto:occupancy-lookup-unavailable@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)).thenReturn(null);
+
+    org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, identityId));
+  }
+
+  @Test
   void rejectsMissingDuplicateAndDisabledMappings() {
     String identityId = "mailto:Alice@example.org";
     var realm = mock(RealmModel.class);

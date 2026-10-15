@@ -29,7 +29,7 @@ final class WalletLoginAccountMapping {
     List<UserModel> matches;
     try (Stream<UserModel> candidates = users.searchForUserByUserAttributeStream(
         realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-      if (candidates == null) return null;
+      if (candidates == null) throw new IllegalStateException("identity mapping lookup unavailable");
       List<UserModel> scan = candidates
           .filter(java.util.Objects::nonNull)
           .limit(MAX_IDENTITY_CANDIDATES + 1)
@@ -120,12 +120,11 @@ final class WalletLoginAccountMapping {
     if (users == null || realm == null || identityId == null || identityId.isEmpty()) return false;
     try (Stream<UserModel> candidates = users.searchForUserByUserAttributeStream(
         realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-      if (candidates == null) return false;
+      if (candidates == null) throw new IllegalStateException("identity mapping lookup unavailable");
       List<UserModel> scan = candidates.filter(java.util.Objects::nonNull)
           .limit(MAX_IDENTITY_CANDIDATES + 1).toList();
       if (scan.size() > MAX_IDENTITY_CANDIDATES) {
-        LOG.debug("Wallet account mapping lookup failed closed at candidate cap");
-        return false;
+        throw new IllegalStateException("identity mapping lookup unavailable");
       }
       return scan.stream()
           .filter(user -> identityId.equals(
