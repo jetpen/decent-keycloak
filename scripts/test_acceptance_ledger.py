@@ -7,7 +7,7 @@ from pathlib import Path
 README = Path(__file__).parents[1] / "README.md"
 def test_acceptance_ledger_reports_fresh_signup_evidence_and_remaining_gates():
     text = README.read_text()
-    assert "`mvn -o clean package` passed 125 tests across 12 suites" in text
+    assert "`mvn -o clean package` passed 132 tests across 12 suites" in text
     assert "Latest two disposable runs" in text
     assert "462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e" in text
     assert "The first completed all scenarios (exit 0)" in text

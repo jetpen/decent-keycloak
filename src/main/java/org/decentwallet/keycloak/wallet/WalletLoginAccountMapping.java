@@ -17,6 +17,12 @@ final class WalletLoginAccountMapping {
     return ensureEnabledUser(users, realm, identityId, false);
   }
 
+  private static final class IdentityMappingUnavailableException extends IllegalStateException {
+    private IdentityMappingUnavailableException(RuntimeException cause) {
+      super("identity mapping read-back unavailable", cause);
+    }
+  }
+
   static UserModel ensureEnabledUser(UserProvider users, RealmModel realm, String identityId,
       boolean createIfMissing) {
     if (users == null || realm == null || identityId == null || identityId.isEmpty()) return null;
@@ -52,18 +58,24 @@ final class WalletLoginAccountMapping {
       // A concurrent request for the same exact identity may already have
       // inserted the deterministic username and mapping. Adopt only after an
       // independent exact-ID read proves there is one enabled winner.
+      List<UserModel> exactMatches;
       try (Stream<UserModel> rechecked = users.searchForUserByUserAttributeStream(
           realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-        if (rechecked == null) return null;
-        List<UserModel> exactMatches = rechecked.filter(java.util.Objects::nonNull)
+        if (rechecked == null) throw new IllegalStateException("identity mapping read-back unavailable");
+        exactMatches = rechecked.filter(java.util.Objects::nonNull)
             .filter(user -> identityId.equals(
                 user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
             .limit(2).toList();
-        return exactMatches.size() == 1 && exactMatches.getFirst().isEnabled()
-            ? exactMatches.getFirst() : null;
+      } catch (RuntimeException readbackUnavailable) {
+        throw new IllegalStateException("identity mapping read-back unavailable", readbackUnavailable);
       }
+      if (exactMatches.isEmpty()) {
+        throw new IllegalStateException("user provisioning unavailable", concurrentUsernameCreation);
+      }
+      return exactMatches.size() == 1 && exactMatches.getFirst().isEnabled()
+          ? exactMatches.getFirst() : null;
     }
-    if (created == null) return null;
+    if (created == null) throw new IllegalStateException("user provisioning unavailable");
     try {
       created.setSingleAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId);
       created.setEnabled(true);
@@ -75,23 +87,28 @@ final class WalletLoginAccountMapping {
       }
       try (Stream<UserModel> rechecked = users.searchForUserByUserAttributeStream(
           realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-        if (rechecked == null) throw new IllegalStateException("identity mapping read-back unavailable");
+        if (rechecked == null) throw new IdentityMappingUnavailableException(null);
         List<UserModel> exactMatches = rechecked
             .filter(java.util.Objects::nonNull)
             .filter(user -> identityId.equals(
                 user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
             .limit(2)
             .toList();
+        if (exactMatches.isEmpty()) {
+          throw new IdentityMappingUnavailableException(null);
+        }
         if (exactMatches.size() != 1 || !exactMatches.getFirst().isEnabled()
             || !created.getId().equals(exactMatches.getFirst().getId())) {
-          users.removeUser(realm, created);
           return null;
         }
         return exactMatches.getFirst();
+      } catch (RuntimeException readbackUnavailable) {
+        if (readbackUnavailable instanceof IdentityMappingUnavailableException unavailable) throw unavailable;
+        throw new IdentityMappingUnavailableException(readbackUnavailable);
       }
-    } catch (RuntimeException failure) {
-      try { users.removeUser(realm, created); } catch (RuntimeException ignored) { }
-      throw failure;
+    } catch (RuntimeException provisioningFailure) {
+      if (provisioningFailure instanceof IdentityMappingUnavailableException unavailable) throw unavailable;
+      throw new IllegalStateException("user provisioning unavailable", provisioningFailure);
     }
   }
 

@@ -422,7 +422,6 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertEqual(expected, actual)
 
   def test_account_policy_denial_requires_fresh_attribution_and_pending_state(self):
-    request_id = '0123456789abcdef0123456789abcdef'
     attributed = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'])
     unclassified = probe.account_mapping_denial_result(403, 'resolved', [])
     accepted = probe.account_mapping_denial_result(202, 'resolved', [])

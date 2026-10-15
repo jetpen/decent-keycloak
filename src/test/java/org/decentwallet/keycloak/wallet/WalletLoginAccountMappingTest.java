@@ -53,6 +53,85 @@ final class WalletLoginAccountMappingTest {
     verify(created).setLastName("Account");
   }
 
+  @Test
+  void signupProvisioningDoesNotTreatStoreFailureWithNoWinnerAsPolicyDenial() {
+    String identityId = "mailto:no-winner-after-create-failure@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    when(users.addUser(realm, null, "wallet-" + hexDigest(identityId), true, true))
+        .thenThrow(new IllegalStateException("temporary user-store failure"));
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(Stream.empty()).thenThrow(new IllegalStateException("lookup transport unavailable"));
+
+    var thrown = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.ensureEnabledUser(users, realm, identityId, true));
+
+    org.junit.jupiter.api.Assertions.assertEquals("identity mapping read-back unavailable", thrown.getMessage());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).removeUser(org.mockito.ArgumentMatchers.eq(realm),
+        org.mockito.ArgumentMatchers.any(UserModel.class));
+  }
+
+  @Test
+  void signupProvisioningReturnsUnavailableOnIdentityStoreFailureWhenNoExactWinnerExists() {
+    String identityId = "mailto:temporary-database-failure@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    var readbackFailure = new IllegalStateException("identity mapping read-back unavailable");
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(Stream.empty()).thenThrow(readbackFailure);
+    String username = "wallet-" + hexDigest(identityId);
+    when(users.addUser(realm, null, username, true, true))
+        .thenThrow(new IllegalStateException("concurrent username insert won"));
+
+    var thrown = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.ensureEnabledUser(users, realm, identityId, true));
+    org.junit.jupiter.api.Assertions.assertEquals("identity mapping read-back unavailable", thrown.getMessage());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).removeUser(org.mockito.ArgumentMatchers.eq(realm),
+        org.mockito.ArgumentMatchers.any(UserModel.class));
+  }
+
+  @Test
+  void signupProvisioningDoesNotDeleteCreatedUserWhenMappingReadBackFails() {
+    String identityId = "mailto:created-but-unreadable@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    var created = mock(UserModel.class);
+    when(created.getId()).thenReturn("created-id");
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(Stream.empty()).thenThrow(new IllegalStateException("read-back outage"));
+    when(users.addUser(realm, null, "wallet-" + hexDigest(identityId), true, true)).thenReturn(created);
+
+    var thrown = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.ensureEnabledUser(users, realm, identityId, true));
+
+    org.junit.jupiter.api.Assertions.assertEquals("identity mapping read-back unavailable", thrown.getMessage());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).removeUser(realm, created);
+  }
+
+  @Test
+  void signupProvisioningTreatsMissingPostCreateMappingAsUnavailableNotPolicyDenial() {
+    String identityId = "mailto:created-without-mapping@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    var created = mock(UserModel.class);
+    when(created.getId()).thenReturn("created-id");
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(Stream.empty(), Stream.empty());
+    when(users.addUser(realm, null, "wallet-" + hexDigest(identityId), true, true)).thenReturn(created);
+    when(created.isEnabled()).thenReturn(true);
+    when(created.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)).thenReturn(identityId);
+
+    var thrown = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.ensureEnabledUser(users, realm, identityId, true));
+
+    org.junit.jupiter.api.Assertions.assertEquals("identity mapping read-back unavailable", thrown.getMessage());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).removeUser(realm, created);
+  }
+
   private static String hexDigest(String identityId) {
     try {
       return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
