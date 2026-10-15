@@ -1702,9 +1702,14 @@ def signup_wallet_flow(client, key, identifier, container):
   require(signature.returncode == 0 and len(signature.stdout) == 64, 'signup Ed25519 proof signed')
   proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identifier, 'signature': b64url(signature.stdout)}, separators=(',', ':')).encode()
+  admin = admin_token(client, os.environ['WALLET_IT_ADMIN_PASSWORD'])
+  exact_users_before_proof = json.loads(admin_call(client, admin, 'GET',
+      f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
+  existing_exact_users = [user for user in exact_users_before_proof
+      if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
+  require(not existing_exact_users, 'no exact Keycloak account exists before signup proof')
   proof_status, _, _ = wallet.request('POST', signup_locator, proof, {'Content-Type': 'application/json'})
   require(proof_status == 202, 'signup proof provisions exact account before pending consume', proof_status)
-  admin = admin_token(client, os.environ['WALLET_IT_ADMIN_PASSWORD'])
   exact_users = json.loads(admin_call(client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   matched = [user for user in exact_users

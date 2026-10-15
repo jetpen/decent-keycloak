@@ -143,15 +143,9 @@ public final class WalletChallengeAuthenticator implements Authenticator {
       return;
     }
     if (context.getAuthenticationSession() != null
-        && "true".equals(context.getAuthenticationSession().getAuthNote("decent.wallet.user-provisioned"))
-        && context.getUser() != null) {
-      try {
-        context.getSession().users().removeUser(context.getRealm(), context.getUser());
-      } catch (RuntimeException rollbackFailure) {
-        LOG.warn("Signup cleanup after callback failure was incomplete");
-      } finally {
-        context.getAuthenticationSession().removeAuthNote("decent.wallet.user-provisioned");
-      }
+        && context.getAuthenticationSession().getAuthNote("decent.wallet.user-provisioned") != null) {
+      LOG.warn("Ignored legacy signup provisioning marker after pending-transaction consume");
+      context.getAuthenticationSession().removeAuthNote("decent.wallet.user-provisioned");
     }
     // The wallet POST resolved the current Identity key before nonce consumption.
     // This callback consumes the accepted receipt and re-checks the local mapping.
@@ -169,27 +163,17 @@ public final class WalletChallengeAuthenticator implements Authenticator {
           auth.getRedirectUri(), auth.getAuthNote("decent.wallet.origin"));
       var visibleReceipt = store.getAccepted(handle, binding);
       if (visibleReceipt.isEmpty()) { failClosed(context); return; }
-      // Resolve mapping before consuming the callback gate so a missing or
-      // temporarily unavailable user does not strand the accepted receipt.
+      // Signup account creation happens after a valid wallet proof and before
+      // the pending transaction's atomic consume. The callback may only resolve
+      // that exact mapped user; provisioning here would occur after consumption.
       UserModel user = WalletLoginAccountMapping.findUniqueEnabledUser(
           context.getSession().users(), context.getRealm(), visibleReceipt.get().identityId());
-      if (user == null && visibleReceipt.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP
-          && context.getRealm().isRegistrationAllowed()) {
-        user = WalletLoginAccountMapping.ensureEnabledUser(context.getSession().users(), context.getRealm(),
-            visibleReceipt.get().identityId(), true);
-        if (user != null) auth.setAuthNote("decent.wallet.user-provisioned", "true");
-      }
       if (user == null || !user.isEnabled()) { failClosed(context); return; }
-      if (visibleReceipt.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP) {
-        if (!WalletLoginAccountMapping.hasUniqueEnabledMapping(context.getSession().users(),
-            context.getRealm(), visibleReceipt.get().identityId())) {
-          if ("true".equals(auth.getAuthNote("decent.wallet.user-provisioned"))) {
-            context.getSession().users().removeUser(context.getRealm(), user);
-            auth.removeAuthNote("decent.wallet.user-provisioned");
-          }
-          failClosed(context);
-          return;
-        }
+      if (visibleReceipt.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP
+          && !WalletLoginAccountMapping.hasUniqueEnabledMapping(context.getSession().users(),
+              context.getRealm(), visibleReceipt.get().identityId())) {
+        failClosed(context);
+        return;
       }
       // Set the already-validated user before the one-use gate; failures here
       // leave the callback retryable and never mark the authentication execution successful.

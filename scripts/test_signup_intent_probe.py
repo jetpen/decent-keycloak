@@ -276,12 +276,26 @@ class SignupIntentProbeTest(unittest.TestCase):
       with self.assertRaises(ValueError):
         probe.signup_profile_submission(html_body, 'https://idp.example:18886/auth', 'demo', values)
 
+  def test_signup_callback_action_never_provisions_or_deletes_a_post_consume_user(self):
+    source = (Path(__file__).parents[1] / 'src/main/java/org/decentwallet/keycloak/wallet/'
+        'WalletChallengeAuthenticator.java').read_text()
+    start = source.index('public void action(AuthenticationFlowContext context)')
+    action = source[start:source.index('static boolean isSingleExactHttpsRedirect', start)]
+    self.assertIn('WalletLoginAccountMapping.findUniqueEnabledUser(', action)
+    self.assertNotIn('WalletLoginAccountMapping.ensureEnabledUser(', action)
+    self.assertNotIn('removeUser(', action)
+    self.assertIn('store.getAccepted(handle, binding)', action)
+    self.assertLess(action.index('store.getAccepted(handle, binding)'),
+        action.index('store.takeAccepted(handle, binding)'))
+
   def test_signup_requires_exact_mapping_readback_and_pkce_oidc_completion(self):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     start = source.index("def signup_wallet_flow(")
     end = source.index("\ndef missing_identity_flow", start)
     body = source[start:end]
     for expected in (
+        "no exact Keycloak account exists before signup proof",
+        "signup proof provisions exact account before pending consume",
         "len(matched) == 1 and matched[0].get('enabled')",
         "polled == 200",
         "status_body.get('status') == 'accepted'",
@@ -290,7 +304,6 @@ class SignupIntentProbeTest(unittest.TestCase):
         "token_status == 200",
         "claims.get('sub') == matched[0].get('id')",
         "claims.get('decent_identity_id') == identifier",
-        "signup proof provisions exact account before pending consume",
     ):
       self.assertIn(expected, body)
 
