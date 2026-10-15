@@ -26,13 +26,13 @@ public final class WalletChallengeAuthenticatorFactory implements AuthenticatorF
     return new AuthenticationExecutionModel.Requirement[] {AuthenticationExecutionModel.Requirement.REQUIRED};
   }
   @Override public boolean isUserSetupAllowed() { return false; }
-  @Override public String getHelpText() { return "Starts the provider-hosted decent-wallet-login-v1 flow. Configure trusted-origins and the realm's decent.wallet.* transport/Identity settings."; }
+  @Override public String getHelpText() { return "Starts the provider-hosted decent-wallet-login-v1 flow. Configure trusted-origins and the realm's decent.wallet.* transport/Identity settings, including decent.wallet.site-name."; }
   @Override public List<ProviderConfigProperty> getConfigProperties() {
     ProviderConfigProperty origins = new ProviderConfigProperty();
     origins.setName("trusted-origins");
-    origins.setLabel("Trusted HTTPS origins");
+    origins.setLabel("Trusted HTTPS origin");
     origins.setType(ProviderConfigProperty.TEXT_TYPE);
-    origins.setHelpText("Comma-separated exact HTTPS origins. One must match the Keycloak public base origin.");
+    origins.setHelpText("One exact HTTPS Keycloak public origin, including port if non-default. It must match trusted hostname/proxy configuration.");
     return List.of(origins);
   }
   @Override public void init(org.keycloak.Config.Scope config) {}

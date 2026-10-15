@@ -15,12 +15,14 @@ import org.keycloak.models.SingleUseObjectProvider;
 /** Stores the pending state for one provider-hosted wallet proof transaction. */
 public final class WalletLoginTransactionStore {
   public static final long TRANSACTION_LIFESPAN_SECONDS = 300;
+  public enum Intent { LOGIN, SIGNUP }
   private static final String NOTE_REALM = "realm_id";
   private static final String NOTE_CLIENT = "client_id";
   private static final String NOTE_ROOT_SESSION = "root_session_id";
   private static final String NOTE_TAB = "tab_id";
   private static final String NOTE_REDIRECT = "redirect_uri";
   private static final String NOTE_ORIGIN = "canonical_origin";
+  private static final String NOTE_INTENT = "intent";
   private static final String NOTE_CHALLENGE = "challenge";
   private static final String NOTE_CSRF = "csrf_token";
   private static final String NOTE_EXPIRES_AT = "expires_at_epoch_second";
@@ -30,7 +32,7 @@ public final class WalletLoginTransactionStore {
   private static final String LOCK_PREFIX = "decent-wallet-login-v1:abuse-lock:";
   private static final String IDENTITY_LOOKUP_PREFIX = "decent-wallet-login-v1:identity-lookup:browser-client:";
   private static final int MAX_INVALID_ATTEMPTS = 5;
-  private static final long IDENTITY_LOOKUP_LEASE_SECONDS = 20;
+  private static final long IDENTITY_LOOKUP_COOLDOWN_SECONDS = 2;
   private static final String NOTE_PROOF_DIGEST = "proof_digest";
   private static final String NOTE_IDENTITY = "identity_id";
   private static final String NOTE_PUBLIC_KEY = "public_key";
@@ -50,7 +52,12 @@ public final class WalletLoginTransactionStore {
   }
 
   public IssuedTransaction issue(Binding binding) {
+    return issue(binding, Intent.LOGIN);
+  }
+
+  public IssuedTransaction issue(Binding binding, Intent intent) {
     validateBinding(binding);
+    Objects.requireNonNull(intent, "wallet transaction intent is required");
     if (singleUseObjects.contains(browserClientLockKey(binding))) {
       throw new IllegalStateException("wallet browser/client admission is temporarily locked");
     }
@@ -67,6 +74,7 @@ public final class WalletLoginTransactionStore {
     notes.put(NOTE_TAB, binding.tabId());
     notes.put(NOTE_REDIRECT, binding.redirectUri());
     notes.put(NOTE_ORIGIN, binding.canonicalOrigin());
+    notes.put(NOTE_INTENT, intent.name());
     notes.put(NOTE_CHALLENGE, challenge);
     notes.put(NOTE_CSRF, csrf);
     java.time.Instant expiresAt = clock.instant().plusSeconds(TRANSACTION_LIFESPAN_SECONDS);
@@ -99,10 +107,11 @@ public final class WalletLoginTransactionStore {
       Binding binding = new Binding(notes.get(NOTE_REALM), notes.get(NOTE_CLIENT),
           notes.get(NOTE_ROOT_SESSION), notes.get(NOTE_TAB), notes.get(NOTE_REDIRECT), notes.get(NOTE_ORIGIN));
       validateBinding(binding);
+      Intent intent = parseIntent(notes.get(NOTE_INTENT));
       String challenge = notes.get(NOTE_CHALLENGE);
       String csrfToken = notes.get(NOTE_CSRF);
       if (!validToken(challenge) || !validToken(csrfToken)) return Optional.empty();
-      return Optional.of(new PendingTransaction(binding, challenge, csrfToken));
+      return Optional.of(new PendingTransaction(binding, challenge, csrfToken, intent));
     } catch (IllegalArgumentException ex) {
       return Optional.empty();
     }
@@ -135,8 +144,13 @@ public final class WalletLoginTransactionStore {
 
   public void markAccepted(String handle, Binding binding, String proofDigest,
       String identityId, String publicKey, String csrfToken) {
+    markAccepted(handle, binding, proofDigest, identityId, publicKey, csrfToken, Intent.LOGIN);
+  }
+
+  public void markAccepted(String handle, Binding binding, String proofDigest,
+      String identityId, String publicKey, String csrfToken, Intent intent) {
     if (!validHandle(handle) || binding == null || blank(proofDigest) || blank(identityId)
-        || blank(publicKey) || !validToken(csrfToken)) {
+        || blank(publicKey) || !validToken(csrfToken) || intent == null) {
       throw new IllegalArgumentException("accepted wallet transaction fields are required");
     }
     validateBinding(binding);
@@ -148,6 +162,7 @@ public final class WalletLoginTransactionStore {
     receipt.put(NOTE_TAB, binding.tabId());
     receipt.put(NOTE_REDIRECT, binding.redirectUri());
     receipt.put(NOTE_ORIGIN, binding.canonicalOrigin());
+    receipt.put(NOTE_INTENT, intent.name());
     receipt.put(NOTE_PROOF_DIGEST, proofDigest);
     receipt.put(NOTE_IDENTITY, identityId);
     receipt.put(NOTE_PUBLIC_KEY, publicKey);
@@ -183,6 +198,11 @@ public final class WalletLoginTransactionStore {
     return gate != null && "pending".equals(gate.get(NOTE_STATUS));
   }
 
+  private static Intent parseIntent(String value) {
+    try { return Intent.valueOf(value); }
+    catch (RuntimeException invalid) { throw new IllegalArgumentException("wallet login intent is invalid"); }
+  }
+
   private static String callbackKey(String handle) {
     return CALLBACK_PREFIX + hex(sha256(handle.getBytes(StandardCharsets.US_ASCII)));
   }
@@ -197,7 +217,7 @@ public final class WalletLoginTransactionStore {
     if (!validAcceptedReceipt(retainedReceipt, expectedBinding)) return Optional.empty();
     return Optional.of(new AcceptedTransaction(retainedReceipt.get(NOTE_IDENTITY),
         retainedReceipt.get(NOTE_PUBLIC_KEY), retainedReceipt.get(NOTE_PROOF_DIGEST),
-        decodeBinding(retainedReceipt)));
+        decodeBinding(retainedReceipt), parseIntent(retainedReceipt.get(NOTE_INTENT))));
   }
 
   public Optional<AcceptedTransaction> peekAccepted(String handle) {
@@ -205,7 +225,7 @@ public final class WalletLoginTransactionStore {
     Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
     if (receipt == null || !validAcceptedReceipt(receipt, null)) return Optional.empty();
     return Optional.of(new AcceptedTransaction(receipt.get(NOTE_IDENTITY), receipt.get(NOTE_PUBLIC_KEY),
-        receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt)));
+        receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT))));
   }
 
   public boolean callbackGateAvailable(String handle, Binding expectedBinding) {
@@ -228,7 +248,7 @@ public final class WalletLoginTransactionStore {
     if (!validAcceptedReceipt(receipt, expectedBinding)) return Optional.empty();
     try {
       return Optional.of(new AcceptedTransaction(receipt.get(NOTE_IDENTITY), receipt.get(NOTE_PUBLIC_KEY),
-          receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt)));
+          receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT))));
     } catch (RuntimeException ex) {
       return Optional.empty();
     }
@@ -240,6 +260,7 @@ public final class WalletLoginTransactionStore {
         || blank(receipt.get(NOTE_PROOF_DIGEST))
         || blank(receipt.get(NOTE_IDENTITY)) || blank(receipt.get(NOTE_PUBLIC_KEY))) return false;
     try {
+      parseIntent(receipt.get(NOTE_INTENT));
       Binding actual = decodeBinding(receipt);
       return expectedBinding == null || actual.equals(expectedBinding);
     } catch (RuntimeException ex) {
@@ -262,7 +283,8 @@ public final class WalletLoginTransactionStore {
   private static boolean completeBinding(Map<String, String> notes) {
     return notes.containsKey(NOTE_REALM) && notes.containsKey(NOTE_CLIENT)
         && notes.containsKey(NOTE_ROOT_SESSION) && notes.containsKey(NOTE_TAB)
-        && notes.containsKey(NOTE_REDIRECT) && notes.containsKey(NOTE_ORIGIN);
+        && notes.containsKey(NOTE_REDIRECT) && notes.containsKey(NOTE_ORIGIN)
+        && notes.containsKey(NOTE_INTENT);
   }
 
   public boolean invalidAttemptLimitReached(String handle) {
@@ -325,7 +347,7 @@ public final class WalletLoginTransactionStore {
     Optional<PendingTransaction> pending = load(handle);
     if (pending.isEmpty() || invalidAttemptLimitReached(handle)) return false;
     return singleUseObjects.putIfAbsent(identityLookupScopeKey(pending.get().binding()),
-        IDENTITY_LOOKUP_LEASE_SECONDS);
+        IDENTITY_LOOKUP_COOLDOWN_SECONDS);
   }
 
   /** Promotes the shared resolver admission key to an emergency block if a process cannot be killed. */
@@ -358,10 +380,11 @@ public final class WalletLoginTransactionStore {
       Binding binding = new Binding(notes.get(NOTE_REALM), notes.get(NOTE_CLIENT),
           notes.get(NOTE_ROOT_SESSION), notes.get(NOTE_TAB), notes.get(NOTE_REDIRECT), notes.get(NOTE_ORIGIN));
       validateBinding(binding);
+      Intent intent = parseIntent(notes.get(NOTE_INTENT));
       String challenge = notes.get(NOTE_CHALLENGE);
       String csrf = notes.get(NOTE_CSRF);
       if (!validToken(challenge) || !validToken(csrf)) return Optional.empty();
-      return Optional.of(new PendingTransaction(binding, challenge, csrf));
+      return Optional.of(new PendingTransaction(binding, challenge, csrf, intent));
     } catch (IllegalArgumentException ex) {
       return Optional.empty();
     }
@@ -371,7 +394,7 @@ public final class WalletLoginTransactionStore {
     return notes.containsKey(NOTE_REALM) && notes.containsKey(NOTE_CLIENT)
         && notes.containsKey(NOTE_ROOT_SESSION) && notes.containsKey(NOTE_TAB)
         && notes.containsKey(NOTE_REDIRECT) && notes.containsKey(NOTE_ORIGIN)
-        && notes.containsKey(NOTE_CHALLENGE) && notes.containsKey(NOTE_CSRF)
+        && notes.containsKey(NOTE_INTENT) && notes.containsKey(NOTE_CHALLENGE) && notes.containsKey(NOTE_CSRF)
         && notes.containsKey(NOTE_EXPIRES_AT);
   }
 
@@ -431,6 +454,15 @@ public final class WalletLoginTransactionStore {
   public record Binding(String realmId, String clientId, String rootSessionId, String tabId,
       String redirectUri, String canonicalOrigin) {}
   public record IssuedTransaction(String handle, String challenge, String csrfToken, java.time.Instant expiresAt) {}
-  public record PendingTransaction(Binding binding, String challenge, String csrfToken) {}
-  public record AcceptedTransaction(String identityId, String publicKey, String proofDigest, Binding binding) {}
+  public record PendingTransaction(Binding binding, String challenge, String csrfToken, Intent intent) {
+    public PendingTransaction(Binding binding, String challenge, String csrfToken) {
+      this(binding, challenge, csrfToken, Intent.LOGIN);
+    }
+  }
+  public record AcceptedTransaction(String identityId, String publicKey, String proofDigest,
+      Binding binding, Intent intent) {
+    public AcceptedTransaction(String identityId, String publicKey, String proofDigest, Binding binding) {
+      this(identityId, publicKey, proofDigest, binding, Intent.LOGIN);
+    }
+  }
 }

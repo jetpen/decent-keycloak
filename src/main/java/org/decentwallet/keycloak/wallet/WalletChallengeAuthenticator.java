@@ -13,6 +13,8 @@ public final class WalletChallengeAuthenticator implements Authenticator {
   private static final org.jboss.logging.Logger LOG =
       org.jboss.logging.Logger.getLogger(WalletChallengeAuthenticator.class);
   private static final String TRUSTED_ORIGINS = "trusted-origins";
+  private static final String SIGNUP_INTENT_ATTRIBUTE = "decent_wallet_signup_intent";
+  private static final String SIGNUP_AUTH_NOTE = "decent.wallet.intent";
   static final String IDENTITY_ATTRIBUTE = "decent_identity_id";
   private final java.util.function.Supplier<WalletLoginTransactionStore> transactionStores;
 
@@ -34,7 +36,18 @@ public final class WalletChallengeAuthenticator implements Authenticator {
     try {
       var auth = context.getAuthenticationSession();
       var authSession = auth;
-      var client = authSession == null ? null : authSession.getClient();
+      if (authSession == null) {
+        failClosed(context);
+        return;
+      }
+      boolean signupIntent = "signup".equals(authSession.getClientNote(SIGNUP_AUTH_NOTE));
+      if (signupIntent) authSession.removeClientNote(SIGNUP_AUTH_NOTE);
+      if (signupIntent) authSession.setAuthNote(SIGNUP_AUTH_NOTE, "signup");
+      if (signupIntent && !context.getRealm().isRegistrationAllowed()) {
+        failClosed(context);
+        return;
+      }
+      var client = authSession.getClient();
       var realm = context.getRealm();
       if (authSession == null || client == null || realm == null || !client.isEnabled()
           || !client.isStandardFlowEnabled()) {
@@ -48,9 +61,17 @@ public final class WalletChallengeAuthenticator implements Authenticator {
       }
       String configuredOrigins = context.getAuthenticatorConfig() == null
           ? null : context.getAuthenticatorConfig().getConfig().get(TRUSTED_ORIGINS);
+      if (configuredOrigins == null || configuredOrigins.isBlank()
+          || configuredOrigins.split(",").length != 1) {
+        throw new IllegalArgumentException("one trusted HTTPS origin must be configured");
+      }
+      String siteName = realm.getAttribute(WalletLoginTransportResourceFactory.KEY_SITE_LABEL);
       java.net.URI base = context.getSession().getContext().getUri().getBaseUri();
-      String baseOrigin = base.getScheme() + "://" + base.getRawAuthority();
-      String origin = canonicalOrigin(baseOrigin, configuredOrigins);
+      String origin = canonicalOrigin(base, configuredOrigins);
+      if (siteName == null || siteName.isBlank()) {
+        failClosed(context);
+        return;
+      }
       String rootSessionId = authSession.getParentSession().getId();
       String tabId = authSession.getTabId();
       if (rootSessionId == null || tabId == null) {
@@ -59,12 +80,17 @@ public final class WalletChallengeAuthenticator implements Authenticator {
       }
       var binding = new WalletLoginTransactionStore.Binding(
           realm.getId(), client.getId(), rootSessionId, tabId, redirectUri, origin);
-      var issued = store.issue(binding);
+      var issued = store.issue(binding, signupIntent
+          ? WalletLoginTransactionStore.Intent.SIGNUP : WalletLoginTransactionStore.Intent.LOGIN);
       auth.setAuthNote("decent.wallet.handle", issued.handle());
       auth.setAuthNote("decent.wallet.client-id", client.getClientId());
       auth.setAuthNote("decent.wallet.origin", origin);
       auth.setAuthNote("decent.wallet.redirect_uri", redirectUri);
-      var callback = context.getRefreshExecutionUrl();
+      String accessCode = context.generateAccessCode();
+      auth.setAction(org.keycloak.sessions.AuthenticationSessionModel.Action.AUTHENTICATE.name());
+      auth.setAuthNote(org.keycloak.authentication.AuthenticationProcessor.CURRENT_FLOW_PATH,
+          org.keycloak.services.resources.LoginActionsService.AUTHENTICATE_PATH);
+      var callback = context.getActionUrl(accessCode);
       if (callback == null) throw new IllegalStateException("Keycloak execution callback unavailable");
       auth.setAuthNote("decent.wallet.callback", callback.toASCIIString());
       String resourceRoot = "realms/" + context.getRealm().getName() + "/"
@@ -72,10 +98,11 @@ public final class WalletChallengeAuthenticator implements Authenticator {
       String statusQuery = "?client_id=" + java.net.URLEncoder.encode(client.getClientId(),
           java.nio.charset.StandardCharsets.UTF_8) + "&tab_id=" + java.net.URLEncoder.encode(tabId,
           java.nio.charset.StandardCharsets.UTF_8);
-      java.net.URI statusUri = base.resolve(resourceRoot + "/" + issued.handle() + "/status" + statusQuery);
+      java.net.URI statusUri = base.resolve(resourceRoot + "/" + issued.handle() + "/status"
+          + statusQuery);
       var response = context.form()
           .setAuthenticationSession(authSession)
-          .setClientSessionCode(context.generateAccessCode())
+          .setClientSessionCode(accessCode)
           .setExecution(context.getExecution().getId())
           .setAuthContext(context)
           .setActionUri(callback)
@@ -87,18 +114,45 @@ public final class WalletChallengeAuthenticator implements Authenticator {
           .setAttribute("walletStatusUri", statusUri.toASCIIString())
           .setAttribute("walletChallengeLocator", WalletLoginLocator.create(issued.handle(), base, context.getRealm().getName()))
           .setAttribute("walletOriginLabel", origin)
+          .setAttribute("walletSiteLabel", siteName.trim())
           .setAttribute("walletExpiresAt", issued.expiresAt().toString())
+          .setAttribute("walletIntent", signupIntent ? "signup" : "login")
           .setResponseHeader("Cache-Control", "no-store")
           .setResponseHeader("Referrer-Policy", "no-referrer")
           .createForm("wallet-login.ftl");
       context.challenge(response);
     } catch (RuntimeException failure) {
+      LOG.error("Wallet challenge rendering failed", failure);
       failClosed(context);
     }
   }
 
   @Override
   public void action(AuthenticationFlowContext context) {
+    var initialAuthSession = context.getAuthenticationSession();
+    if (initialAuthSession != null && context.getHttpRequest() != null
+        && "POST".equals(context.getHttpRequest().getHttpMethod())
+        && context.getHttpRequest().getDecodedFormParameters().containsKey("wallet_intent")) {
+      var values = context.getHttpRequest().getDecodedFormParameters().get("wallet_intent");
+      if (values != null && values.size() == 1 && "signup".equals(values.getFirst())) {
+        initialAuthSession.setClientNote(SIGNUP_AUTH_NOTE, "signup");
+        context.resetFlow(() -> initialAuthSession.setClientNote(SIGNUP_AUTH_NOTE, "signup"));
+        return;
+      }
+      failClosed(context);
+      return;
+    }
+    if (context.getAuthenticationSession() != null
+        && "true".equals(context.getAuthenticationSession().getAuthNote("decent.wallet.user-provisioned"))
+        && context.getUser() != null) {
+      try {
+        context.getSession().users().removeUser(context.getRealm(), context.getUser());
+      } catch (RuntimeException rollbackFailure) {
+        LOG.warn("Signup cleanup after callback failure was incomplete");
+      } finally {
+        context.getAuthenticationSession().removeAuthNote("decent.wallet.user-provisioned");
+      }
+    }
     // The wallet POST resolved the current Identity key before nonce consumption.
     // This callback consumes the accepted receipt and re-checks the local mapping.
     try {
@@ -119,7 +173,24 @@ public final class WalletChallengeAuthenticator implements Authenticator {
       // temporarily unavailable user does not strand the accepted receipt.
       UserModel user = WalletLoginAccountMapping.findUniqueEnabledUser(
           context.getSession().users(), context.getRealm(), visibleReceipt.get().identityId());
+      if (user == null && visibleReceipt.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP
+          && context.getRealm().isRegistrationAllowed()) {
+        user = WalletLoginAccountMapping.ensureEnabledUser(context.getSession().users(), context.getRealm(),
+            visibleReceipt.get().identityId(), true);
+        if (user != null) auth.setAuthNote("decent.wallet.user-provisioned", "true");
+      }
       if (user == null || !user.isEnabled()) { failClosed(context); return; }
+      if (visibleReceipt.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP) {
+        if (!WalletLoginAccountMapping.hasUniqueEnabledMapping(context.getSession().users(),
+            context.getRealm(), visibleReceipt.get().identityId())) {
+          if ("true".equals(auth.getAuthNote("decent.wallet.user-provisioned"))) {
+            context.getSession().users().removeUser(context.getRealm(), user);
+            auth.removeAuthNote("decent.wallet.user-provisioned");
+          }
+          failClosed(context);
+          return;
+        }
+      }
       // Set the already-validated user before the one-use gate; failures here
       // leave the callback retryable and never mark the authentication execution successful.
       auth.setAuthenticatedUser(user);
@@ -145,34 +216,25 @@ public final class WalletChallengeAuthenticator implements Authenticator {
     }
   }
 
-  private static String canonicalOrigin(String baseOrigin, String configuredOrigins) {
+  private static String canonicalOrigin(java.net.URI base, String configuredOrigins) {
     if (configuredOrigins == null || configuredOrigins.isBlank()) {
       throw new IllegalArgumentException("trusted wallet-login origins are not configured");
     }
-    java.net.URI base = java.net.URI.create(baseOrigin);
-    if (!"https".equalsIgnoreCase(base.getScheme()) || base.getHost() == null) {
-      throw new IllegalArgumentException("Keycloak base URL must be HTTPS");
-    }
-    String selected = null;
-    for (String item : configuredOrigins.split(",")) {
-      String candidate = item.trim();
-      if (candidate.isEmpty()) continue;
-      java.net.URI uri = java.net.URI.create(candidate);
-      if (!uri.isAbsolute() || !"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null
-          || uri.getRawAuthority().contains("@") || uri.getRawPath() != null && !uri.getRawPath().isEmpty()
-          || uri.getRawQuery() != null || uri.getRawFragment() != null) {
-        throw new IllegalArgumentException("trusted origin entries must be exact HTTPS origins");
-      }
-      String normalized = "https://" + uri.getRawAuthority().toLowerCase(java.util.Locale.ROOT);
-      if (normalized.equals("https://" + base.getRawAuthority().toLowerCase(java.util.Locale.ROOT))) selected = normalized;
-    }
-    if (selected == null) throw new IllegalArgumentException("Keycloak HTTPS origin is not allowlisted");
-    return selected;
+    String baseOrigin = WalletLoginTransportHandler.normalizeOrigin(
+        base.getScheme() + "://" + base.getRawAuthority());
+    boolean allowlisted = java.util.Arrays.stream(configuredOrigins.split(","))
+        .map(String::trim)
+        .filter(candidate -> !candidate.isEmpty())
+        .map(WalletLoginTransportHandler::normalizeOrigin)
+        .anyMatch(baseOrigin::equals);
+    if (!allowlisted) throw new IllegalArgumentException("Keycloak HTTPS origin is not allowlisted");
+    return baseOrigin;
   }
 
   private static void clearWalletAuthNotes(org.keycloak.sessions.AuthenticationSessionModel auth) {
     for (String note : java.util.List.of("decent.wallet.handle", "decent.wallet.client-id",
-        "decent.wallet.origin", "decent.wallet.redirect_uri", "decent.wallet.callback")) {
+        "decent.wallet.origin", "decent.wallet.redirect_uri", "decent.wallet.callback",
+        "decent.wallet.intent", "decent.wallet.user-provisioned")) {
       try { auth.removeAuthNote(note); }
       catch (RuntimeException cleanupFailure) { LOG.warn("Unable to clear a completed wallet-login auth note"); }
     }

@@ -110,22 +110,27 @@ final class WalletLoginTransactionStoreTest {
       for (var attempt : attempts) if (attempt.get()) winners++;
       assertEquals(1, winners);
       assertFalse(store.tryAcquireIdentityLookup(issued.handle()));
-      assertEquals(20, provider.lastPutLifespan.get());
+      assertEquals(2, provider.lastPutLifespan.get());
     } finally {
       pool.shutdownNow();
     }
   }
 
   @Test
-  void identityLookupWindowSerializesSiblingTransactionsForOneBrowserClient() {
-    var store = new WalletLoginTransactionStore(new MemorySingleUseStore(), new SecureRandom(), Clock.systemUTC());
+  void identityLookupEmergencyPromotionSurvivesAStaleOwnerReleasingItsWindow() {
+    var provider = new MemorySingleUseStore();
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
     var first = store.issue(BINDING);
     var siblingBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id", "root-session-id",
         "sibling-tab", "https://site.example/callback", "https://idp.example");
     var sibling = store.issue(siblingBinding);
 
     assertTrue(store.tryAcquireIdentityLookup(first.handle()));
+    store.blockIdentityLookups(first.handle(), BINDING);
+
     assertFalse(store.tryAcquireIdentityLookup(sibling.handle()));
+    assertTrue(store.load(sibling.handle()).isPresent());
+    assertEquals(300, provider.lifespanForKeyStartingWith("decent-wallet-login-v1:identity-lookup:"));
   }
 
   @Test
@@ -184,10 +189,17 @@ final class WalletLoginTransactionStoreTest {
   private static final class MemorySingleUseStore implements SingleUseObjectProvider {
     private final Map<String, Map<String, String>> entries = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.List<String> putIfAbsentKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> lifespans = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong lastPutLifespan = new AtomicLong();
+
+    long lifespanForKeyStartingWith(String prefix) {
+      return lifespans.entrySet().stream().filter(entry -> entry.getKey().startsWith(prefix))
+          .map(Map.Entry::getValue).findFirst().orElse(-1L);
+    }
 
     @Override public void put(String key, long lifespanSeconds, Map<String, String> notes) {
       lastPutLifespan.set(lifespanSeconds);
+      lifespans.put(key, lifespanSeconds);
       entries.put(key, new HashMap<>(notes));
     }
     @Override public Map<String, String> get(String key) {
@@ -206,6 +218,7 @@ final class WalletLoginTransactionStoreTest {
     @Override public boolean putIfAbsent(String key, long lifespanSeconds) {
       lastPutLifespan.set(lifespanSeconds);
       putIfAbsentKeys.add(key);
+      lifespans.putIfAbsent(key, lifespanSeconds);
       return entries.putIfAbsent(key, new HashMap<>()) == null;
     }
     @Override public boolean contains(String key) { return entries.containsKey(key); }

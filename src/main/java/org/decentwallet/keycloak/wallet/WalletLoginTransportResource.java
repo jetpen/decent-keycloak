@@ -27,17 +27,24 @@ public final class WalletLoginTransportResource implements RealmResourceProvider
   private WalletLoginTransportHandler handler;
   private String idpOrigin;
   private String walletOrigin;
+  private boolean acceptSignup;
+  private java.util.function.Function<KeycloakSession, AuthenticationSessionManager>
+      authenticationSessionManagerFactory = AuthenticationSessionManager::new;
 
-  private UriInfo uriInfo() { return uriInfo; }
+  private UriInfo uriInfo() {
+    return uriInfo != null ? uriInfo : session.getContext().getUri();
+  }
 
   private String walletOrigin() { return walletOrigin; }
 
   public WalletLoginTransportResource() { }
 
-  void configure(KeycloakSession session, WalletLoginTransportHandler handler, String idpOrigin) {
+  void configure(KeycloakSession session, WalletLoginTransportHandler handler, String idpOrigin,
+      boolean acceptSignup) {
     this.session = session;
     this.handler = handler;
     this.idpOrigin = idpOrigin;
+    this.acceptSignup = acceptSignup;
     this.walletOrigin = session.getContext().getRealm().getAttribute(
         WalletLoginTransportResourceFactory.KEY_WALLET_ORIGIN);
   }
@@ -76,6 +83,42 @@ public final class WalletLoginTransportResource implements RealmResourceProvider
       @HeaderParam("Content-Type") String contentType,
       @HeaderParam("X-Decent-CSRF") String csrf,
       InputStream body) {
+    WalletLoginTransactionStore.Intent intent = signupIntentForBoundTransaction(handle);
+    return processTransactionPost(handle, origin, fetchSite, fetchMode, fetchDest,
+        contentType, csrf, body, intent);
+  }
+
+  private WalletLoginTransactionStore.Intent signupIntentForBoundTransaction(String handle) {
+    var realm = session.getContext().getRealm();
+    if (realm == null || uriInfo() == null) return null;
+    String requestedClientId = uriInfo().getQueryParameters().getFirst("client_id");
+    String tabId = uriInfo().getQueryParameters().getFirst("tab_id");
+    if (requestedClientId == null || tabId == null) return null;
+    var client = realm.getClientByClientId(requestedClientId);
+    if (client == null) return null;
+    var auth = authenticationSessionManagerFactory.apply(session)
+        .getCurrentAuthenticationSession(realm, client, tabId);
+    if (auth == null || auth.getClient() == null || auth.getParentSession() == null
+        || !client.getId().equals(auth.getClient().getId()) || !tabId.equals(auth.getTabId())
+        || !requestedClientId.equals(auth.getAuthNote("decent.wallet.client-id"))
+        || !handle.equals(auth.getAuthNote("decent.wallet.handle"))
+        || !idpOrigin.equals(auth.getAuthNote("decent.wallet.origin"))) return null;
+    String redirect = auth.getAuthNote("decent.wallet.redirect_uri");
+    if (redirect == null || !redirect.equals(auth.getRedirectUri())) return null;
+    WalletLoginTransactionStore.Binding binding = new WalletLoginTransactionStore.Binding(
+        realm.getId(), client.getId(), auth.getParentSession().getId(), auth.getTabId(),
+        redirect, auth.getAuthNote("decent.wallet.origin"));
+    var pending = handler.pendingTransaction(handle, binding);
+    if (pending == null || pending.intent() != WalletLoginTransactionStore.Intent.SIGNUP
+        || !realm.isRegistrationAllowed()) return null;
+    return WalletLoginTransactionStore.Intent.SIGNUP;
+  }
+
+  private Response processTransactionPost(String handle, String origin, String fetchSite,
+      String fetchMode, String fetchDest, String contentType, String csrf,
+      InputStream body, WalletLoginTransactionStore.Intent expectedIntent) {
+    if (expectedIntent == WalletLoginTransactionStore.Intent.SIGNUP && !acceptSignup) return responseWithCors(
+        WalletLoginTransportHandler.HttpResult.empty(403), origin);
     final byte[] boundedBody;
     try {
       boundedBody = readBoundedBody(body);
@@ -86,7 +129,7 @@ public final class WalletLoginTransportResource implements RealmResourceProvider
       return responseWithCors(WalletLoginTransportHandler.HttpResult.empty(413), origin);
     }
     return responseWithCors(handler.submitProof(handle, origin, fetchSite, fetchMode, fetchDest,
-        contentType, csrf, boundedBody, idpOrigin), origin);
+        contentType, csrf, boundedBody, idpOrigin, expectedIntent), origin);
   }
 
   @GET
@@ -105,7 +148,7 @@ public final class WalletLoginTransportResource implements RealmResourceProvider
     if (requestedClientId == null || tabId == null) return notFound();
     var client = realm.getClientByClientId(requestedClientId);
     if (client == null) return notFound();
-    AuthenticationSessionManager sessions = new AuthenticationSessionManager(session);
+    AuthenticationSessionManager sessions = authenticationSessionManagerFactory.apply(session);
     var auth = sessions.getCurrentAuthenticationSession(realm, client, tabId);
     if (auth == null || auth.getClient() == null || auth.getParentSession() == null
         || !client.getId().equals(auth.getClient().getId()) || !tabId.equals(auth.getTabId())

@@ -19,6 +19,11 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
   private static final String DIAL_WARNING_PREFIX =
       "Failed to open TCP stream: all attempts to connect to ";
   private static final String DIAL_WARNING_SUFFIX = " failed";
+  private static final String REGISTRY_MISS_PREFIX = "Value not found for key /decent-registry/identity/";
+  private static final String CONNECTED_PREFIX = "Connected to ";
+  private static final String DIALING_PREFIX = "Dialing ";
+  private static final int IDENTITY_OBJECT_KEY_HEX_LENGTH = 64;
+  private static final int MAX_DIAGNOSTIC_LINES = 64;
   private static final ObjectMapper RESULT_MAPPER = new ObjectMapper(
       JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
       .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -89,23 +94,19 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     reader.join(TimeUnit.SECONDS.toMillis(1));
     if (output.overflowed()) throw new IdentityResolutionException("Identity lookup response exceeded limit");
     int exit = process.exitValue();
-    String text = stripLeadingDialWarnings(output.text());
-    if (exit == 1 && text.startsWith("not found")) return null;
-    if (exit == 3 || text.startsWith("history unavailable:")) {
+    String outputText = output.text();
+    if (exit == 1 && isConfirmedIdentityNotFound(outputText)) return null;
+    if (exit == 3 || stripRecognizedDhtDiagnostics(outputText).startsWith("history unavailable:")) {
       throw new IdentityResolutionException("Identity history unavailable");
     }
     if (exit != 0) throw new IdentityResolutionException("Identity lookup failed");
     try {
-      var node = RESULT_MAPPER.readTree(text);
-      String returnedIdentifier = node.path("identifier").asText(null);
-      String returnedHex = node.path("owner_name_hex").asText(null);
-      String publicKeyHex = node.path("owner_public_key_hex").asText(null);
-      long sequence = node.path("seq").asLong(-1);
-      if (sequence < 0 || !identityId.equals(returnedIdentifier) || returnedHex == null || publicKeyHex == null
-          || !exactHex.equalsIgnoreCase(returnedHex)) {
+      IdentityResolutionResult result = RESULT_MAPPER.readValue(extractIdentityJson(outputText), IdentityResolutionResult.class);
+      if (result.seq < 0 || !identityId.equals(result.identifier) || result.ownerNameHex == null
+          || result.ownerPublicKeyHex == null || !exactHex.equalsIgnoreCase(result.ownerNameHex)) {
         throw new IdentityResolutionException("Identity result did not match exact identifier");
       }
-      byte[] publicKey = HexFormat.of().parseHex(publicKeyHex);
+      byte[] publicKey = HexFormat.of().parseHex(result.ownerPublicKeyHex);
       if (publicKey.length != 32) throw new IdentityResolutionException("Identity public key size rejected");
       byte[] prefix = {0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00};
       byte[] spki = new byte[prefix.length + publicKey.length];
@@ -129,19 +130,169 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     }
   }
 
-  private static String stripLeadingDialWarnings(String output) {
+  static boolean isConfirmedIdentityNotFound(String output) {
+    String[] lines = output.split("\\R", -1);
+    if (lines.length < 2 || !"not found".equals(lines[lines.length - 1])) return false;
+    boolean sawRegistryMiss = false;
+    for (int index = 0; index < lines.length - 1; index++) {
+      String line = lines[index];
+      if (isKnownDialWarning(line)) continue;
+      if (isRegistryIdentityMiss(line)) {
+        sawRegistryMiss = true;
+        continue;
+      }
+      return false;
+    }
+    return sawRegistryMiss;
+  }
+
+  private static boolean isRegistryIdentityMiss(String line) {
+    if (!line.startsWith(REGISTRY_MISS_PREFIX)) return false;
+    String objectKey = line.substring(REGISTRY_MISS_PREFIX.length());
+    if (objectKey.length() != IDENTITY_OBJECT_KEY_HEX_LENGTH) return false;
+    return objectKey.chars().allMatch(character -> Character.digit(character, 16) >= 0);
+  }
+
+  static String extractIdentityJson(String output) {
+    String[] lines = output.split("\\R", -1);
+    int start = -1;
+    int diagnosticLines = 0;
+    for (int index = 0; index < lines.length; index++) {
+      String line = lines[index];
+      if (line.stripLeading().startsWith("{")) {
+        start = index;
+        break;
+      }
+      if (!line.isBlank()) {
+        if (!isRecognizedDhtDiagnostic(line) || ++diagnosticLines > MAX_DIAGNOSTIC_LINES) {
+          throw new IllegalArgumentException("unrecognized text before identity JSON");
+        }
+      }
+    }
+    if (start < 0) throw new IllegalArgumentException("identity JSON is missing");
+    StringBuilder json = new StringBuilder();
+    int depth = 0;
+    boolean quoted = false;
+    boolean escaped = false;
+    int endLine = -1;
+    for (int index = start; index < lines.length; index++) {
+      String line = lines[index];
+      if (index > start) json.append("\n");
+      json.append(line);
+      if (index > start && !line.isBlank() && isRecognizedDhtDiagnostic(line) && !quoted && depth > 0) {
+        continue;
+      }
+      for (int offset = 0; offset < line.length(); offset++) {
+        char current = line.charAt(offset);
+        if (quoted) {
+          if (escaped) escaped = false;
+          else if (current == '\\') escaped = true;
+          else if (current == '"') quoted = false;
+        } else if (current == '"') quoted = true;
+        else if (current == '{') depth++;
+        else if (current == '}') depth--;
+      }
+      if (depth == 0 && !quoted) { endLine = index; break; }
+    }
+    if (endLine < 0) throw new IllegalArgumentException("identity JSON is incomplete");
+    diagnosticLines = 0;
+    for (int index = endLine + 1; index < lines.length; index++) {
+      if (!lines[index].isBlank()) {
+        if (!isRecognizedDhtDiagnostic(lines[index]) || ++diagnosticLines > MAX_DIAGNOSTIC_LINES) {
+          throw new IllegalArgumentException("unrecognized text after identity JSON");
+        }
+      }
+    }
+    String clean = removeInterleavedDhtDiagnostics(json.toString());
+    return clean;
+  }
+
+  private static String removeInterleavedDhtDiagnostics(String json) {
+    String[] lines = json.split("\\R", -1);
+    StringBuilder cleaned = new StringBuilder();
+    boolean inside = false;
+    int braces = 0;
+    boolean inString = false;
+    boolean escape = false;
+    for (String line : lines) {
+      boolean diagnostic = isRecognizedDhtDiagnostic(line);
+      if (diagnostic && inside && braces > 0 && !inString) continue;
+      if (cleaned.length() > 0) cleaned.append('\n');
+      cleaned.append(line);
+      for (int index = 0; index < line.length(); index++) {
+        char current = line.charAt(index);
+        if (inString) {
+          if (escape) escape = false;
+          else if (current == '\\') escape = true;
+          else if (current == '"') inString = false;
+        } else if (current == '"') inString = true;
+        else if (current == '{') { braces++; inside = true; }
+        else if (current == '}') braces--;
+      }
+    }
+    return cleaned.toString();
+  }
+
+  private static String stripRecognizedDhtDiagnostics(String output) {
     String[] lines = output.split("\\R", -1);
     int firstResultLine = 0;
-    while (firstResultLine < lines.length && isKnownDialWarning(lines[firstResultLine])) {
+    while (firstResultLine < lines.length && isRecognizedDhtDiagnostic(lines[firstResultLine])) {
       firstResultLine++;
     }
-    return String.join("\n", java.util.Arrays.copyOfRange(lines, firstResultLine, lines.length)).trim();
+    String remainder = String.join("\n", java.util.Arrays.copyOfRange(lines, firstResultLine, lines.length)).trim();
+    if (!remainder.startsWith("{")) return remainder;
+    int depth = 0;
+    boolean inString = false;
+    boolean escaped = false;
+    for (int index = 0; index < remainder.length(); index++) {
+      char character = remainder.charAt(index);
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character == '\\') escaped = true;
+        else if (character == '"') inString = false;
+      } else if (character == '"') inString = true;
+      else if (character == '{') depth++;
+      else if (character == '}' && --depth == 0) {
+        String trailing = remainder.substring(index + 1).trim();
+        for (String diagnostic : trailing.split("\\R", -1)) {
+          if (!diagnostic.isBlank() && !isRecognizedDhtDiagnostic(diagnostic)) return remainder;
+        }
+        return remainder.substring(0, index + 1);
+      }
+    }
+    return remainder;
+  }
+
+  private static boolean isRecognizedDhtDiagnostic(String line) {
+    if (line.startsWith(DIALING_PREFIX) || line.startsWith(CONNECTED_PREFIX)) {
+      String endpoint = line.substring(line.indexOf(' ') + 1);
+      return !endpoint.isBlank();
+    }
+    if (isKnownDialWarning(line) || isRegistryIdentityMiss(line)) return true;
+    String prefix = "failed to upgrade security for peer ";
+    String secureSuffix = ": handshake failed when upgrading to secure connection";
+    String shortSuffix = ": handshake failed";
+    if (!line.startsWith(prefix)) return false;
+    String peer = line.substring(prefix.length(),
+        line.endsWith(secureSuffix) ? line.length() - secureSuffix.length()
+            : line.endsWith(shortSuffix) ? line.length() - shortSuffix.length() : 0);
+    return (line.endsWith(secureSuffix) || line.endsWith(shortSuffix))
+        && peer.startsWith("12D3Koo") && peer.length() == 52
+        && peer.chars().allMatch(character -> "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+            .indexOf(character) >= 0);
+  }
+
+  @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
+  private static final class IdentityResolutionResult {
+    @com.fasterxml.jackson.annotation.JsonProperty("identifier") public String identifier;
+    @com.fasterxml.jackson.annotation.JsonProperty("owner_name_hex") public String ownerNameHex;
+    @com.fasterxml.jackson.annotation.JsonProperty("owner_public_key_hex") public String ownerPublicKeyHex;
+    @com.fasterxml.jackson.annotation.JsonProperty("seq") public long seq;
   }
 
   private static boolean isKnownDialWarning(String line) {
     if (!line.startsWith(DIAL_WARNING_PREFIX) || !line.endsWith(DIAL_WARNING_SUFFIX)) return false;
-    String endpoint = line.substring(DIAL_WARNING_PREFIX.length(),
-        line.length() - DIAL_WARNING_SUFFIX.length());
+    String endpoint = line.substring(DIAL_WARNING_PREFIX.length(), line.length() - DIAL_WARNING_SUFFIX.length());
     return !endpoint.isBlank() && endpoint.chars().noneMatch(Character::isWhitespace);
   }
 

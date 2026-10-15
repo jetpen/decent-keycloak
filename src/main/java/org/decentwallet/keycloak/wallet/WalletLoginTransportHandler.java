@@ -9,33 +9,61 @@ import java.util.Optional;
 
 /** Provider-owned wallet GET/POST seam. The resolver must return the exact current Registry key. */
 public final class WalletLoginTransportHandler {
+  private static final org.jboss.logging.Logger LOG =
+      org.jboss.logging.Logger.getLogger(WalletLoginTransportHandler.class);
+  private static final int MAX_ACCOUNT_DIRECTORY_CANDIDATES = 64;
   static final int MAX_PROOF_BYTES = 8192;
   private final WalletLoginTransactionStore transactions;
   private final WalletLoginIdentityResolver identities;
   private final String walletOrigin;
   private final String idpOrigin;
+  private final String siteLabel;
   private final WalletLoginAccountResolver accounts;
+  private final boolean acceptSignup;
+  private final WalletLoginTransactionStore transactionStore;
   private final WalletLoginVerifier verifier = new WalletLoginVerifier();
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin) {
-    this(transactions, identities, walletOrigin, null, null);
+    this(transactions, identities, walletOrigin, null, null, null, true, transactions);
   }
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin) {
-    this(transactions, identities, walletOrigin, idpOrigin, null);
+    this(transactions, identities, walletOrigin, idpOrigin, null, null, true, transactions);
   }
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
       WalletLoginAccountResolver accounts) {
+    this(transactions, identities, walletOrigin, idpOrigin, null, accounts, true, transactions);
+  }
+
+  public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
+      WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
+      String siteLabel, WalletLoginAccountResolver accounts) {
+    this(transactions, identities, walletOrigin, idpOrigin, siteLabel, accounts, true, transactions);
+  }
+
+  public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
+      WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
+      String siteLabel, WalletLoginAccountResolver accounts, boolean acceptSignup) {
+    this(transactions, identities, walletOrigin, idpOrigin, siteLabel, accounts, acceptSignup, transactions);
+  }
+
+  public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
+      WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
+      String siteLabel, WalletLoginAccountResolver accounts, boolean acceptSignup,
+      WalletLoginTransactionStore transactionStore) {
     this.transactions = java.util.Objects.requireNonNull(transactions);
     this.identities = identities;
     this.walletOrigin = walletOrigin == null || walletOrigin.isBlank()
         ? null : normalizeOrigin(walletOrigin);
     this.idpOrigin = idpOrigin == null ? null : normalizeOrigin(idpOrigin);
+    this.siteLabel = siteLabel == null || siteLabel.isBlank() ? null : siteLabel.trim();
     this.accounts = accounts;
+    this.acceptSignup = acceptSignup;
+    this.transactionStore = java.util.Objects.requireNonNull(transactionStore);
   }
 
   public HttpResult getWalletLocator(String handle, String idpOrigin) {
@@ -65,8 +93,10 @@ public final class WalletLoginTransportHandler {
     if (!nativeWallet && !validBrowserRequest(requestOrigin, fetchSite, fetchMode, fetchDest)) {
       return HttpResult.empty(403);
     }
-    Map<String, String> body = Map.of("profile", WalletLoginProof.PROFILE,
-        "challenge", pending.get().challenge(), "csrf_token", pending.get().csrfToken());
+    Map<String, String> body = siteLabel == null ? Map.of("profile", WalletLoginProof.PROFILE,
+        "challenge", pending.get().challenge(), "csrf_token", pending.get().csrfToken())
+        : Map.of("profile", WalletLoginProof.PROFILE, "challenge", pending.get().challenge(),
+            "csrf_token", pending.get().csrfToken(), "site_name", siteLabel);
     return HttpResult.json(200, body);
   }
 
@@ -81,9 +111,17 @@ public final class WalletLoginTransportHandler {
   HttpResult submitProof(String handle, String requestOrigin, String fetchSite,
       String fetchMode, String fetchDest, String contentType, String csrfToken,
       byte[] body, String idpOrigin) {
+    return submitProof(handle, requestOrigin, fetchSite, fetchMode, fetchDest,
+        contentType, csrfToken, body, idpOrigin, null);
+  }
+
+  HttpResult submitProof(String handle, String requestOrigin, String fetchSite,
+      String fetchMode, String fetchDest, String contentType, String csrfToken,
+      byte[] body, String idpOrigin, WalletLoginTransactionStore.Intent expectedIntent) {
     var pending = transactions.load(handle);
     if (pending.isEmpty()) return submitAcceptedRetry(handle, requestOrigin, fetchSite,
         fetchMode, fetchDest, contentType, csrfToken, body, idpOrigin);
+    if (expectedIntent != null && pending.get().intent() != expectedIntent) return HttpResult.empty(403);
     WalletLoginTransactionStore.Binding binding = pending.get().binding();
     if (!sameOrigin(idpOrigin, binding.canonicalOrigin())
         || this.idpOrigin != null && !sameOrigin(idpOrigin, this.idpOrigin)) return HttpResult.empty(404);
@@ -120,9 +158,11 @@ public final class WalletLoginTransportHandler {
     try {
       identity = identities.resolveExact(proof.identityId());
     } catch (ProcessIdentityResolver.IdentityResolutionException ex) {
+      LOG.warnf("Wallet Identity resolver unavailable (%s)", ex.getClass().getSimpleName());
       if (ex.processMayStillRun()) transactions.blockIdentityLookups(handle, binding);
       return HttpResult.empty(503);
     } catch (Exception ex) {
+      LOG.warnf("Wallet Identity resolver unavailable (%s)", ex.getClass().getSimpleName());
       return HttpResult.empty(503);
     }
     if (identity == null || !proof.identityId().equals(identity.identityId())) {
@@ -138,9 +178,25 @@ public final class WalletLoginTransportHandler {
       return HttpResult.empty(401);
     }
     if (accounts == null) return HttpResult.empty(503);
+    WalletLoginTransactionStore.Intent intent = pending.get().intent();
     try {
-      if (!accounts.hasUniqueEnabledUser(proof.identityId())) return HttpResult.empty(403);
+      boolean mapped = accounts.hasUniqueEnabledUser(proof.identityId());
+      if (!mapped) {
+        LOG.debugf("Wallet account policy lookup started (signup=%s, registration-enabled=%s)",
+            intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup);
+        boolean occupied = accounts.hasUniqueMappedUserIncludingDisabled(proof.identityId());
+        LOG.debugf("Wallet account policy occupancy observed (occupied=%s)", occupied);
+        if (intent != WalletLoginTransactionStore.Intent.SIGNUP || !acceptSignup || occupied) {
+          LOG.debugf("Wallet account policy rejected proof (signup=%s, registered=%s, occupied=%s)",
+              intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup, occupied);
+          return HttpResult.empty(403);
+        }
+        org.keycloak.models.UserModel provisioned = accounts.ensureEnabledUser(proof.identityId());
+        if (provisioned == null || !provisioned.isEnabled()) return HttpResult.empty(403);
+        if (!accounts.hasUniqueEnabledUser(proof.identityId())) return HttpResult.empty(403);
+      }
     } catch (Exception unavailable) {
+      LOG.warnf("Wallet account mapping lookup unavailable (%s)", unavailable.getClass().getSimpleName());
       return HttpResult.empty(503);
     }
 
@@ -150,7 +206,8 @@ public final class WalletLoginTransportHandler {
     String digest = hex(sha256(body));
     try {
       transactions.markAccepted(handle, binding, digest, proof.identityId(),
-          Base64.getUrlEncoder().withoutPadding().encodeToString(identity.publicKey()), consumed.get().csrfToken());
+          Base64.getUrlEncoder().withoutPadding().encodeToString(identity.publicKey()), consumed.get().csrfToken(),
+          consumed.get().intent());
     } catch (RuntimeException ex) {
       // Nonce is consumed; no OIDC result unless its separate accepted receipt persists.
       return HttpResult.empty(503);
@@ -205,10 +262,12 @@ public final class WalletLoginTransportHandler {
       return HttpResult.empty(403);
     }
     var pending = transactions.load(handle, initiatingBrowserBinding);
-    if (pending.isEmpty() && transactions.getAccepted(handle, initiatingBrowserBinding).isEmpty()) {
-      return HttpResult.empty(404);
-    }
     var accepted = transactions.getAccepted(handle, initiatingBrowserBinding);
+    if (pending.isEmpty() && accepted.isEmpty()) return HttpResult.empty(404);
+    WalletLoginTransactionStore.Intent intent = pending.map(
+        WalletLoginTransactionStore.PendingTransaction::intent).orElseGet(
+        () -> accepted.map(WalletLoginTransactionStore.AcceptedTransaction::intent).orElse(
+            WalletLoginTransactionStore.Intent.LOGIN));
     boolean csrfMatches = pending.map(value -> constantTimeEquals(value.csrfToken(), csrfToken)).orElseGet(
         () -> transactions.acceptedCsrfMatches(handle, initiatingBrowserBinding, csrfToken));
     if (!csrfMatches) return HttpResult.empty(403);
@@ -216,11 +275,16 @@ public final class WalletLoginTransportHandler {
       return transactions.callbackGateAvailable(handle, initiatingBrowserBinding)
           ? HttpResult.json(200, Map.of("status", "accepted")) : HttpResult.empty(404);
     }
-    return pending.isPresent() ? HttpResult.json(200, Map.of("status", "pending")) : HttpResult.empty(404);
+        return pending.isPresent() ? HttpResult.json(200, Map.of("status", "pending")) : HttpResult.empty(404);
   }
 
   boolean allowsWalletOrigin(String origin) {
     return walletOrigin != null && sameOrigin(walletOrigin, origin);
+  }
+
+  WalletLoginTransactionStore.PendingTransaction pendingTransaction(
+      String handle, WalletLoginTransactionStore.Binding binding) {
+    return transactionStore.load(handle, binding).orElse(null);
   }
 
   private boolean validBrowserRequest(String origin, String fetchSite, String fetchMode, String fetchDest) {
@@ -238,7 +302,11 @@ public final class WalletLoginTransportHandler {
     return origin == null && site == null && mode == null && dest == null;
   }
 
-  private static boolean sameOrigin(String a, String b) {
+  static boolean sameOrigin(String a, String b) {
+    return sameOriginInternal(a, b);
+  }
+
+  private static boolean sameOriginInternal(String a, String b) {
     if (a == null || b == null) return false;
     try { return normalizeOrigin(a).equals(normalizeOrigin(b)); }
     catch (IllegalArgumentException ex) { return false; }
@@ -251,7 +319,13 @@ public final class WalletLoginTransportHandler {
         || uri.getRawQuery() != null || uri.getRawFragment() != null) {
       throw new IllegalArgumentException("wallet origin must be an exact HTTPS origin");
     }
-    return ("https://" + uri.getRawAuthority()).toLowerCase(java.util.Locale.ROOT);
+    try {
+      int port = uri.getPort() == 443 ? -1 : uri.getPort();
+      return new java.net.URI("https", null, uri.getHost().toLowerCase(java.util.Locale.ROOT),
+          port, null, null, null).toASCIIString();
+    } catch (java.net.URISyntaxException invalidOrigin) {
+      throw new IllegalArgumentException("wallet origin is invalid", invalidOrigin);
+    }
   }
 
   private static boolean constantTimeEquals(String expected, String received) {

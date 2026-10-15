@@ -14,6 +14,8 @@ public final class WalletLoginTransportResourceFactory
   static final String KEY_REGISTRY_BOOTSTRAP = "decent.wallet.registry.bootstrap";
   static final String KEY_REGISTRY_CLIENT_PORT = "decent.wallet.registry.client-port";
   static final String KEY_IDENTITY_EXECUTABLE = "decent.wallet.identity.executable";
+  static final String KEY_SITE_LABEL = "decent.wallet.site-name";
+  static final String KEY_TRUSTED_WALLET_ORIGINS = "decent.wallet.trusted-origins";
 
   @Override
   public RealmResourceProvider create(KeycloakSession session) {
@@ -36,17 +38,37 @@ public final class WalletLoginTransportResourceFactory
     }
     if (resolver == null) resolver = identityId -> null;
     WalletLoginIdentityResolver sharedResolver = resolver;
+    boolean acceptSignup = realm.isRegistrationAllowed();
     String walletOrigin = realm.getAttribute(KEY_WALLET_ORIGIN);
-    if (walletOrigin == null || walletOrigin.isBlank()) walletOrigin = null;
+    if (walletOrigin != null && walletOrigin.isBlank()) walletOrigin = null;
+    final String configuredWalletOrigin = walletOrigin;
+    String trustedOrigins = realm.getAttribute(KEY_TRUSTED_WALLET_ORIGINS);
+    if (trustedOrigins != null && !trustedOrigins.isBlank()) {
+      boolean matched = java.util.Arrays.stream(trustedOrigins.split(","))
+          .map(String::trim)
+          .anyMatch(candidate -> WalletLoginTransportHandler.sameOrigin(candidate, configuredWalletOrigin));
+      if (!matched) throw new IllegalStateException("wallet origin is not in the exact trusted-origin allowlist");
+    }
     java.net.URI publicBase = session.getContext().getUri().getBaseUri();
     String idpOrigin = canonicalIdpOrigin(publicBase, realm.getAttribute(KEY_IDP_ORIGIN));
     var store = new WalletLoginTransactionStore(session.singleUseObjects(),
         new java.security.SecureRandom(), java.time.Clock.systemUTC());
-    WalletLoginAccountResolver accounts = identityId ->
-        WalletLoginAccountMapping.findUniqueEnabledUser(session.users(), realm, identityId) != null;
+    String siteLabel = realm.getAttribute(KEY_SITE_LABEL);
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String identityId) {
+        return WalletLoginAccountMapping.hasUniqueEnabledMapping(session.users(), realm, identityId);
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String identityId) {
+        return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(session.users(), realm, identityId);
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String identityId) {
+        return WalletLoginAccountMapping.ensureEnabledUser(session.users(), realm, identityId, true);
+      }
+    };
     var resource = new WalletLoginTransportResource();
     resource.configure(session,
-        new WalletLoginTransportHandler(store, sharedResolver, walletOrigin, idpOrigin, accounts), idpOrigin);
+        new WalletLoginTransportHandler(store, sharedResolver, walletOrigin, idpOrigin, siteLabel, accounts,
+            acceptSignup, store), idpOrigin, acceptSignup);
     return resource;
   }
 
