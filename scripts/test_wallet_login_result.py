@@ -39,7 +39,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     main_body = source[main_start:]
     self.assertIn('stale_key_rotation_flow(', source)
     self.assertIn("result['rotated_identity_case']", main_body)
-    self.assertIn("duplicate exact local account mapping denies fresh login with HTTP 403", source)
+    self.assertIn("account_policy_denial_is_attributed(ambiguity_result)", source)
     self.assertIn("'username': 'wallet-owner-duplicate', 'enabled': True", source)
     self.assertIn("provision_identity_attribute(client, token, 'wallet-owner-duplicate', identifier)", main_body)
 
@@ -59,6 +59,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     body = source[start:end]
     self.assertIn("wallet.request('POST', locator, proof", body)
     self.assertIn('require(submitted == 202', body)
+    self.assertIn("set(envelope) == {'profile', 'challenge', 'csrf_token'}", body)
+    self.assertIn("'Example Wallet Demo Site' in text", body)
     self.assertIn("require(retried == 202 and json.loads(retry_raw).get('status') == 'accepted'", body)
     self.assertIn('require(changed == 409', body)
     self.assertIn("b' ' * 8193", source)

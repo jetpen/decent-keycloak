@@ -56,14 +56,48 @@ def test_live_disabled_account_fixture_is_independent_from_unmapped_user():
 def test_live_probe_counts_registry_unavailable_separately_from_policy_denial():
   source = PROBE.read_text()
   start = source.index("def account_mapping_denial_flow(")
-  end = source.index("\ndef stale_key_rotation_flow", start)
+  end = source.index("\ndef account_mapping_denial_result", start)
   body = source[start:end]
-  assert "direct_http == 503" in body
-  assert "direct_http == 403" in body
-  assert "local_account_mapping_decision_observed" in body
+  classifier_start = source.index("def account_mapping_denial_result(")
+  classifier_end = source.index("\ndef unmapped_account_case_evidence", classifier_start)
+  classifier = source[classifier_start:classifier_end]
+  assert "account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories)" in body
+  assert "status == 503" in classifier
+  assert "status == 403" in classifier
+  assert "local_account_mapping_decision_observed" in classifier
 
 
-def test_latest_e2e_summary_does_not_claim_full_qualification():
+def test_account_policy_attribution_validates_the_exact_direct_registry_result():
+  source = PROBE.read_text()
+  start = source.index("def account_mapping_denial_flow(")
+  end = source.index("\ndef account_mapping_denial_result", start)
+  function = source[start:end]
+  assert "registry_lookup_outcome = exact_registry_lookup_outcome(" in function
+  assert "direct_probe.stdout, direct_probe.returncode, identity_id)" in function
+  assert "registry_lookup_succeeded = direct_probe.returncode == 0" not in function
+  assert "account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories)" in function
+
+
+def test_unclassified_403_diagnostic_does_not_claim_registry_unavailable():
+  source = PROBE.read_text()
+  start = source.index("def account_mapping_denial_flow(")
+  end = source.index("\ndef account_mapping_denial_result", start)
+  function = source[start:end]
+  assert "provider-side account-policy attribution unavailable" in function
+  assert "Registry lookup was unavailable; policy denial unqualified" not in function
+
+
+def test_account_mapping_denial_cases_require_fresh_policy_attribution():
+  source = PROBE.read_text()
+  main = source[source.index("def main():"):]
+  assert "account_policy_denial_is_attributed(result['unmapped_account_case'])" in main
+  assert "account_policy_denial_is_attributed(disabled_result)" in main
+  assert "account_policy_denial_is_attributed(ambiguity_result)" in main
+
+
+def test_latest_e2e_summary_does_not_claim_unqualified_scenarios_passed():
   source = PROBE.read_text()
   assert "overall provider qualification remains limited" in source
+  assert "E2E_SCENARIOS_COMPLETE: inspect per-case outcomes" in source
+  assert "covered cases passed" not in source
   assert "PASS: disposable Keycloak" not in source

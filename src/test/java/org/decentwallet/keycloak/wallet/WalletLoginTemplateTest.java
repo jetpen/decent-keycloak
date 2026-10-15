@@ -73,6 +73,14 @@ final class WalletLoginTemplateTest {
     assertEquals(1, count(template, "fetch(statusUrl, {"));
   }
 
+  @Test
+  void startsStatusPollingForBothLoginAndSignupIntents() throws Exception {
+    String template = Files.readString(Path.of("src/main/resources/theme-resources/templates/wallet-login.ftl"));
+    assertTrue(template.contains("if (walletIntent === \"login\" || walletIntent === \"signup\") {"));
+    assertTrue(template.contains("window.setTimeout(poll, 1500);"));
+  }
+
+
   private static int count(String text, String value) {
     int count = 0;
     int index = 0;

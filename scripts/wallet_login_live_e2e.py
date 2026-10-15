@@ -18,6 +18,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+
 PROJECTS = Path(os.environ.get('WALLET_IT_PROJECTS', str(Path.home() / 'projects')))
 REGISTRY_CLI = str(PROJECTS / 'decent-registry/.venv/bin/decent-registry')
 IDENTITY_SOURCE = str(PROJECTS / 'decent-identity/src')
@@ -33,6 +34,18 @@ WALLET_ORIGIN = 'https://wallet.example'
 REALM = 'wallet-e2e'
 CLIENT = 'wallet-e2e-client'
 REDIRECT = 'https://rp.example/callback'
+class AdminPassword:
+  def __init__(self, value):
+    if value is None:
+      raise RuntimeError("disposable admin credential is unavailable")
+    self._value = value
+
+  def __str__(self):
+    return self._value
+
+  def __repr__(self):
+    return "AdminPassword([REDACTED])"
+
 
 
 def free_port():
@@ -98,6 +111,7 @@ class LocalKeycloakRedirects(urllib.request.HTTPRedirectHandler):
 class Client:
   def __init__(self):
     self.redirects = []
+    self.privateClientAdminCredential: str | None = None
     self.opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(), LocalKeycloakRedirects())
     redirect_handler = next(handler for handler in self.opener.handlers
@@ -371,13 +385,26 @@ def parse_exact_identity_result(stdout, identifier):
   if isinstance(result.get('seq'), bool) or not isinstance(result.get('seq'), int) or result['seq'] < 0:
     return None
   key = result.get('owner_public_key_hex')
-  if not isinstance(key, str) or len(key) != 64:
+  if not isinstance(key, str) or re.fullmatch(r'[0-9a-fA-F]{64}', key) is None:
     return None
   try:
-    bytes.fromhex(key)
+    raw_key = bytes.fromhex(key)
   except ValueError:
     return None
+  if len(raw_key) != 32:
+    return None
   return result
+
+
+def exact_registry_lookup_succeeded(stdout, exit_code, identifier):
+  return exit_code == 0 and parse_exact_identity_result(stdout, identifier) is not None
+
+
+def exact_registry_lookup_outcome(stdout, exit_code, identifier):
+  if exact_registry_lookup_succeeded(stdout, exit_code, identifier):
+    return 'resolved'
+  resolution, _ = classify_identity_lookup(stdout, exit_code)
+  return 'not_found' if resolution == 'not_found' else 'unavailable'
 
 
 def generate_owner_key(temp, label):
@@ -425,26 +452,38 @@ def write_identity(temp, bootstrap, label='wallet-login-e2e'):
 def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap):
   check = run(['ss', '-ltn', f'( sport = :{KC_PORT} )'], timeout=5)
   require('LISTEN' not in check.stdout, 'disposable Keycloak port available')
-  cmd = [
-      'podman', 'run', '--detach', '--rm', '--name', container, '--network', 'host',
-      '--env', 'KC_BOOTSTRAP_ADMIN_USERNAME=wallet-admin',
-      '--env', f'KC_BOOTSTRAP_ADMIN_PASSWORD={password}',
-      '--env', 'LD_LIBRARY_PATH=/opt/kc-lib',
-      '--volume', f'{IDENTITY_VENV}:{IDENTITY_VENV}:ro',
-      '--volume', f'{REGISTRY_VENV}:{REGISTRY_VENV}:ro',
-      '--volume', f'{UV_PYTHON}:{UV_PYTHON}:ro',
-      '--volume', f'{IDENTITY_SOURCE}:{IDENTITY_SOURCE}:ro',
-      '--volume', f'{PROJECTS / 'decent-registry/src'}:{PROJECTS / 'decent-registry/src'}:ro',
-      '--volume', f'{KC_LIB}:/opt/kc-lib:ro',
-      '--volume', f'{wrapper_path.parent}:/opt/wallet-login-live-it:ro',
-      IMAGE, 'start-dev', '--http-enabled=true', f'--http-port={KC_PORT}',
-      '--http-relative-path=/auth', f'--hostname=https://idp.example:{KC_PORT}/auth',
-      '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1', '--db=dev-file',
-      '--log-level=org.keycloak.authentication:DEBUG,org.keycloak.services:DEBUG,org.decentwallet.keycloak.wallet:DEBUG'
-  ]
-  started = run(cmd, timeout=40)
-  require(started.returncode == 0, 'start disposable Keycloak')
+  env_fd, env_path = tempfile.mkstemp(prefix='wallet-login-admin-', suffix='.env', dir=SCRATCH)
+  env_file = Path(env_path)
+  try:
+    os.fchmod(env_fd, 0o600)
+    with os.fdopen(env_fd, 'w', encoding='utf-8') as env_stream:
+      env_stream.write('KC_BOOTSTRAP_ADMIN_PASSWORD=' + password + '\n')
+    cmd = [
+        'podman', 'run', '--detach', '--rm', '--name', container, '--network', 'host',
+        '--env-file', str(env_file),
+        '--env', 'KC_BOOTSTRAP_ADMIN_USERNAME=wallet-admin',
+        '--env', 'LD_LIBRARY_PATH=/opt/kc-lib',
+        '--volume', f'{IDENTITY_VENV}:{IDENTITY_VENV}:ro',
+        '--volume', f'{REGISTRY_VENV}:{REGISTRY_VENV}:ro',
+        '--volume', f'{UV_PYTHON}:{UV_PYTHON}:ro',
+        '--volume', f'{IDENTITY_SOURCE}:{IDENTITY_SOURCE}:ro',
+        '--volume', f'{PROJECTS / 'decent-registry/src'}:{PROJECTS / 'decent-registry/src'}:ro',
+        '--volume', f'{KC_LIB}:/opt/kc-lib:ro',
+        '--volume', f'{wrapper_path.parent}:/opt/wallet-login-live-it:ro',
+        IMAGE, 'start-dev', '--http-enabled=true', f'--http-port={KC_PORT}',
+        '--http-relative-path=/auth', f'--hostname=https://idp.example:{KC_PORT}/auth',
+        '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1', '--db=dev-file',
+        '--log-level=org.keycloak.authentication:DEBUG,org.keycloak.services:DEBUG,org.decentwallet.keycloak.wallet:DEBUG'
+    ]
+    started = run(cmd, timeout=40)
+  finally:
+    env_file.unlink(missing_ok=True)
+  if started.returncode != 0:
+    raise RuntimeError("acceptance probe failed at start disposable Keycloak")
+  if not isinstance(started, subprocess.CompletedProcess):
+    raise RuntimeError("Keycloak start returned no result")
   client = Client()
+  client.privateClientAdminCredential = password
   discovery = None
   last_connection_error = None
   for _ in range(90):
@@ -465,6 +504,7 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap):
         print('keycloak-log:', line[:500])
     print('last_connection_error=', type(last_connection_error).__name__ if last_connection_error else 'none')
     require(False, 'Keycloak OIDC discovery startup')
+  require(discovery is not None, 'Keycloak OIDC discovery startup')
   require(discovery.get('issuer') == f'https://idp.example:{KC_PORT}/auth/realms/master',
           'trusted HTTPS issuer')
   return client
@@ -771,12 +811,13 @@ def auth_flow(client, key, identifier, container):
   }
   require(all(status == 404 for status in wrong_binding_statuses.values()),
       'wrong realm/client/session/tab cannot poll wallet status')
+  require('Example Wallet Demo Site' in text,
+      'provider login page displays configured site label')
   wallet = Client()
   wallet_status, wallet_headers, envelope_raw = wallet.request('GET', locator)
   require(wallet_status == 200, 'native challenge GET', wallet_status)
   envelope = json.loads(envelope_raw)
-  require(set(envelope) == {'profile', 'challenge', 'csrf_token', 'site_name'}, 'challenge response exact fields')
-  require(envelope['site_name'] == 'Example Wallet Demo Site', 'configured site label')
+  require(set(envelope) == {'profile', 'challenge', 'csrf_token'}, 'challenge response exact contract fields')
   require(envelope['profile'] == 'decent-wallet-login-v1', 'challenge profile')
   require(envelope['csrf_token'] == browser_csrf, 'transaction CSRF binding')
   require_transport_security_headers(wallet_headers, 'native challenge security headers')
@@ -1119,7 +1160,7 @@ def invalid_proof_throttle_flow():
       'http_after_five_invalid_attempts': throttled, 'no_acceptance_or_callback': True}
 
 def account_mapping_denial_flow(client, key, identity_id, scenario, container, resolver_port, bootstrap, wrapper_path_name):
-  token = admin_token(client, os.environ['WALLET_IT_ADMIN_PASSWORD'])
+  token = admin_token(client, AdminPassword(client.privateClientAdminCredential))
   browser = Client()
   poll_browser = browser
   verifier = b64url(secrets.token_bytes(32))
@@ -1157,14 +1198,18 @@ def account_mapping_denial_flow(client, key, identity_id, scenario, container, r
   require(signature.returncode == 0 and len(signature.stdout) == 64,
       f'sign valid proof for {scenario} Registry identity')
   direct_started = time.monotonic()
+  registry_lookup_outcome = 'unavailable'
   try:
     direct_probe = run(['podman', 'exec', container, '/usr/bin/env', '-i',
         'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
         '/opt/wallet-login-live-it/' + wrapper_path_name, 'get', '--identifier', identity_id,
         '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20)
-    require(direct_probe.returncode == 0,
-        f'{scenario} direct in-container exact Registry Identity lookup succeeds')
-    print(f'{scenario} direct Registry lookup completed in {int((time.monotonic()-direct_started)*1000)} ms')
+    registry_lookup_outcome = exact_registry_lookup_outcome(
+        direct_probe.stdout, direct_probe.returncode, identity_id)
+    if registry_lookup_outcome == 'resolved':
+      print(f'{scenario} direct Registry lookup completed in {int((time.monotonic()-direct_started)*1000)} ms')
+    else:
+      print(f'{scenario} direct Registry lookup {registry_lookup_outcome}')
   except (subprocess.TimeoutExpired, RuntimeError) as resolver_failure:
     print(f'{scenario} direct Registry lookup unavailable: {type(resolver_failure).__name__}')
   # This signed provider proof determines account policy even when the separate
@@ -1173,34 +1218,110 @@ def account_mapping_denial_flow(client, key, identity_id, scenario, container, r
       'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identity_id, 'signature': b64url(signature.stdout),
   }, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+  logs_before = run(['podman', 'logs', '--tail', '120', container], timeout=15)
+  previous_log_lines = logs_before.stdout.splitlines() if logs_before.returncode == 0 else None
   direct_http, _, response_body = browser.request('POST', locator, proof,
       {'Content-Type': 'application/json', 'X-Decent-CSRF': csrf.group(1),
        'Origin': WALLET_ORIGIN, 'Sec-Fetch-Site': 'cross-site',
        'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty'})
-  if direct_http == 202:
-    print(f'{scenario} diagnostic accepted-identity-category: duplicate-account-policy-not-triggered')
-    raise RuntimeError(f'acceptance probe failed at {scenario} expected account denial (HTTP {direct_http})')
-  server_diagnostics = run(['podman', 'logs', '--tail', '30', container], timeout=15)
-  safe_categories = []
-  for line in server_diagnostics.stdout.splitlines():
-    if 'Wallet Identity resolver unavailable (' in line:
-      safe_categories.append(line.split('Wallet Identity resolver unavailable (', 1)[1].split(')', 1)[0])
-    elif 'Wallet account mapping lookup unavailable (' in line:
-      safe_categories.append('account-' + line.split('Wallet account mapping lookup unavailable (', 1)[1].split(')', 1)[0])
-    if len(safe_categories) >= 6:
-      break
-  if safe_categories:
-    print(f'{scenario} provider-failure-categories:', json.dumps(safe_categories))
   poll_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
   polled, _, status_raw = poll_browser.request('GET', status_url.group(1), headers=poll_headers)
   require(polled == 200, f'{scenario} browser remains pending')
   require(json.loads(status_raw) == {'status': 'pending'},
       f'{scenario} proof yielded no accepted receipt or callback')
-  return {'current_registry_proof_http': direct_http, 'scenario': scenario,
-      'local_account_mapping_decision_observed': direct_http == 403,
-      'registry_unavailable': direct_http == 503,
-      'no_acceptance_or_callback': direct_http != 202}
+  server_diagnostics = run(['podman', 'logs', '--tail', '120', container], timeout=15)
+  current_log_lines = server_diagnostics.stdout.splitlines() if server_diagnostics.returncode == 0 else []
+  safe_categories = new_account_mapping_log_categories(previous_log_lines, current_log_lines)[:12]
+  if safe_categories:
+    print(f'{scenario} provider-failure-categories:', json.dumps(safe_categories))
+  result = account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories)
+  if result['outcome'] in ('unexpected_acceptance', 'unexpected_status'):
+    raise RuntimeError(f'acceptance probe failed at {scenario} expected account denial (HTTP {direct_http})')
+  if result['outcome'] == 'provider_denied_unclassified':
+    print(f'{scenario} HTTP 403 denied; provider-side account-policy attribution unavailable')
+  return result
+
+
+def new_account_mapping_log_categories(previous_lines, current_lines):
+  if previous_lines is None:
+    return []
+  maximum_overlap = min(len(previous_lines), len(current_lines))
+  overlap = 0
+  for size in range(maximum_overlap, 0, -1):
+    if previous_lines[-size:] == current_lines[:size]:
+      overlap = size
+      break
+  if previous_lines and overlap == 0:
+    return []
+  categories = []
+  for line in current_lines[overlap:]:
+    if 'Wallet account policy rejected proof (' in line:
+      categories.append('account-policy-rejected')
+    elif 'Wallet Identity resolver unavailable (' in line:
+      categories.append('identity-resolver-unavailable')
+    elif 'Wallet account mapping lookup unavailable (' in line:
+      categories.append('account-mapping-unavailable')
+  return categories
+
+
+def account_mapping_denial_result(status, registry_lookup_outcome, safe_categories):
+  if status == 403:
+    policy_trace = 'account-policy-rejected' in safe_categories
+    resolver_failed = any(category == 'identity-resolver-unavailable' for category in safe_categories)
+    mapping_failed = any(category == 'account-mapping-unavailable' for category in safe_categories)
+    if registry_lookup_outcome == 'resolved' and policy_trace and not resolver_failed and not mapping_failed:
+      return {'current_registry_proof_http': status, 'scenario': 'account-mapping-denial',
+          'registry_lookup_outcome': registry_lookup_outcome,
+          'local_account_mapping_decision_observed': True, 'registry_unavailable': False,
+          'no_acceptance_or_callback': True, 'outcome': 'policy_denied'}
+    return {'current_registry_proof_http': status, 'scenario': 'account-mapping-denial',
+        'registry_lookup_outcome': registry_lookup_outcome,
+        'local_account_mapping_decision_observed': False,
+        'registry_unavailable': registry_lookup_outcome == 'unavailable',
+        'no_acceptance_or_callback': True, 'outcome': 'provider_denied_unclassified'}
+  if status == 503:
+    if registry_lookup_outcome == 'unavailable':
+      outcome = 'registry_unavailable'
+    elif registry_lookup_outcome == 'not_found':
+      outcome = 'provider_registry_inconsistent'
+    elif 'account-mapping-unavailable' in safe_categories:
+      outcome = 'account_mapping_unavailable'
+    else:
+      outcome = 'provider_unavailable'
+    return {'current_registry_proof_http': status, 'scenario': 'account-mapping-denial',
+        'registry_lookup_outcome': registry_lookup_outcome,
+        'local_account_mapping_decision_observed': False,
+        'registry_unavailable': outcome == 'registry_unavailable',
+        'no_acceptance_or_callback': True, 'outcome': outcome}
+  if status == 202:
+    return {'current_registry_proof_http': status, 'scenario': 'account-mapping-denial',
+        'registry_lookup_outcome': registry_lookup_outcome,
+        'local_account_mapping_decision_observed': False, 'registry_unavailable': False,
+        'no_acceptance_or_callback': False, 'outcome': 'unexpected_acceptance'}
+  return {'current_registry_proof_http': status, 'scenario': 'account-mapping-denial',
+      'registry_lookup_outcome': registry_lookup_outcome,
+      'local_account_mapping_decision_observed': False, 'registry_unavailable': False,
+      'no_acceptance_or_callback': False, 'outcome': 'unexpected_status'}
+
+
+def unmapped_account_case_evidence(result):
+  if result.get('outcome') == 'policy_denied':
+    return result
+  return {'outcome': result.get('outcome', 'unqualified'),
+      'current_registry_proof_http': result.get('current_registry_proof_http'),
+      'registry_lookup_outcome': result.get('registry_lookup_outcome', 'unavailable'),
+      'local_account_mapping_decision_observed': False,
+      'registry_unavailable': result.get('registry_unavailable', False),
+      'no_acceptance_or_callback': result.get('no_acceptance_or_callback', False),
+      'scenario': 'unmapped-account'}
+
+
+def account_policy_denial_is_attributed(result):
+  return (result.get('current_registry_proof_http') == 403
+      and result.get('outcome') == 'policy_denied'
+      and result.get('local_account_mapping_decision_observed') is True
+      and result.get('no_acceptance_or_callback') is True)
 
 
 def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
@@ -1635,7 +1756,7 @@ def signup_form_action(html_body, idp_origin, realm, required_action=False, prof
 
 
 
-def signup_wallet_flow(client, key, identifier, container):
+def signup_wallet_flow(client, key, identifier, container, admin_client):
   verifier = b64url(secrets.token_bytes(32))
   code_challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
@@ -1702,15 +1823,15 @@ def signup_wallet_flow(client, key, identifier, container):
   require(signature.returncode == 0 and len(signature.stdout) == 64, 'signup Ed25519 proof signed')
   proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identifier, 'signature': b64url(signature.stdout)}, separators=(',', ':')).encode()
-  admin = admin_token(client, os.environ['WALLET_IT_ADMIN_PASSWORD'])
-  exact_users_before_proof = json.loads(admin_call(client, admin, 'GET',
+  admin = admin_token(admin_client, AdminPassword(admin_client.privateClientAdminCredential))
+  exact_users_before_proof = json.loads(admin_call(admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   existing_exact_users = [user for user in exact_users_before_proof
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
   require(not existing_exact_users, 'no exact Keycloak account exists before signup proof')
   proof_status, _, _ = wallet.request('POST', signup_locator, proof, {'Content-Type': 'application/json'})
   require(proof_status == 202, 'signup proof provisions exact account before pending consume', proof_status)
-  exact_users = json.loads(admin_call(client, admin, 'GET',
+  exact_users = json.loads(admin_call(admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   matched = [user for user in exact_users
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
@@ -1745,9 +1866,10 @@ def signup_wallet_flow(client, key, identifier, container):
     debug_logs = run(['podman', 'logs', '--tail', '100', container], timeout=15)
     safe_response = sanitize_signup_action_diagnostics(callback_html, debug_logs.stdout)
     print('signup-callback-error-diagnostics:', json.dumps(safe_response, sort_keys=True))
-    safe_response['events'] = recent_login_error_categories(
-        client, admin_token(client, os.environ['WALLET_IT_ADMIN_PASSWORD']))
-    print('signup-keycloak-event-categories:', json.dumps(safe_response['events'], sort_keys=True))
+    admin_password = AdminPassword(admin_client.privateClientAdminCredential)
+    safe_token = admin_token(admin_client, admin_password)
+    safe_events = recent_login_error_categories(admin_client, safe_token)
+    print('signup-keycloak-event-categories:', json.dumps(safe_events, sort_keys=True))
   diagnostics = sanitize_signup_callback_response(callback_status, headers, callback_html,
       debug_logs.stdout if debug_logs is not None else '')
   location = headers.get('Location', '')
@@ -1897,8 +2019,8 @@ def main():
       replay_key, _, replay_identifier = write_identity(
           temp, bootstrap, label='wallet-login-replay')
       client = start_keycloak(container, password, wrapper, resolver_port, bootstrap)
+      client.privateClientAdminCredential = password
       token = admin_token(client, password)
-      os.environ['WALLET_IT_ADMIN_PASSWORD'] = password
       configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
       enable_keycloak_login_events(client, token)
       provision_identity_attribute(client, token, 'wallet-owner-duplicate', replay_identifier)
@@ -1916,9 +2038,14 @@ def main():
           'username': 'wallet-unmapped-fixture', 'enabled': True,
       }, expected=(201,))
       require(unmapped_status == 201, 'create pre-provisioned user without wallet Identity mapping')
-      result['unmapped_account_case'] = account_mapping_denial_flow(
+      unmapped_result = account_mapping_denial_flow(
           client, unmapped_key, unmapped_identifier, 'unmapped-account',
           container, resolver_port, bootstrap, wrapper.name)
+      result['unmapped_account_case'] = unmapped_account_case_evidence(unmapped_result)
+      require(account_policy_denial_is_attributed(result['unmapped_account_case']),
+          'unmapped account denial has fresh provider policy evidence',
+          result['unmapped_account_case'].get('outcome'))
+
       rotated_old_key, rotated_wrapper, rotated_identifier = write_identity(
           temp, bootstrap, label='wallet-login-rotated')
       rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor')
@@ -1957,14 +2084,14 @@ def main():
       disabled_result = account_mapping_denial_flow(
           client, disabled_key, disabled_identifier, 'disabled-account',
           container, resolver_port, bootstrap, wrapper.name)
-      require(disabled_result['current_registry_proof_http'] == 403,
-          'valid proof for disabled mapped user is denied with HTTP 403',
-          disabled_result['current_registry_proof_http'])
+      require(account_policy_denial_is_attributed(disabled_result),
+          'disabled mapped account denial has fresh provider policy evidence',
+          disabled_result.get('outcome'))
       result['disabled_account_case'] = disabled_result
       signup_key, _, signup_identifier = write_identity(
           temp, bootstrap, label='wallet-login-signup')
       signup_browser = Client()
-      result['signup_case'] = signup_wallet_flow(signup_browser, signup_key, signup_identifier, container)
+      result['signup_case'] = signup_wallet_flow(signup_browser, signup_key, signup_identifier, container, client)
       result['rotated_identity_case'] = stale_key_rotation_flow(
           client, rotated_old_key, rotated_key, rotated_identifier, container,
           resolver_port, bootstrap, rotated_wrapper.name)
@@ -1978,11 +2105,12 @@ def main():
       ambiguity_result = account_mapping_denial_flow(
           client, key, identifier, 'ambiguous-account', container,
           resolver_port, bootstrap, wrapper.name)
-      require(ambiguity_result['current_registry_proof_http'] == 403,
-          'duplicate exact local account mapping denies fresh login with HTTP 403')
+      require(account_policy_denial_is_attributed(ambiguity_result),
+          'ambiguous account denial has fresh provider policy evidence',
+          ambiguity_result.get('outcome'))
       result['ambiguous_account_case'] = ambiguity_result
       result['missing_identity_case'] = missing_identity_flow(container, wrapper, resolver_port, bootstrap)
-      print('E2E_CASES_COMPLETE: covered cases passed; overall provider qualification remains limited')
+      print('E2E_SCENARIOS_COMPLETE: inspect per-case outcomes; overall provider qualification remains limited')
       print('evidence=', json.dumps(result, sort_keys=True))
   finally:
     run(['podman', 'rm', '--force', container], timeout=25)

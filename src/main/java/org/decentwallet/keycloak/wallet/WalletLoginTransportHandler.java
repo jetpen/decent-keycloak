@@ -17,7 +17,6 @@ public final class WalletLoginTransportHandler {
   private final WalletLoginIdentityResolver identities;
   private final String walletOrigin;
   private final String idpOrigin;
-  private final String siteLabel;
   private final WalletLoginAccountResolver accounts;
   private final boolean acceptSignup;
   private final WalletLoginTransactionStore transactionStore;
@@ -25,55 +24,38 @@ public final class WalletLoginTransportHandler {
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin) {
-    this(transactions, identities, walletOrigin, null, null, null, true, transactions);
+    this(transactions, identities, walletOrigin, null, null, true, transactions);
   }
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin) {
-    this(transactions, identities, walletOrigin, idpOrigin, null, null, true, transactions);
+    this(transactions, identities, walletOrigin, idpOrigin, null, true, transactions);
   }
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
       WalletLoginAccountResolver accounts) {
-    this(transactions, identities, walletOrigin, idpOrigin, null, accounts, true, transactions);
+    this(transactions, identities, walletOrigin, idpOrigin, accounts, true, transactions);
   }
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
-      String siteLabel, WalletLoginAccountResolver accounts) {
-    this(transactions, identities, walletOrigin, idpOrigin, siteLabel, accounts, true, transactions);
+      WalletLoginAccountResolver accounts, boolean acceptSignup) {
+    this(transactions, identities, walletOrigin, idpOrigin, accounts, acceptSignup, transactions);
   }
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
-      String siteLabel, WalletLoginAccountResolver accounts, boolean acceptSignup) {
-    this(transactions, identities, walletOrigin, idpOrigin, siteLabel, accounts, acceptSignup, transactions);
-  }
-
-  public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
-      WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
-      String siteLabel, WalletLoginAccountResolver accounts, boolean acceptSignup,
+      WalletLoginAccountResolver accounts, boolean acceptSignup,
       WalletLoginTransactionStore transactionStore) {
     this.transactions = java.util.Objects.requireNonNull(transactions);
     this.identities = identities;
     this.walletOrigin = walletOrigin == null || walletOrigin.isBlank()
         ? null : normalizeOrigin(walletOrigin);
     this.idpOrigin = idpOrigin == null ? null : normalizeOrigin(idpOrigin);
-    this.siteLabel = siteLabel == null || siteLabel.isBlank() ? null : siteLabel.trim();
     this.accounts = accounts;
     this.acceptSignup = acceptSignup;
     this.transactionStore = java.util.Objects.requireNonNull(transactionStore);
-  }
-
-  public HttpResult getWalletLocator(String handle, String idpOrigin) {
-    var pending = transactions.load(handle);
-    if (pending.isEmpty()) return HttpResult.empty(404);
-    if (!sameOrigin(idpOrigin, pending.get().binding().canonicalOrigin())
-        || this.idpOrigin != null && !sameOrigin(idpOrigin, this.idpOrigin)) return HttpResult.empty(404);
-    return HttpResult.json(200, Map.of("profile", WalletLoginProof.PROFILE,
-        "challenge", pending.get().challenge(), "csrf_token", pending.get().csrfToken(),
-        "idp_origin", pending.get().binding().canonicalOrigin()));
   }
 
   HttpResult getChallenge(String handle, String requestOrigin, String fetchSite,
@@ -93,11 +75,8 @@ public final class WalletLoginTransportHandler {
     if (!nativeWallet && !validBrowserRequest(requestOrigin, fetchSite, fetchMode, fetchDest)) {
       return HttpResult.empty(403);
     }
-    Map<String, String> body = siteLabel == null ? Map.of("profile", WalletLoginProof.PROFILE,
-        "challenge", pending.get().challenge(), "csrf_token", pending.get().csrfToken())
-        : Map.of("profile", WalletLoginProof.PROFILE, "challenge", pending.get().challenge(),
-            "csrf_token", pending.get().csrfToken(), "site_name", siteLabel);
-    return HttpResult.json(200, body);
+    return HttpResult.json(200, Map.of("profile", WalletLoginProof.PROFILE,
+        "challenge", pending.get().challenge(), "csrf_token", pending.get().csrfToken()));
   }
 
   HttpResult submitProof(String handle, String requestOrigin, String fetchSite,

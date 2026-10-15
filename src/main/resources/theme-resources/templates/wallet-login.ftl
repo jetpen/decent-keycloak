@@ -66,7 +66,7 @@
           polling = false;
           window.setTimeout(poll, 2000);
         };
-        if (walletIntent === "login") {
+        if (walletIntent === "login" || walletIntent === "signup") {
           window.setTimeout(poll, 1500);
         }
       }());

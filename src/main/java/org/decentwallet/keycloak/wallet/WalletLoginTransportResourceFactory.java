@@ -53,7 +53,6 @@ public final class WalletLoginTransportResourceFactory
     String idpOrigin = canonicalIdpOrigin(publicBase, realm.getAttribute(KEY_IDP_ORIGIN));
     var store = new WalletLoginTransactionStore(session.singleUseObjects(),
         new java.security.SecureRandom(), java.time.Clock.systemUTC());
-    String siteLabel = realm.getAttribute(KEY_SITE_LABEL);
     WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
       @Override public boolean hasUniqueEnabledUser(String identityId) {
         return WalletLoginAccountMapping.hasUniqueEnabledMapping(session.users(), realm, identityId);
@@ -67,7 +66,7 @@ public final class WalletLoginTransportResourceFactory
     };
     var resource = new WalletLoginTransportResource();
     resource.configure(session,
-        new WalletLoginTransportHandler(store, sharedResolver, walletOrigin, idpOrigin, siteLabel, accounts,
+        new WalletLoginTransportHandler(store, sharedResolver, walletOrigin, idpOrigin, accounts,
             acceptSignup, store), idpOrigin, acceptSignup);
     return resource;
   }

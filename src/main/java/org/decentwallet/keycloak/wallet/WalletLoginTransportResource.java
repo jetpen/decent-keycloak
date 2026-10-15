@@ -83,9 +83,9 @@ public final class WalletLoginTransportResource implements RealmResourceProvider
       @HeaderParam("Content-Type") String contentType,
       @HeaderParam("X-Decent-CSRF") String csrf,
       InputStream body) {
-    WalletLoginTransactionStore.Intent intent = signupIntentForBoundTransaction(handle);
+    WalletLoginTransactionStore.Intent expectedIntent = signupIntentForBoundTransaction(handle);
     return processTransactionPost(handle, origin, fetchSite, fetchMode, fetchDest,
-        contentType, csrf, body, intent);
+        contentType, csrf, body, expectedIntent);
   }
 
   private WalletLoginTransactionStore.Intent signupIntentForBoundTransaction(String handle) {
