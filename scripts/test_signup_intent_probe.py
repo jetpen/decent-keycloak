@@ -415,7 +415,14 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertEqual(accepted['outcome'], 'unexpected_acceptance')
     self.assertFalse(accepted['no_acceptance_or_callback'])
 
+  def test_account_policy_request_id_has_128_bits(self):
+    identifier = 'handle-123'
+    expected = __import__('hashlib').sha256(identifier.encode('ascii')).hexdigest()[:32]
+    actual = probe.account_policy_request_id('https://idp.example/transactions/' + identifier)
+    self.assertEqual(expected, actual)
+
   def test_account_policy_denial_requires_fresh_attribution_and_pending_state(self):
+    request_id = '0123456789abcdef0123456789abcdef'
     attributed = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'])
     unclassified = probe.account_mapping_denial_result(403, 'resolved', [])
     accepted = probe.account_mapping_denial_result(202, 'resolved', [])
@@ -425,25 +432,39 @@ class SignupIntentProbeTest(unittest.TestCase):
     unclassified['no_acceptance_or_callback'] = False
     self.assertFalse(probe.account_policy_denial_is_attributed(unclassified))
 
-  def test_account_policy_attribution_uses_only_new_allowlisted_log_categories(self):
+    self.assertEqual(probe.account_policy_request_id('https://idp.example/transactions/handle-123'),
+        __import__('hashlib').sha256(b'handle-123').hexdigest()[:32])
     prior = ['prior log line']
+    request_id = '0123456789abcdef0123456789abcdef'
     current = prior + [
         'INFO Identity ID must not be emitted',
-        'DEBUG Wallet account policy rejected proof (signup=true, registered=false, occupied=true)',
-        'WARN Wallet Identity resolver unavailable (IdentityResolutionException)',
-        'WARN Wallet account mapping lookup unavailable (IllegalStateException)',
+        f'DEBUG Wallet account policy rejected proof (request={request_id}, signup=true, registered=false, occupied=true)',
+        f'WARN Wallet Identity resolver unavailable (request={request_id}, IdentityResolutionException)',
+        f'WARN Wallet account mapping lookup unavailable (request={request_id}, IllegalStateException)',
     ]
-    self.assertEqual(probe.new_account_mapping_log_categories(prior, current), [
-        'account-policy-rejected', 'identity-resolver-unavailable',
-        'account-mapping-unavailable'])
-    self.assertEqual(probe.new_account_mapping_log_categories(prior, ['rotated log']), [])
-    self.assertNotIn('must not be emitted', repr(probe.new_account_mapping_log_categories(prior, current)))
+    self.assertEqual(probe.new_account_mapping_log_categories(prior, current, request_id), [
+        'account-policy-rejected', 'identity-resolver-unavailable', 'account-mapping-unavailable'])
+    self.assertEqual(probe.new_account_mapping_log_categories(prior, ['rotated log'], request_id), [])
+    self.assertNotIn('must not be emitted', repr(probe.new_account_mapping_log_categories(prior, current, request_id)))
 
     full_tail = [f'log-{index}' for index in range(120)]
-    rolled_tail = full_tail[17:] + ['DEBUG Wallet account policy rejected proof (signup=true, registered=false, occupied=true)']
-    self.assertEqual(probe.new_account_mapping_log_categories(full_tail, rolled_tail),
+    rolled_tail = full_tail[17:] + [
+        f'DEBUG Wallet account policy rejected proof (request={request_id}, signup=true, registered=false, occupied=true)']
+    self.assertEqual(probe.new_account_mapping_log_categories(full_tail, rolled_tail, request_id),
         ['account-policy-rejected'])
-    self.assertEqual(probe.new_account_mapping_log_categories(full_tail, ['unrelated log']), [])
+    self.assertEqual(probe.new_account_mapping_log_categories(full_tail, ['unrelated log'], request_id), [])
+
+  def test_account_policy_attribution_ignores_other_request_log_events(self):
+    expected_request_id = '0123456789abcdef0123456789abcdef'
+    other_request_id = 'ffffffffffffffffffffffffffffffff'
+    prior = ['prior log line']
+    current = prior + [
+        f'DEBUG Wallet account policy rejected proof (request={expected_request_id}, signup=true, registered=false, occupied=true)',
+        f'DEBUG Wallet Identity resolver unavailable (request={other_request_id}, IdentityResolutionException)',
+        f'DEBUG Wallet account policy rejected proof (request={other_request_id}, signup=true, registered=false, occupied=true)',
+    ]
+    self.assertEqual(probe.new_account_mapping_log_categories(prior, current, expected_request_id),
+        ['account-policy-rejected'])
 
   def test_signup_template_starts_status_polling_for_signup_as_well_as_login(self):
     source = (Path(__file__).parents[1] / 'src/main/resources/theme-resources/templates/wallet-login.ftl').read_text()

@@ -184,6 +184,42 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void requestCorrelationIdIsOpaqueStableHandleDigest() throws Exception {
+    String handle = "opaque-transaction-handle";
+    String first = WalletLoginTransportHandler.requestCorrelationId(handle);
+    String second = WalletLoginTransportHandler.requestCorrelationId(handle);
+
+    assertEquals(32, first.length());
+    assertTrue(first.matches("[0-9a-f]{32}"));
+    assertEquals(first, second);
+    assertFalse(first.contains(handle));
+  }
+
+  @Test
+  void accountPolicyDecisionLogIncludesOnlyOpaqueRequestCorrelationId() throws Exception {
+    var source = java.nio.file.Files.readString(java.nio.file.Path.of(
+        "src/main/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandler.java"));
+    var start = source.indexOf("if (intent != WalletLoginTransactionStore.Intent.SIGNUP || !acceptSignup || occupied)");
+    var end = source.indexOf("return HttpResult.empty(403);", start);
+    var log = source.substring(start, end);
+
+    assertTrue(start >= 0 && end > start);
+    assertTrue(log.contains("Wallet account policy rejected proof (request=%s"));
+    assertFalse(log.contains("proof.identityId()"));
+    assertFalse(log.contains("proof.signature()"));
+    assertFalse(log.contains("pending.get().csrfToken()"));
+  }
+
+  @Test
+  void resolverAndMappingLogsIncludeOnlyOpaqueRequestCorrelationId() throws Exception {
+    var source = java.nio.file.Files.readString(java.nio.file.Path.of(
+        "src/main/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandler.java"));
+    assertTrue(source.contains("Wallet Identity resolver unavailable (request=%s, %s)"));
+    assertTrue(source.contains("Wallet account mapping lookup unavailable (request=%s, %s)"));
+    assertFalse(source.contains("Wallet Identity resolver unavailable (%s)"));
+  }
+
+  @Test
   void signupProvisionedAccountIsNotCompensatedWhenConsumeLoses() throws Exception {
     var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var provider = new MemoryStore();

@@ -1212,8 +1212,10 @@ def account_mapping_denial_flow(client, key, identity_id, scenario, container, r
       print(f'{scenario} direct Registry lookup {registry_lookup_outcome}')
   except (subprocess.TimeoutExpired, RuntimeError) as resolver_failure:
     print(f'{scenario} direct Registry lookup unavailable: {type(resolver_failure).__name__}')
-  # This signed provider proof determines account policy even when the separate
-  # container lookup emitted peer-unavailable diagnostics.
+  logs_before = run(['podman', 'logs', '--tail', '120', container], timeout=15)
+  previous_log_lines = logs_before.stdout.splitlines() if logs_before.returncode == 0 else None
+  expected_request_id = account_policy_request_id(locator)
+  require(expected_request_id is not None, f'{scenario} opaque log correlation token')
   proof = json.dumps({
       'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identity_id, 'signature': b64url(signature.stdout),
@@ -1232,7 +1234,9 @@ def account_mapping_denial_flow(client, key, identity_id, scenario, container, r
       f'{scenario} proof yielded no accepted receipt or callback')
   server_diagnostics = run(['podman', 'logs', '--tail', '120', container], timeout=15)
   current_log_lines = server_diagnostics.stdout.splitlines() if server_diagnostics.returncode == 0 else []
-  safe_categories = new_account_mapping_log_categories(previous_log_lines, current_log_lines)[:12]
+  expected_request_id = account_policy_request_id(locator)
+  safe_categories = new_account_mapping_log_categories(
+      previous_log_lines, current_log_lines, expected_request_id)
   if safe_categories:
     print(f'{scenario} provider-failure-categories:', json.dumps(safe_categories))
   result = account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories)
@@ -1243,7 +1247,12 @@ def account_mapping_denial_flow(client, key, identity_id, scenario, container, r
   return result
 
 
-def new_account_mapping_log_categories(previous_lines, current_lines):
+def account_policy_request_id(locator):
+  handle = urllib.parse.urlsplit(locator).path.rsplit('/', 1)[-1]
+  return hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+
+
+def new_account_mapping_log_categories(previous_lines, current_lines, expected_request_id):
   if previous_lines is None:
     return []
   maximum_overlap = min(len(previous_lines), len(current_lines))
@@ -1254,13 +1263,24 @@ def new_account_mapping_log_categories(previous_lines, current_lines):
       break
   if previous_lines and overlap == 0:
     return []
+  if not re.fullmatch(r'[0-9a-f]{32}', expected_request_id):
+    return []
   categories = []
   for line in current_lines[overlap:]:
-    if 'Wallet account policy rejected proof (' in line:
+    policy_match = re.search(r'Wallet account policy rejected proof \(request=([0-9a-f]{32}),', line)
+    resolver_match = re.search(r'Wallet Identity resolver unavailable \(request=([0-9a-f]{32}),', line)
+    mapping_match = re.search(r'Wallet account mapping lookup unavailable \(request=([0-9a-f]{32}),', line)
+    matched = policy_match or resolver_match or mapping_match
+    if matched is None:
+      continue
+    request_id = matched.group(1)
+    if request_id != expected_request_id:
+      continue
+    if policy_match:
       categories.append('account-policy-rejected')
-    elif 'Wallet Identity resolver unavailable (' in line:
+    elif resolver_match:
       categories.append('identity-resolver-unavailable')
-    elif 'Wallet account mapping lookup unavailable (' in line:
+    elif mapping_match:
       categories.append('account-mapping-unavailable')
   return categories
 

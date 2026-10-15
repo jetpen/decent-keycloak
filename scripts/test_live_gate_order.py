@@ -5,6 +5,7 @@ import ast
 from pathlib import Path
 
 PROBE = Path(__file__).with_name("wallet_login_live_e2e.py")
+ROOT = Path(__file__).parents[1]
 
 
 def _function_node(name: str) -> ast.FunctionDef:
@@ -19,7 +20,7 @@ def test_live_account_denial_flow_records_unavailable_direct_probe_as_diagnostic
   function = source[start:end]
   assert "except (subprocess.TimeoutExpired, RuntimeError) as resolver_failure" in function
   assert "direct Registry lookup unavailable" in function
-  assert "container lookup emitted peer-unavailable diagnostics" in function
+  assert "expected_request_id = account_policy_request_id(locator)" in function
 
 
 def test_live_disabled_account_fixture_has_distinct_identity_and_user_mapping():
@@ -87,12 +88,20 @@ def test_unclassified_403_diagnostic_does_not_claim_registry_unavailable():
   assert "Registry lookup was unavailable; policy denial unqualified" not in function
 
 
-def test_account_mapping_denial_cases_require_fresh_policy_attribution():
+def test_live_account_denials_require_request_specific_registry_and_log_evidence():
   source = PROBE.read_text()
-  main = source[source.index("def main():"):]
+  main = source[source.index("def main():") :]
   assert "account_policy_denial_is_attributed(result['unmapped_account_case'])" in main
   assert "account_policy_denial_is_attributed(disabled_result)" in main
   assert "account_policy_denial_is_attributed(ambiguity_result)" in main
+  assert "expected_request_id = account_policy_request_id(locator)" in source
+  assert "request_id != expected_request_id" in source
+
+
+def test_account_policy_request_id_is_derived_from_opaque_handle():
+  source = PROBE.read_text()
+  assert "hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]" in source
+  assert "Wallet account policy rejected proof (request=%s, signup=%s" in (ROOT / "src/main/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandler.java").read_text()
 
 
 def test_latest_e2e_summary_does_not_claim_unqualified_scenarios_passed():

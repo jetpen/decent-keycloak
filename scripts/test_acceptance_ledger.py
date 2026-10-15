@@ -7,25 +7,15 @@ from pathlib import Path
 README = Path(__file__).parents[1] / "README.md"
 def test_acceptance_ledger_reports_fresh_signup_evidence_and_remaining_gates():
     text = README.read_text()
-    assert "`mvn -o clean package` passed 122 tests across 12 suites" in text
-    assert "Latest repeated disposable runs" in text
-    assert "If consumption loses, the losing request publishes no accepted receipt or callback" in text
-    assert "a concurrent winner may still succeed" in text
-    assert "ef6c0a0a0a59d89a2549493e3b99b54441fbc9c723870da4da6879c958e9be02" in text
-    assert "unmapped/disabled policy denial with fresh `account-policy-rejected` events" in text
-    assert "bounded log-tail evidence without an explicit request ID" in text
-    assert "The first run stopped at stale-owner proof HTTP 503" in text
-    assert "The retry passed stale-owner rejection (401/pending) and current-key proof 202/accepted" in text
-    assert "Neither run reached missing-Identity" in text
-    assert "the harness correctly left the case unclassified" in text
-    assert "81 tests and 10 subtests" in text
-    assert "host harness SHA-256 `b628838ffb9aa89a73011218e94abdf7d8ac20b873894c4a1bb7f74e9d066398`" in text
-    assert "Both exited 1" in text
-    assert "An earlier full run on image `sha256:53de80ab84036364b864807ffaca3c564174ff4516535fa7d2a84923e54be648`" in text
-    assert "predates the exact challenge-response correction" in text
-    assert "WALLET_IT_NATIVE_LIBS=/home/ben/.hermes/cache/scratch/keycloak-ubi9-lib/usr/lib64" in text
+    assert "`mvn -o clean package` passed 125 tests across 12 suites" in text
+    assert "Latest two disposable runs" in text
+    assert "462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e" in text
+    assert "The first completed all scenarios (exit 0)" in text
+    assert "A repeat on the same image exited 1 at current-key proof HTTP 503" in text
+    assert "Registry negative and repeatability remain unqualified" in text
+
     assert "Still open from Issue #1" in text
-    assert "request-correlated reproducible attribution of account-policy denials" in text
+    assert "request-correlated reproducible attribution of account-policy denials under concurrent traffic" in text
     assert "self-contained reproducible pinned runtime" in text
     assert "two-node shared-store replay" in text
     assert "Issue #1 remains open" in text
@@ -38,20 +28,17 @@ def test_acceptance_ledger_reports_fresh_signup_evidence_and_remaining_gates():
 
 def test_rotation_section_reports_bounded_current_image_result():
     text = README.read_text()
-    assert "ef6c0a0a0a59d89a2549493e3b99b54441fbc9c723870da4da6879c958e9be02" in text
-    assert "The retry passed stale-owner rejection (401/pending) and current-key proof 202/accepted" in text
-    assert "repeatable stale/current-key rotation" in text
-    assert "earlier full run on image `sha256:53de80ab84036364b864807ffaca3c564174ff4516535fa7d2a84923e54be648`" in text
+    assert "Latest two disposable runs" in text
+    assert "current-key proof HTTP 503" in text
+    assert "Registry negative and repeatability remain unqualified" in text
 
 
 def test_live_probe_results_do_not_claim_production_qualification():
     text = README.read_text()
-    assert "single-node loopback proxy simulation" in text
-    assert "no real wallet client has qualified it" in text
-    assert "Neither run reached missing-Identity" in text
-    assert "both exited 1 before the full scenario sequence completed" in text
-    assert "nondeterministic single-node loopback proxy simulations" in text
-    assert "shared-store qualification" in text
+    assert "Both are single-node loopback/synthetic-signer/host-mounted-runtime simulations" in text
+    assert "current-key proof HTTP 503" in text
+    assert "Registry negative and repeatability remain unqualified" in text
+    assert "two-node shared-store replay" in text
 
 
 

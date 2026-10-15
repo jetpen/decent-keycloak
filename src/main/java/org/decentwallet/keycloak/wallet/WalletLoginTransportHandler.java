@@ -130,6 +130,7 @@ public final class WalletLoginTransportHandler {
       transactions.recordInvalidAttempt(handle);
       return HttpResult.empty(401);
     }
+    String requestId = requestCorrelationId(handle);
     if (identities == null) return HttpResult.empty(503);
 
     if (!transactions.tryAcquireIdentityLookup(handle)) return HttpResult.empty(429);
@@ -137,11 +138,11 @@ public final class WalletLoginTransportHandler {
     try {
       identity = identities.resolveExact(proof.identityId());
     } catch (ProcessIdentityResolver.IdentityResolutionException ex) {
-      LOG.warnf("Wallet Identity resolver unavailable (%s)", ex.getClass().getSimpleName());
+      LOG.warnf("Wallet Identity resolver unavailable (request=%s, %s)", requestId, ex.getClass().getSimpleName());
       if (ex.processMayStillRun()) transactions.blockIdentityLookups(handle, binding);
       return HttpResult.empty(503);
     } catch (Exception ex) {
-      LOG.warnf("Wallet Identity resolver unavailable (%s)", ex.getClass().getSimpleName());
+      LOG.warnf("Wallet Identity resolver unavailable (request=%s, %s)", requestId, ex.getClass().getSimpleName());
       return HttpResult.empty(503);
     }
     if (identity == null || !proof.identityId().equals(identity.identityId())) {
@@ -166,8 +167,8 @@ public final class WalletLoginTransportHandler {
         boolean occupied = accounts.hasUniqueMappedUserIncludingDisabled(proof.identityId());
         LOG.debugf("Wallet account policy occupancy observed (occupied=%s)", occupied);
         if (intent != WalletLoginTransactionStore.Intent.SIGNUP || !acceptSignup || occupied) {
-          LOG.debugf("Wallet account policy rejected proof (signup=%s, registered=%s, occupied=%s)",
-              intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup, occupied);
+          LOG.debugf("Wallet account policy rejected proof (request=%s, signup=%s, registered=%s, occupied=%s)",
+              requestId, intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup, occupied);
           return HttpResult.empty(403);
         }
         org.keycloak.models.UserModel provisioned = accounts.ensureEnabledUser(proof.identityId());
@@ -175,7 +176,7 @@ public final class WalletLoginTransportHandler {
         if (!accounts.hasUniqueEnabledUser(proof.identityId())) return HttpResult.empty(403);
       }
     } catch (Exception unavailable) {
-      LOG.warnf("Wallet account mapping lookup unavailable (%s)", unavailable.getClass().getSimpleName());
+      LOG.warnf("Wallet account mapping lookup unavailable (request=%s, %s)", requestId, unavailable.getClass().getSimpleName());
       return HttpResult.empty(503);
     }
 
@@ -311,6 +312,10 @@ public final class WalletLoginTransportHandler {
     if (expected == null || received == null) return false;
     return MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
         received.getBytes(StandardCharsets.US_ASCII));
+  }
+  static String requestCorrelationId(String handle) {
+    byte[] digest = sha256(handle.getBytes(StandardCharsets.US_ASCII));
+    return java.util.HexFormat.of().formatHex(digest, 0, 16);
   }
   private static byte[] sha256(byte[] bytes) {
     try { return MessageDigest.getInstance("SHA-256").digest(bytes); }
