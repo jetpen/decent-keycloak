@@ -1160,9 +1160,14 @@ final class WalletLoginTransportHandlerTest {
     for (var otherBinding : otherBindings) {
       assertTrue(store.getAccepted(issued.handle(), otherBinding).isEmpty());
       assertFalse(store.callbackGateAvailable(issued.handle(), otherBinding));
+      assertTrue(store.takeAccepted(issued.handle(), otherBinding).isEmpty());
+      assertTrue(store.callbackGateAvailable(issued.handle(), BINDING));
     }
     assertTrue(store.getAccepted(issued.handle(), BINDING).isPresent());
     assertTrue(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.takeAccepted(issued.handle(), BINDING).isPresent());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
   }
 
   private static byte[] signedProof(String challenge, String identity, KeyPair keyPair) throws Exception {
