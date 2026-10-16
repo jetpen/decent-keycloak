@@ -688,16 +688,56 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
-  void signupOccupancyLookupFailureReturnsUnavailableBeforeCreateAndLeavesTransactionPending() throws Exception {
+  void enabledAccountCandidateCapFailureReturnsUnavailableAndLeavesTransactionPending() throws Exception {
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
     var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
-    byte[] proof = signedProof(issued.challenge(), "mailto:occupancy-outage@example.org", keyPair);
+    byte[] proof = signedProof(issued.challenge(), "mailto:enabled-cap@example.org", keyPair);
+    var realm = org.mockito.Mockito.mock(org.keycloak.models.RealmModel.class);
+    var users = org.mockito.Mockito.mock(org.keycloak.models.UserProvider.class);
+    org.mockito.Mockito.when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, "mailto:enabled-cap@example.org"))
+        .thenReturn(java.util.stream.IntStream.range(0, 65)
+            .mapToObj(index -> org.mockito.Mockito.mock(org.keycloak.models.UserModel.class)));
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueEnabledMapping(users, realm, exactIdentityId);
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, exactIdentityId);
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.ensureEnabledUser(users, realm, exactIdentityId, true);
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+    var result = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+
+    assertEquals(503, result.status());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).addUser(
+        org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.isNull(),
+        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.eq(true),
+        org.mockito.ArgumentMatchers.eq(true));
+    assertTrue(store.load(issued.handle()).isPresent());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  @Test
+  void nullOccupancySearchReturnsUnavailableBeforeSignupAndLeavesTransactionPending() throws Exception {
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    byte[] proof = signedProof(issued.challenge(), "mailto:occupancy-null-stream@example.org", keyPair);
     var createCalls = new java.util.concurrent.atomic.AtomicInteger();
     WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
       @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return false; }
       @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
-        throw new IllegalStateException("occupancy lookup unavailable");
+        throw new IllegalStateException("identity mapping lookup unavailable");
       }
       @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
         createCalls.incrementAndGet();
@@ -712,6 +752,47 @@ final class WalletLoginTransportHandlerTest {
         "application/json", null, proof, IDP_ORIGIN);
 
     assertEquals(503, result.status());
+    assertEquals(0, createCalls.get());
+    assertTrue(store.load(issued.handle()).isPresent());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  @Test
+  void signupOccupancyCandidateCapReturnsUnavailableBeforeCreateAndLeavesTransactionPending() throws Exception {
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    byte[] proof = signedProof(issued.challenge(), "mailto:occupancy-cap@example.org", keyPair);
+    var realm = org.mockito.Mockito.mock(org.keycloak.models.RealmModel.class);
+    var users = org.mockito.Mockito.mock(org.keycloak.models.UserProvider.class);
+    var createCalls = new java.util.concurrent.atomic.AtomicInteger();
+    org.mockito.Mockito.when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, "mailto:occupancy-cap@example.org"))
+        .thenReturn(java.util.stream.IntStream.range(0, 65)
+            .mapToObj(index -> org.mockito.Mockito.mock(org.keycloak.models.UserModel.class)));
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return false; }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, exactIdentityId);
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        createCalls.incrementAndGet();
+        return org.mockito.Mockito.mock(org.keycloak.models.UserModel.class);
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+    var result = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+
+    assertEquals(503, result.status());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).addUser(
+        org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.isNull(),
+        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.eq(true),
+        org.mockito.ArgumentMatchers.eq(true));
     assertEquals(0, createCalls.get());
     assertTrue(store.load(issued.handle()).isPresent());
     assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
