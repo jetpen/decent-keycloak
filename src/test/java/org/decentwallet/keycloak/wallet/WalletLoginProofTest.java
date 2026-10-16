@@ -1,4 +1,4 @@
-package org.decent.keycloak.wallet;
+package org.decentwallet.keycloak.wallet;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;

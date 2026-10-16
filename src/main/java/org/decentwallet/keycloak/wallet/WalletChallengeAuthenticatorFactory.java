@@ -1,6 +1,9 @@
-package org.decent.keycloak.wallet;
+package org.decentwallet.keycloak.wallet;
 
+import java.security.SecureRandom;
+import java.time.Clock;
 import java.util.List;
+
 import org.keycloak.authentication.Authenticator;
 import org.keycloak.authentication.AuthenticatorFactory;
 import org.keycloak.authentication.ConfigurableAuthenticatorFactory;
@@ -11,18 +14,27 @@ import org.keycloak.provider.ProviderConfigProperty;
 /** SPI registration and required-flow metadata for the development authenticator. */
 public final class WalletChallengeAuthenticatorFactory implements AuthenticatorFactory, ConfigurableAuthenticatorFactory {
   public static final String ID = "decent-wallet-challenge";
-  private static final Authenticator AUTHENTICATOR = new WalletChallengeAuthenticator();
-  @Override public Authenticator create(KeycloakSession session) { return AUTHENTICATOR; }
+  @Override public Authenticator create(KeycloakSession session) {
+    return new WalletChallengeAuthenticator(() -> new WalletLoginTransactionStore(
+        session.singleUseObjects(), new SecureRandom(), Clock.systemUTC()));
+  }
   @Override public String getId() { return ID; }
   @Override public String getDisplayType() { return "Decent wallet challenge (development spike)"; }
   @Override public String getReferenceCategory() { return "decent-wallet"; }
-  @Override public boolean isConfigurable() { return false; }
+  @Override public boolean isConfigurable() { return true; }
   @Override public AuthenticationExecutionModel.Requirement[] getRequirementChoices() {
     return new AuthenticationExecutionModel.Requirement[] {AuthenticationExecutionModel.Requirement.REQUIRED};
   }
   @Override public boolean isUserSetupAllowed() { return false; }
-  @Override public String getHelpText() { return "Development-only request for a fresh wallet challenge; no wallet verifier is wired yet."; }
-  @Override public List<ProviderConfigProperty> getConfigProperties() { return List.of(); }
+  @Override public String getHelpText() { return "Starts the provider-hosted decent-wallet-login-v1 flow. Configure trusted-origins and the realm's decent.wallet.* transport/Identity settings, including decent.wallet.site-name."; }
+  @Override public List<ProviderConfigProperty> getConfigProperties() {
+    ProviderConfigProperty origins = new ProviderConfigProperty();
+    origins.setName("trusted-origins");
+    origins.setLabel("Trusted HTTPS origin");
+    origins.setType(ProviderConfigProperty.TEXT_TYPE);
+    origins.setHelpText("One exact HTTPS Keycloak public origin, including port if non-default. It must match trusted hostname/proxy configuration.");
+    return List.of(origins);
+  }
   @Override public void init(org.keycloak.Config.Scope config) {}
   @Override public void postInit(KeycloakSessionFactory factory) {}
   @Override public void close() {}

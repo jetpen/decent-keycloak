@@ -1,3 +1,6 @@
 
 # Maven build output
 target/
+
+# Python test/runtime artifacts
+scripts/__pycache__/
