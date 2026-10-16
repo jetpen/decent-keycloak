@@ -688,7 +688,7 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
-  void enabledAccountCandidateCapFailureReturnsUnavailableAndLeavesTransactionPending() throws Exception {
+  void enabledAccountCandidateCapFailsClosedForSignupHandler() throws Exception {
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
     var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
@@ -1103,14 +1103,76 @@ final class WalletLoginTransportHandlerTest {
     assertTrue(store.load(issued.handle()).isPresent());
   }
 
-  private static byte[] signedProof(String challenge, String identity, KeyPair pair) throws Exception {
+  @Test
+  void proofForOneTransactionCannotBeSubmittedAtAnotherValidTransactionHandle() throws Exception {
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var initiatingTransaction = store.issue(BINDING);
+    var otherTransaction = store.issue(BINDING);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    byte[] initiatingProof = signedProof(initiatingTransaction.challenge(), "mailto:wrong-handle@example.org", keyPair);
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+
+    var crossHandleAttempt = handler.submitProof(otherTransaction.handle(), null, null, null, null,
+        "application/json", null, initiatingProof, IDP_ORIGIN);
+    var initiatingAttempt = handler.submitProof(initiatingTransaction.handle(), null, null, null, null,
+        "application/json", null, initiatingProof, IDP_ORIGIN);
+
+    assertEquals(401, crossHandleAttempt.status());
+    assertEquals(202, initiatingAttempt.status());
+    assertTrue(store.load(otherTransaction.handle()).isPresent());
+    assertFalse(store.load(initiatingTransaction.handle()).isPresent());
+    assertTrue(store.getAccepted(otherTransaction.handle(), BINDING).isEmpty());
+    assertTrue(store.getAccepted(initiatingTransaction.handle(), BINDING).isPresent());
+    assertFalse(store.callbackGateAvailable(otherTransaction.handle(), BINDING));
+    assertTrue(store.callbackGateAvailable(initiatingTransaction.handle(), BINDING));
+  }
+
+  @Test
+  void acceptedReceiptAndCallbackGateRequireExactInitiatingBinding() throws Exception {
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    byte[] proof = signedProof(issued.challenge(), "mailto:binding-check@example.org", keyPair);
+    var accepted = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+    var result = accepted.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+        issued.csrfToken(), proof, IDP_ORIGIN);
+    assertEquals(202, result.status());
+    assertFalse(store.load(issued.handle()).isPresent());
+
+    var otherBindings = java.util.List.of(
+        new WalletLoginTransactionStore.Binding("other-realm", BINDING.clientId(), BINDING.rootSessionId(),
+            BINDING.tabId(), BINDING.redirectUri(), BINDING.canonicalOrigin()),
+        new WalletLoginTransactionStore.Binding(BINDING.realmId(), "other-client", BINDING.rootSessionId(),
+            BINDING.tabId(), BINDING.redirectUri(), BINDING.canonicalOrigin()),
+        new WalletLoginTransactionStore.Binding(BINDING.realmId(), BINDING.clientId(), "other-root-session",
+            BINDING.tabId(), BINDING.redirectUri(), BINDING.canonicalOrigin()),
+        new WalletLoginTransactionStore.Binding(BINDING.realmId(), BINDING.clientId(), BINDING.rootSessionId(),
+            "other-tab", BINDING.redirectUri(), BINDING.canonicalOrigin()),
+        new WalletLoginTransactionStore.Binding(BINDING.realmId(), BINDING.clientId(), BINDING.rootSessionId(),
+            BINDING.tabId(), "https://other.example/callback", BINDING.canonicalOrigin()),
+        new WalletLoginTransactionStore.Binding(BINDING.realmId(), BINDING.clientId(), BINDING.rootSessionId(),
+            BINDING.tabId(), BINDING.redirectUri(), "https://other-idp.example"));
+
+    for (var otherBinding : otherBindings) {
+      assertTrue(store.getAccepted(issued.handle(), otherBinding).isEmpty());
+      assertFalse(store.callbackGateAvailable(issued.handle(), otherBinding));
+    }
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isPresent());
+    assertTrue(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  private static byte[] signedProof(String challenge, String identity, KeyPair keyPair) throws Exception {
     Map<String, Object> signed = new LinkedHashMap<>();
     signed.put("profile", WalletLoginProof.PROFILE);
     signed.put("challenge", challenge);
     signed.put("identity_id", identity);
     byte[] bytes = new JsonCanonicalizer(new ObjectMapper().writeValueAsString(signed)).getEncodedUTF8();
     Signature signer = Signature.getInstance("Ed25519");
-    signer.initSign(pair.getPrivate());
+    signer.initSign(keyPair.getPrivate());
     signer.update(bytes);
     String signature = Base64.getUrlEncoder().withoutPadding().encodeToString(signer.sign());
     return ("{\"profile\":\"" + WalletLoginProof.PROFILE + "\",\"challenge\":\"" + challenge

@@ -9,7 +9,7 @@ This repository owns the Keycloak-specific adapter for the approved, provider-ne
 - **Latest two disposable runs:** both used immutable image `sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e` and harness SHA-256 `a4d649a03b3a5d3dc15157e0b00cfa38cc3acc87bd32ef86cbbf82f578e0182d`. The first completed all scenarios (exit 0): login/PKCE, signup/account readback, preflight/security, invalid-proof/throttle, request-correlated account denials, and rotation (sequence 2/current key; stale proof 401/pending; current proof 202/accepted). Missing Identity was unavailable, not a proven miss: CLI output contained a peer-handshake diagnostic, provider returned 503, and the transaction stayed pending with no callback. A repeat on the same image exited 1 at current-key proof HTTP 503 after the provider resolver emitted peer-handshake diagnostics; stale proof had returned 401/pending. Registry negative and repeatability remain unqualified. Both are single-node loopback/synthetic-signer/host-mounted-runtime simulations, not real TLS/browser-wallet, shared-store, or production qualification.
 ### Offline verification
 
-The latest clean Maven package passed 140 tests across 12 suites with zero failures, errors, or skips. The Python harness passed 83 tests plus 10 subtests; compilation and `git diff --check` passed.
+The latest clean Maven package passed 142 tests across 12 suites with zero failures, errors, or skips; the handler regressions exercise candidate-cap, transaction-handle, and browser-binding failure paths. The Python harness passed 83 tests plus 10 subtests; compilation and `git diff --check` passed.
 
 ### Live run provenance
 
