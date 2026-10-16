@@ -134,6 +134,37 @@ final class WalletLoginTransactionStoreTest {
   }
 
   @Test
+  void onlyOneConcurrentCallbackRedemptionCanConsumeAcceptedGate() throws Exception {
+    var provider = new BarrierOnAcceptedReceiptReads();
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    assertTrue(store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).isPresent());
+    store.markAccepted(issued.handle(), BINDING, "proof-digest", "mailto:alice@example.org", "AA", issued.csrfToken());
+
+    var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+    var ready = new java.util.concurrent.CountDownLatch(2);
+    var start = new java.util.concurrent.CountDownLatch(1);
+    try {
+      var attempts = java.util.stream.IntStream.range(0, 2).mapToObj(index -> pool.submit(() -> {
+        ready.countDown();
+        start.await();
+        return store.takeAccepted(issued.handle(), BINDING);
+      })).toList();
+      assertTrue(ready.await(3, java.util.concurrent.TimeUnit.SECONDS));
+      start.countDown();
+      long winners = 0;
+      for (var attempt : attempts) if (attempt.get(5, java.util.concurrent.TimeUnit.SECONDS).isPresent()) winners++;
+
+      assertEquals(1, winners);
+      assertTrue(store.getAccepted(issued.handle(), BINDING).isPresent());
+      assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+      assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+    } finally {
+      pool.shutdownNow();
+    }
+  }
+
+  @Test
   void callbackGateIsPublishedBeforeAcceptedStatusBecomesVisible() {
     var provider = new MemorySingleUseStore();
     var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
@@ -186,7 +217,27 @@ final class WalletLoginTransactionStoreTest {
     assertTrue(provider.entries.isEmpty());
   }
 
-  private static final class MemorySingleUseStore implements SingleUseObjectProvider {
+  private static final class BarrierOnAcceptedReceiptReads extends MemorySingleUseStore {
+    private final java.util.concurrent.CountDownLatch readers = new java.util.concurrent.CountDownLatch(2);
+
+    @Override public Map<String, String> get(String key) {
+      Map<String, String> value = super.get(key);
+      if (key.startsWith("decent-wallet-login-v1:accepted:")) {
+        readers.countDown();
+        try {
+          if (!readers.await(3, java.util.concurrent.TimeUnit.SECONDS)) {
+            throw new IllegalStateException("callback redemption did not have two receipt readers");
+          }
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("interrupted while synchronizing callback redemptions", interrupted);
+        }
+      }
+      return value;
+    }
+  }
+
+  private static class MemorySingleUseStore implements SingleUseObjectProvider {
     private final Map<String, Map<String, String>> entries = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.List<String> putIfAbsentKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final java.util.concurrent.ConcurrentHashMap<String, Long> lifespans = new java.util.concurrent.ConcurrentHashMap<>();
