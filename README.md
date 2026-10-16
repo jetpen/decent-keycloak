@@ -7,8 +7,13 @@ This repository owns the Keycloak-specific adapter for the approved, provider-ne
 ## Current evidence and limits
 
 - **Latest two disposable runs:** both used immutable image `sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e` and harness SHA-256 `a4d649a03b3a5d3dc15157e0b00cfa38cc3acc87bd32ef86cbbf82f578e0182d`. The first completed all scenarios (exit 0): login/PKCE, signup/account readback, preflight/security, invalid-proof/throttle, request-correlated account denials, and rotation (sequence 2/current key; stale proof 401/pending; current proof 202/accepted). Missing Identity was unavailable, not a proven miss: CLI output contained a peer-handshake diagnostic, provider returned 503, and the transaction stayed pending with no callback. A repeat on the same image exited 1 at current-key proof HTTP 503 after the provider resolver emitted peer-handshake diagnostics; stale proof had returned 401/pending. Registry negative and repeatability remain unqualified. Both are single-node loopback/synthetic-signer/host-mounted-runtime simulations, not real TLS/browser-wallet, shared-store, or production qualification.
-- **Offline verification:** `mvn -o clean package` passed 136 tests across 12 suites (0 failures/errors/skips); `scripts/test_*.py` passed 83 tests and 10 subtests; Python compilation and `git diff --check` passed.
-- **Run provenance:** image `sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e`; harness SHA-256 `a4d649a03b3a5d3dc15157e0b00cfa38cc3acc87bd32ef86cbbf82f578e0182d`; run one exit 0 with all cases reached, repeat exit 1 at current-key HTTP 503 during rotation. Both used:
+### Offline verification
+
+The latest clean Maven package passed 138 tests across 12 suites with zero failures, errors, or skips. The Python harness passed 83 tests plus 10 subtests; compilation and `git diff --check` passed.
+
+### Live run provenance
+
+Image `sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e`; harness SHA-256 `a4d649a03b3a5d3dc15157e0b00cfa38cc3acc87bd32ef86cbbf82f578e0182d`; run one exit 0 with all cases reached, repeat exit 1 at current-key HTTP 503 during rotation. Both used:
   ```bash
   WALLET_IT_IMAGE=sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e \
   WALLET_IT_NATIVE_LIBS=/home/ben/.hermes/cache/scratch/keycloak-ubi9-lib/usr/lib64 \
@@ -16,7 +21,10 @@ This repository owns the Keycloak-specific adapter for the approved, provider-ne
   PYTHONPATH=/home/ben/projects/decent-registry/src:/home/ben/projects/decent-identity/src \
   /home/ben/projects/decent-registry/.venv/bin/python scripts/wallet_login_live_e2e.py
   ```
-- **Still open from Issue #1:** real TLS and actual browser/native-wallet interoperability, including native challenge GET with browser metadata absent (the route behavior is implemented but no real wallet client has qualified it); repeatable Registry negative/rotation matrix, including repeated stale/current-key and missing-identity tests; request-correlated reproducible attribution of account-policy denials under concurrent traffic; two-node shared-store replay; signup concurrency/recovery (a losing consume/receipt write can still leave an account provisioned); a self-contained reproducible pinned runtime (the harness currently host-mounts Registry/Identity runtimes and GMP); relying-party/WordPress acceptance; security review; supported Keycloak version/upgrade scope; and docs/CI. Issue #1 remains open.
+
+### Still open from Issue #1
+
+Real TLS and actual browser/native-wallet interoperability, including native challenge GET with browser metadata absent (the route behavior is implemented but no real wallet client has qualified it); repeatable Registry negative/rotation matrix, including repeated stale/current-key and missing-identity tests; request-correlated reproducible attribution of account-policy denials under concurrent traffic; two-node shared-store replay; signup concurrency/recovery (a losing consume/receipt write can still leave an account provisioned); a self-contained reproducible pinned runtime (the harness currently host-mounts Registry/Identity runtimes and GMP); relying-party/WordPress acceptance; security review; supported Keycloak version/upgrade scope; and docs/CI. Issue #1 remains open.
 
 ## Implemented flow shape
 

@@ -237,6 +237,32 @@ final class WalletLoginAccountMappingTest {
   }
 
   @Test
+  void enabledMappingLookupCandidateCapIsUnavailableInsteadOfMissing() {
+    String identityId = "mailto:enabled-too-many-candidates@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(java.util.stream.IntStream.range(0, 65).mapToObj(index -> mock(UserModel.class)));
+
+    org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.hasUniqueEnabledMapping(users, realm, identityId));
+  }
+
+  @Test
+  void occupancyLookupCandidateCapIsUnavailableInsteadOfUnoccupied() {
+    String identityId = "mailto:occupancy-too-many-candidates@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(java.util.stream.IntStream.range(0, 65).mapToObj(index -> mock(UserModel.class)));
+
+    org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, identityId));
+  }
+
+  @Test
   void rejectsMissingDuplicateAndDisabledMappings() {
     String identityId = "mailto:Alice@example.org";
     var realm = mock(RealmModel.class);
