@@ -200,6 +200,76 @@ class WalletLoginTransportResourceRouteTest {
   }
 
   @Test
+  void statusReturns404WithoutCallbackWhenOneUseGateWasAlreadyConsumed() throws Exception {
+    var resource = new WalletLoginTransportResource();
+    var session = org.mockito.Mockito.mock(org.keycloak.models.KeycloakSession.class);
+    var context = org.mockito.Mockito.mock(org.keycloak.models.KeycloakContext.class);
+    var uri = org.mockito.Mockito.mock(org.keycloak.models.KeycloakUriInfo.class);
+    var realm = org.mockito.Mockito.mock(org.keycloak.models.RealmModel.class);
+    var client = org.mockito.Mockito.mock(org.keycloak.models.ClientModel.class);
+    var auth = org.mockito.Mockito.mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var parent = org.mockito.Mockito.mock(org.keycloak.sessions.RootAuthenticationSessionModel.class);
+    org.mockito.Mockito.when(session.getContext()).thenReturn(context);
+    org.mockito.Mockito.when(context.getUri()).thenReturn(uri);
+    org.mockito.Mockito.when(context.getRealm()).thenReturn(realm);
+    var query = new jakarta.ws.rs.core.MultivaluedHashMap<String, String>();
+    query.add("client_id", "client-public");
+    query.add("tab_id", BINDING.tabId());
+    org.mockito.Mockito.when(uri.getQueryParameters()).thenReturn(query);
+    org.mockito.Mockito.when(realm.getClientByClientId("client-public")).thenReturn(client);
+    org.mockito.Mockito.when(realm.getId()).thenReturn(BINDING.realmId());
+    org.mockito.Mockito.when(client.getId()).thenReturn(BINDING.clientId());
+    org.mockito.Mockito.when(auth.getClient()).thenReturn(client);
+    org.mockito.Mockito.when(auth.getParentSession()).thenReturn(parent);
+    org.mockito.Mockito.when(parent.getId()).thenReturn(BINDING.rootSessionId());
+    org.mockito.Mockito.when(auth.getTabId()).thenReturn(BINDING.tabId());
+    org.mockito.Mockito.when(auth.getRedirectUri()).thenReturn(BINDING.redirectUri());
+    org.mockito.Mockito.when(auth.getAuthNote("decent.wallet.client-id")).thenReturn("client-public");
+    org.mockito.Mockito.when(auth.getAuthNote("decent.wallet.redirect_uri")).thenReturn(BINDING.redirectUri());
+    org.mockito.Mockito.when(auth.getAuthNote("decent.wallet.origin")).thenReturn(IDP_ORIGIN);
+    String actionUrl = IDP_ORIGIN + "/auth/realms/demo/login-actions/authenticate?session_code=opaque";
+    org.mockito.Mockito.when(auth.getAuthNote("decent.wallet.callback")).thenReturn(actionUrl);
+    var sessions = org.mockito.Mockito.mock(org.keycloak.services.managers.AuthenticationSessionManager.class);
+    org.mockito.Mockito.when(sessions.getCurrentAuthenticationSession(realm, client, BINDING.tabId()))
+        .thenReturn(auth);
+    setField(resource, "authenticationSessionManagerFactory",
+        (java.util.function.Function<KeycloakSession,
+            org.keycloak.services.managers.AuthenticationSessionManager>) ignored -> sessions);
+
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(),
+        java.time.Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    String handle = issued.handle();
+    org.mockito.Mockito.when(auth.getAuthNote("decent.wallet.handle")).thenReturn(handle);
+    var pending = store.consume(handle, BINDING, issued.challenge(), issued.csrfToken()).orElseThrow();
+    store.markAccepted(handle, BINDING, "proof-digest", "mailto:alice@example.org", "AA",
+        pending.csrfToken(), pending.intent());
+    assertTrue(store.takeAccepted(handle, BINDING).isPresent());
+    var handler = new WalletLoginTransportHandler(store, exact -> null, WALLET_ORIGIN, IDP_ORIGIN);
+    var status = handler.getStatus(handle, null, "same-origin", "cors", "empty",
+        pending.csrfToken(), IDP_ORIGIN, BINDING);
+    assertEquals(404, status.status());
+    setField(resource, "session", session);
+    setField(resource, "handler", handler);
+    setField(resource, "idpOrigin", IDP_ORIGIN);
+    var responseType = org.mockito.Mockito.mockStatic(Response.class);
+    var builder = org.mockito.Mockito.mock(Response.ResponseBuilder.class);
+    responseType.when(() -> Response.status(org.mockito.ArgumentMatchers.anyInt())).thenReturn(builder);
+    responseType.when(() -> Response.fromResponse(org.mockito.ArgumentMatchers.any())).thenReturn(builder);
+    org.mockito.Mockito.when(builder.header(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any()))
+        .thenReturn(builder);
+    var notFoundResponse = org.mockito.Mockito.mock(Response.class);
+    org.mockito.Mockito.when(notFoundResponse.getStatus()).thenReturn(404);
+    org.mockito.Mockito.when(builder.build()).thenReturn(notFoundResponse);
+    try (responseType) {
+      Response result = resource.status(handle, null, "same-origin", "cors", "empty", pending.csrfToken());
+      assertEquals(404, result.getStatus());
+      org.mockito.Mockito.verify(auth, org.mockito.Mockito.never()).getAuthNote("decent.wallet.callback");
+      org.mockito.Mockito.verify(builder, org.mockito.Mockito.never()).entity(org.mockito.ArgumentMatchers.any());
+    }
+  }
+
+  @Test
   void signupStatusReturnsExactGeneratedCallbackForTheInitiatingBrowser() throws Exception {
     var resource = new WalletLoginTransportResource();
     var session = org.mockito.Mockito.mock(org.keycloak.models.KeycloakSession.class);

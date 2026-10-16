@@ -6,8 +6,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.keycloak.authentication.AuthenticationFlowContext;
@@ -54,6 +58,46 @@ final class WalletChallengeUserMappingTest {
   }
 
   @Test
+  void authenticatorDoesNotMarkFlowSuccessfulWhenResumeThrowsAfterGateConsumption() throws Exception {
+    String identityId = "mailto:alice@example.org";
+    var provider = new TestSingleUseObjectProvider();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(),
+        java.time.Clock.systemUTC());
+    var issued = store.issue(binding());
+    var pending = store.consume(issued.handle(), binding(), issued.challenge(), issued.csrfToken()).orElseThrow();
+    store.markAccepted(issued.handle(), binding(), "proof-digest", identityId, "AA",
+        pending.csrfToken(), pending.intent());
+    UserModel user = matchingUser(identityId);
+    Harness harness = arrange(identityId, Stream.of(user), store, issued.handle());
+    org.mockito.Mockito.doThrow(new IllegalStateException("test flow resume failure"))
+        .when(harness.context()).success();
+
+    new WalletChallengeAuthenticator(() -> store).action(harness.context());
+
+    verify(harness.context()).success();
+    verify(harness.context()).failure(AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+    assertTrue(store.getAccepted(issued.handle(), binding()).isPresent());
+    assertTrue(store.takeAccepted(issued.handle(), binding()).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), binding()));
+  }
+
+  @Test
+  void actionFailsClosedWhenCallbackGateWasConsumedAfterReceiptLookup() {
+    String identityId = "mailto:alice@example.org";
+    UserModel user = matchingUser(identityId);
+    Harness harness = arrange(identityId, Stream.of(user));
+    when(harness.store().takeAccepted(anyString(), any())).thenReturn(Optional.empty());
+
+    new WalletChallengeAuthenticator(() -> harness.store()).action(harness.context());
+
+    verify(harness.store()).getAccepted(anyString(), any());
+    verify(harness.store()).takeAccepted(anyString(), any());
+    verify(harness.auth()).setAuthenticatedUser(user);
+    verify(harness.context()).failure(AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+    verify(harness.context(), never()).success();
+  }
+
+  @Test
   void actionFailsClosedWhenMultipleLocalUsersMatchOneIdentity() {
     String identityId = "mailto:alice@example.org";
     UserModel first = matchingUser(identityId);
@@ -75,11 +119,17 @@ final class WalletChallengeUserMappingTest {
   }
 
   private static Harness arrange(String identityId, Stream<UserModel> candidates) {
-    var store = mock(WalletLoginTransactionStore.class);
+    return arrange(identityId, candidates, mock(WalletLoginTransactionStore.class), "A".repeat(43));
+  }
+
+  private static Harness arrange(String identityId, Stream<UserModel> candidates,
+      WalletLoginTransactionStore store, String handle) {
     var receipt = new WalletLoginTransactionStore.AcceptedTransaction(identityId,
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "proof-digest", binding());
-    when(store.getAccepted(anyString(), any())).thenReturn(Optional.of(receipt));
-    when(store.takeAccepted(anyString(), any())).thenReturn(Optional.of(receipt));
+    if (org.mockito.Mockito.mockingDetails(store).isMock()) {
+      when(store.getAccepted(handle, binding())).thenReturn(Optional.of(receipt));
+      when(store.takeAccepted(handle, binding())).thenReturn(Optional.of(receipt));
+    }
 
     var context = mock(AuthenticationFlowContext.class);
     var session = mock(KeycloakSession.class);
@@ -100,13 +150,31 @@ final class WalletChallengeUserMappingTest {
     when(auth.getTabId()).thenReturn("tab-id");
     when(auth.getRedirectUri()).thenReturn("https://site.example/callback");
     when(auth.getAuthNote(anyString())).thenAnswer(invocation -> switch (invocation.getArgument(0, String.class)) {
-      case "decent.wallet.handle" -> "A".repeat(43);
+      case "decent.wallet.handle" -> handle;
       case "decent.wallet.origin" -> "https://idp.example";
       default -> null;
     });
     when(users.searchForUserByUserAttributeStream(realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE,
         identityId)).thenReturn(candidates);
     return new Harness(store, context, auth, realm, users);
+  }
+
+  private static final class TestSingleUseObjectProvider implements org.keycloak.models.SingleUseObjectProvider {
+    private final Map<String, Map<String, String>> entries = new ConcurrentHashMap<>();
+
+    @Override public void put(String key, long lifespanSeconds, Map<String, String> notes) {
+      entries.put(key, Map.copyOf(notes));
+    }
+    @Override public Map<String, String> get(String key) { return entries.get(key); }
+    @Override public Map<String, String> remove(String key) { return entries.remove(key); }
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      return entries.replace(key, Map.copyOf(notes)) != null;
+    }
+    @Override public boolean putIfAbsent(String key, long lifespanSeconds) {
+      return entries.putIfAbsent(key, Map.of()) == null;
+    }
+    @Override public boolean contains(String key) { return entries.containsKey(key); }
+    @Override public void close() {}
   }
 
   private static WalletLoginTransactionStore.Binding binding() {
