@@ -219,6 +219,24 @@ final class WalletLoginAccountMappingTest {
   }
 
   @Test
+  void identityMappingCandidateCapCannotMasqueradeAsEmptyAndCreateUser() {
+    String identityId = "mailto:too-many-candidates@example.org";
+    var realm = mock(RealmModel.class);
+    var users = mock(UserProvider.class);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenReturn(java.util.stream.IntStream.range(0, 65).mapToObj(index -> mock(UserModel.class)));
+
+    org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+        () -> WalletLoginAccountMapping.ensureEnabledUser(users, realm, identityId, true));
+
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).addUser(
+        org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.isNull(),
+        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.eq(true),
+        org.mockito.ArgumentMatchers.eq(true));
+  }
+
+  @Test
   void rejectsMissingDuplicateAndDisabledMappings() {
     String identityId = "mailto:Alice@example.org";
     var realm = mock(RealmModel.class);

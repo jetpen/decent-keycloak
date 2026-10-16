@@ -34,7 +34,7 @@ final class WalletLoginAccountMapping {
           .filter(java.util.Objects::nonNull)
           .limit(MAX_IDENTITY_CANDIDATES + 1)
           .toList();
-      if (scan.size() > MAX_IDENTITY_CANDIDATES) return null;
+      if (scan.size() > MAX_IDENTITY_CANDIDATES) throw new IllegalStateException("identity mapping lookup unavailable");
       matches = scan.stream()
           .filter(user -> identityId.equals(
               user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
