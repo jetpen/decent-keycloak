@@ -250,7 +250,7 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     boolean sawRegistryMiss = false;
     for (int index = 0; index < terminalLine; index++) {
       String line = lines[index];
-      if (isKnownDialWarning(line)) continue;
+      if (isKnownDialWarning(line)) return false;
       if (isRegistryIdentityMiss(line)) {
         if (!expectedObjectKeyHex.equalsIgnoreCase(line.substring(REGISTRY_MISS_PREFIX.length()))) {
           return false;

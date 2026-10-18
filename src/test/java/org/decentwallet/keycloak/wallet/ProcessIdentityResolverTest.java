@@ -374,6 +374,24 @@ final class ProcessIdentityResolverTest {
         + "\nValue not found for key /decent-registry/identity/" + "ab".repeat(32) + "\nnot found\n";
     assertFalse(ProcessIdentityResolver.isConfirmedIdentityNotFound(wrongKeyDiagnostics, expectedObjectKey));
     assertFalse(ProcessIdentityResolver.isConfirmedIdentityNotFound(mixedKeyDiagnostics, expectedObjectKey));
+    String dialWarningDiagnostics = "Failed to open TCP stream: all attempts to connect to 127.0.0.1:9000 failed\n"
+        + "Value not found for key /decent-registry/identity/" + expectedObjectKey + "\nnot found\n";
+    assertFalse(ProcessIdentityResolver.isConfirmedIdentityNotFound(dialWarningDiagnostics, expectedObjectKey));
+
+    Path warningExecutable = Files.createTempFile("identity-dial-warning-miss-stub-", ".sh");
+    try {
+      String encodedOutput = java.util.Base64.getEncoder().encodeToString(
+          dialWarningDiagnostics.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      Files.writeString(warningExecutable, "#!/bin/sh\nprintf '%s' '" + encodedOutput
+          + "' | base64 -d\nexit 1\n");
+      warningExecutable.toFile().setExecutable(true);
+      var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, warningExecutable.toString());
+
+      assertThrows(ProcessIdentityResolver.IdentityResolutionException.class,
+          () -> resolver.resolveExact(identity));
+    } finally {
+      Files.deleteIfExists(warningExecutable);
+    }
 
     Path executable = Files.createTempFile("identity-wrong-miss-stub-", ".sh");
     try {
