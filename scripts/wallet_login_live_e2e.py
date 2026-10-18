@@ -784,7 +784,7 @@ def classify_identity_lookup(stdout, exit_code, expected_identifier=None):
     return 'unavailable', categories
   explicit_terminal_miss = exit_code == 1 and categories[-1:] == ['not_found']
   absence_only = explicit_terminal_miss and all(
-      item in ('registry_miss', 'dial_warning', 'not_found') for item in categories)
+      item in ('registry_miss', 'not_found') for item in categories)
   if expected_identifier is None:
     absence_only = False
   if (exit_code == 1 and explicit_terminal_miss and absence_only

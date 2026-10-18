@@ -385,7 +385,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertEqual('unavailable', resolution)
     self.assertEqual(['json', 'json', 'json', 'json', 'json', 'json', 'other'], categories)
 
-  def test_exact_registry_miss_with_only_dial_warnings_is_absence(self):
+  def test_exact_registry_miss_with_dial_warning_is_unavailable(self):
     identifier = 'mailto:alice@example.org'
     expected_key = '4aa8889aa1e3f193844b32d36e58b50a8817304b9e15d798d460d00bff828a29'
     output = chr(10).join((
@@ -396,7 +396,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
     resolution, categories = classify_identity_lookup(output, 1, identifier)
 
-    self.assertEqual('not_found', resolution)
+    self.assertEqual('unavailable', resolution)
     self.assertEqual(['dial_warning', 'registry_miss', 'not_found'], categories)
 
   def test_unavailable_categories_preserve_history_and_traceback_reason(self):
