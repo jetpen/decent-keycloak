@@ -2,40 +2,108 @@
 
 This repository owns the Keycloak-specific adapter for the approved, provider-neutral `decent-wallet-login-v1` contract. The ecosystem protocol and vectors live in [`decent-ecosystem`](https://github.com/jetpen/decent-ecosystem/issues/46). This work is separate from Storage's RFC 7523 wallet-grant adapter.
 
-**Status: implemented transport/proof plumbing; not acceptance-qualified as an end-to-end login.** The provider must not be presented as production-ready. A clean local build and route smoke do not prove Registry integration, distributed replay, wallet interoperability, or OIDC completion.
+**Status: implementation is experimental and not fully acceptance-qualified.** The provider must not be presented as production-ready. A pinned runtime and immutable-image loopback probe exist, but local package and loopback evidence do not establish real TLS, browser-engine/native-wallet interoperability, distributed replay, or production Registry behavior.
 
-## Current evidence and limits
+**Local Registry network exposure:** the disposable harness uses Podman host networking and binds the Registry node to `127.0.0.1`, not all host interfaces. A regression checks the generated config. This confines the listener to local use; it does not qualify Registry availability or reliability.
 
-- **Latest two disposable runs:** both used immutable image `sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e` and harness SHA-256 `a4d649a03b3a5d3dc15157e0b00cfa38cc3acc87bd32ef86cbbf82f578e0182d`. The first completed all scenarios (exit 0): login/PKCE, signup/account readback, preflight/security, invalid-proof/throttle, request-correlated account denials, and rotation (sequence 2/current key; stale proof 401/pending; current proof 202/accepted). Missing Identity was unavailable, not a proven miss: CLI output contained a peer-handshake diagnostic, provider returned 503, and the transaction stayed pending with no callback. A repeat on the same image exited 1 at current-key proof HTTP 503 after the provider resolver emitted peer-handshake diagnostics; stale proof had returned 401/pending. Registry negative and repeatability remain unqualified. Both are single-node loopback/synthetic-signer/host-mounted-runtime simulations, not real TLS/browser-wallet, shared-store, or production qualification.
-### Offline verification
+## Previous bounded loopback (before configured/ephemeral comparison)
 
-The latest clean Maven package passed 146 tests across 12 suites with zero failures, errors, or skips; handler/store/resource regressions exercise candidate-cap, cross-transaction, full-binding receipt/callback-gate, concurrent callback-redemption, failed flow-resume, callback-race denial, and no-callback-after-consume paths. The Python harness passed 83 tests plus 10 subtests; compilation and `git diff --check` passed.
+Image ID `96c7012db2c2353097816f0b121969a9da7338bc9118325c5da60179629a3a17`; digest `sha256:f515944fb09df1e575baaffb7d0a7ae3cc9cc2b05866160facd1db19243a71f0`; harness SHA `75cf8018805abcbef297763613397106dbb8b357172f6f283b79565c979a2daf`. Login/PKCE, browser security/throttle, invalid-proof throttling, account denial and signup paths passed. It reached rotation sequence-2 publication/readback, then stopped after three fresh resolver reads were unavailable. The newer six-read configured/ephemeral comparison is documented below.
 
-### Live run provenance
+**Historical stale-source rotation run.** Image `sha256:e75dc697fd6d4c4b306b49f13ad2761fb404fce3df6b76e72761073fc1bf9504`; harness SHA `96976b506a6a97200a25d209e170c875be348a47254e86b70008a3266bbda626`. This older image reached stale-key 401/pending, current-key 202/accepted and exact local mapping, but predates the current source/harness changes. Its three later fresh reads were unavailable and its missing-ID CLI `not_found` disagreed with provider 503; do not use it to infer current-source behavior, provider absence, or Registry cause.
 
-Image `sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e`; harness SHA-256 `a4d649a03b3a5d3dc15157e0b00cfa38cc3acc87bd32ef86cbbf82f578e0182d`; run one exit 0 with all cases reached, repeat exit 1 at current-key HTTP 503 during rotation. Both used:
-  ```bash
-  WALLET_IT_IMAGE=sha256:462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e \
-  WALLET_IT_NATIVE_LIBS=/home/ben/.hermes/cache/scratch/keycloak-ubi9-lib/usr/lib64 \
-  WALLET_IT_PROJECTS=/home/ben/projects \
-  PYTHONPATH=/home/ben/projects/decent-registry/src:/home/ben/projects/decent-identity/src \
-  /home/ben/projects/decent-registry/.venv/bin/python scripts/wallet_login_live_e2e.py
-  ```
 
-### Still open from Issue #1
+# Verification layers and remaining gates
 
-Real TLS and actual browser/native-wallet interoperability, including native challenge GET with browser metadata absent (the route behavior is implemented but no real wallet client has qualified it); repeatable Registry negative/rotation matrix, including repeated stale/current-key and missing-identity tests; request-correlated reproducible attribution of account-policy denials under concurrent traffic; two-node shared-store replay; signup concurrency/recovery (a losing consume/receipt write can still leave an account provisioned); a self-contained reproducible pinned runtime (the harness currently host-mounts Registry/Identity runtimes and GMP); relying-party/WordPress acceptance; security review; supported Keycloak version/upgrade scope; and docs/CI. Issue #1 remains open.
+This offline acceptance ledger records implementation/build evidence separately from external qualification. **Issue #1 remains open** until the full issue's acceptance criteria pass.
+
+| Slice | Status | Verified so far | Still open |
+|---|---|---|---|
+| Keycloak #4 self-contained resolver runtime | Implemented in feature worktree; uncommitted/unmerged | Current source: Maven 161/12; Python **133 non-ledger tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one module discovers zero tests)**. Leading-dash CLI argument and bundled executable default regressions pass; process-start, timeout, interruption, and output-overflow sanitized diagnostics; positive lookups reject unexpected diagnostics; pinned runtime inputs verified. Latest loopback passed login/PKCE/replay, preflight/security, throttle, account-policy denial, and signup/PKCE. Rotation publication/readback reached sequence 2; six fresh successor reads failed exact Identity/key matching, so stale/current-key proofs did not run. | Registry/provider matrix and stale/current-key rotation proof gate remain open. |
+| Keycloak #5 repeatable current-Registry matrix | Blocked on #4 integration merge | No implementation/acceptance run | Exact current/miss/unavailable/history, repeated proofs and rotation |
+| Keycloak #6 two-node shared-store replay | Pending | Not run | Production-mode cluster membership; cross-node consume/status/callback one-winner |
+| Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
+| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
+| Keycloak #9 security/support policy/docs/CI | Final slice | Local evidence only | Independent security review, version policy and CI |
+| Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
+| WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
+
+Issue #1 stays open. Component work, unit tests, and loopback simulation do not close its broader acceptance criteria. WordPress HITL decisions must be resolved by the user before implementation. The #4 changes remain separate from integration until the ticket-scoped diff is independently reviewed and merged.
+
+**Latest loopback from the current code state.** Image ID `f259700b220c2eb2f3c6d1b75055a0309901e16823affff1463a282edf59adc9`; digest `sha256:480807ab7ab77d5a169dbcea064ba4a096fcddebb324e0f44caa2e5e603547ae`; harness SHA `23cc8f48d850fee2be0451341d0ed076cd9b4532a5e0e62eef172601613861cd`. Login/PKCE, browser security/preflight, invalid-proof throttling, unmapped/disabled-account denials and signup/PKCE passed. Rotation publication/readback reached sequence 2. All six fresh lookups (three configured-port, three ephemeral-port) failed to confirm the exact successor key; the harness stopped before stale/current-key proofs. Configured-port samples had Registry-miss, dial-warning, peer-handshake and `other` categories; ephemeral samples had Registry-miss, dial-warning and `other`, with JSON-shaped lines in some samples. The harness classified every sample unavailable; exact retained output does not identify why. Root cause remains unknown. A new local regression test identified that the harness previously treated the first standalone `}` as the JSON end; it now uses a balanced-object scan, and sanitized samples separately report JSON validity and exact successor match. These fixes do not establish the live samples had nested JSON or that this was their cause. This is loopback-only evidence, not Registry reliability, real TLS/browser-wallet, or shared-store qualification.
+| Type | Status |
+|---|---|
+```bash
+python3 -m unittest \
+  scripts.test_wallet_login_result \
+  scripts.test_wallet_login_transport_e2e \
+  scripts.test_owner_rotation_probe \
+  scripts.test_signup_intent_probe \
+  scripts.test_self_contained_resolver_runtime \
+  scripts.test_owner_rotation_envelope \
+  scripts.test_live_gate_order \
+  scripts.test_acceptance_ledger -q
+python3 -m py_compile scripts/*.py container/*.py
+python3 container/build_resolver_runtime.py
+```
+
+**Local checks (latest executed feature-tree commands):**
+
+```bash
+MAVEN_OPTS='-Xmx2g' mvn -q -o clean package
+python3 -m unittest \
+  scripts.test_wallet_login_result \
+  scripts.test_wallet_login_transport_e2e \
+  scripts.test_owner_rotation_probe \
+  scripts.test_signup_intent_probe \
+  scripts.test_self_contained_resolver_runtime \
+  scripts.test_owner_rotation_envelope \
+  scripts.test_live_gate_order \
+  scripts.test_acceptance_ledger -q
+python3 -m py_compile scripts/*.py container/*.py
+python3 container/build_resolver_runtime.py
+git diff --check HEAD
+```
+
+Observed results: Maven **161 tests / 12 suites**, zero failures/errors/skips; Python **133 functional tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one discovers zero tests)**. Pinned source archives passed SHA verification and resolver-input validation. Offline/package passes do not qualify the open live Registry gate.
+
+# Loopback evidence
+
+| Revision | Observed result | Qualification limit |
+|---|---|---|
+| Prior run: image `sha256:480807ab7ab77d5a169dbcea064ba4a096fcddebb324e0f44caa2e5e603547ae`; harness SHA `b8917a5e13d59d55562406b5733a0a4dc7a6b467c69f59dbfd60dbc17d0c3d2a` | Login/security/throttle/account-denial/signup passed; rotation publication/readback reached sequence 2; six fresh reads unavailable. | Proof stage stopped; root cause unknown. |
+| Latest: image `sha256:29fe182466744bf7d9286fde27331cce784041170898eed430bfb8490ae8f602`; harness SHA `d20dcce5730112cbdadd757c867348812decd4d0316c063dbd9ff43e035` | This harness runs signup before rotation. Signup/PKCE and rotation publication/readback to sequence 2 passed. All six fresh successor reads failed exact Identity/key matching. | No stale/current-key proofs. Receipt contains sanitized per-read JSON-balance/exact-match booleans and diagnostic categories; these do not identify the cause. |
+
+
+
+
+| Unqualified | Registry matrix/reliability; stale/current rotation proofs; real TLS/browser/native-wallet; multi-node shared-store replay; signup races/recovery; relying-party acceptance. |
+
+## Remaining Issue #1 gates
+
+| Slice | Status | Verified so far | Still open |
+|---|---|---|---|
+| Keycloak #4 self-contained resolver runtime | Implemented in feature worktree; uncommitted/unmerged | Current source: Maven 161/12; Python **133 non-ledger tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one module discovers zero tests)**. Leading-dash CLI argument and bundled executable default regressions pass; process-start, timeout, interruption, and output-overflow sanitized diagnostics; positive lookups reject unexpected diagnostics; pinned runtime inputs verified. Latest loopback passed login/PKCE/replay, preflight/security, throttle, account-policy denial, and signup/PKCE. Rotation publication/readback reached sequence 2; six fresh successor reads failed exact Identity/key matching, so stale/current-key proofs did not run. | Registry/provider matrix and stale/current-key rotation proof gate remain open. |
+| Keycloak #5 repeatable current-Registry matrix | Blocked on #4 integration merge | No implementation/acceptance run | Exact current/miss/unavailable/history, repeated proofs and rotation |
+| Keycloak #6 two-node shared-store replay | Pending | Not run | Production-mode cluster membership; cross-node consume/status/callback one-winner |
+| Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
+| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
+| Keycloak #9 security/support policy/docs/CI | Final slice | Local evidence only | Independent security review, version policy and CI |
+| Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
+| WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
+
+Issue #1 remains open. Component work, unit tests, and loopback simulation do not close its broader acceptance criteria. WordPress HITL decisions must be resolved by the user before implementation. The #4 changes are still separate from integration until the ticket-scoped diff is independently reviewed and merged.
 
 ## Implemented flow shape
 
 1. A required Keycloak authenticator requires Standard Flow and exactly one registered exact HTTPS redirect URI, then binds the current authentication session, realm, and trusted public HTTPS origin before issuing a transaction.
 2. The Keycloak shared `SingleUseObjectProvider` stores five-minute pending state under a hash of the independent 256-bit opaque URL handle. The signed challenge is base64url-no-padding SHA-256 of a separate 32-byte random nonce; a separate transaction CSRF token is generated.
-3. The QR contains an HTTPS transaction locator only. Wallet `GET` reads the no-store `{profile, challenge, csrf_token}` envelope. Wallet `POST` to the same URI submits the exact four-string proof (`profile`, `challenge`, `identity_id`, `signature`). The proof-core uses RFC 8785 JCS UTF-8 signing bytes and Ed25519.
+3. The QR contains an HTTPS transaction locator only. Wallet `GET` reads the no-store `{profile, challenge, csrf_token}` envelope. Wallet `POST` to the same URI submits the exact four-string proof (`profile`, `challenge`, `identity_id`, `signature`). The proof core uses RFC 8785 JCS UTF-8 signing bytes and Ed25519.
 4. A fixed, bounded `decent-identity get` subprocess adapter resolves the exact raw identity ID/current owner public key. A shared two-second cooldown per initiating browser/client rejects near-simultaneous sibling lookups but does **not** serialize the resolver's full process lifetime or prevent another lookup after cooldown expiry. It expires rather than being owner-released. For signup, exactly one enabled local Keycloak user is provisioned after proof and before pending-transaction consumption; see the failure window below.
-5. Atomic removal of pending state is the proof one-winner point. The accepted proof/status digest is retained until expiry; an identical proof retry reports accepted only, while changed bytes fail. A separate callback gate is published before accepted status and permits one Keycloak resume. The live single-node probe confirmed that a subsequent callback request does not repeat the original authorization code and that status stops advertising its callback after the gate is consumed. **Signup callback gate:** callback re-reads the exact enabled account and fails closed if missing; it does not provision or delete after pending proof consumption. Focused regressions cover the missing-map/gate behavior; successful callback behavior has bounded live evidence, but post-consume mapping disappearance is not exercised live. A final Keycloak resume failure then requires a fresh login rather than replaying the one-use gate. The resolver gets a ten-second execution timeout and, after forcible termination is requested, a two-second forced-termination grace period. The shared admission key expires after two seconds, even if the resolver is still running; it is not an owner-released process-lifetime lock. If termination cannot be confirmed, promotion extends that key to five minutes and applies the browser/client lock. Because promotion follows timeout and termination grace, it may occur after the original admission key expired; promotion cannot cancel an already-admitted sibling lookup. This remains best-effort rather than a fencing guarantee. Storage failure never returns success/code.
+5. Atomic removal of pending state is the proof one-winner point. The accepted proof/status digest is retained until expiry; an identical proof retry reports accepted only, while changed bytes fail. A separate callback gate is published before accepted status and permits one Keycloak resume. The live single-node probe confirmed that a subsequent callback request does not repeat the original authorization code and that status stops advertising its callback after the gate is consumed. **Signup callback gate:** callback re-reads the exact enabled account and fails closed if missing; it does not provision or delete after pending proof consumption. Focused regressions cover the missing-map/gate behavior; post-consume mapping disappearance is not exercised live. A final Keycloak resume failure then requires a fresh login rather than replaying the one-use gate. The resolver gets a ten-second execution timeout and, after forcible termination is requested, a two-second forced-termination grace period. The shared admission key expires after two seconds, even if the resolver is still running; it is not an owner-released process-lifetime lock. If termination cannot be confirmed, promotion extends that key to five minutes and applies the browser/client lock. Because promotion follows timeout and termination grace, it may occur after the original admission key expired; promotion cannot cancel an already-admitted sibling lookup. This remains best-effort rather than a fencing guarantee. Storage failure never returns success/code.
 6. Five per-transaction invalid-proof slots and a best-effort five-minute browser/client new-transaction lock are stored separately. They throttle abuse only; they do not revoke already-issued sibling transactions or replace atomic per-transaction replay prevention.
 
-This outline describes the current implementation shape, not a claim that every step has passed live acceptance. In particular, atomic behavior of the supported shared Keycloak backend has not yet been qualified across nodes.
+This outline describes implementation shape, not a claim that every step has passed acceptance. Atomic behavior of the supported shared Keycloak backend has not yet been qualified across nodes.
 
 ## HTTP surface
 
@@ -57,15 +125,17 @@ Realm attributes consumed by the provider:
 
 - `decent.wallet.browser-origin` — exact HTTPS web-wallet Origin; required for browser-wallet requests and is itself the exact allowed browser Origin. The optional `decent.wallet.trusted-origins` adds a consistency check; if present it must include this origin.
 - `decent.wallet.site-name` — required realm-wide relying-party label, displayed on the Keycloak wallet-login page. It is not an additional wallet challenge-response field.
-- `decent.wallet.registry.bootstrap` and `decent.wallet.registry.client-port` — required together to configure the current Identity CLI resolver.
-- `decent.wallet.identity.executable` — optional fixed command (`decent-identity`) or explicit absolute executable path. Process time and output are bounded; its runtime must be available to the Keycloak process/container.
+- `decent.wallet.registry.bootstrap` and `decent.wallet.registry.client-port` — required together to configure the bundled Identity resolver runtime built from repository-pinned Identity/Registry sources and dependencies.
+- `decent.wallet.identity.executable` — defaults to `/opt/decent-resolver/bin/decent-identity` in the bundled runtime. A development override must be an absolute executable path.
 - `decent.wallet.idp-origin` — optional exact HTTPS assertion; if set, it must match the normalized origin from trusted Keycloak hostname/proxy configuration. It cannot override that origin.
 
-A missing setting does not enable fallback authentication; the flow fails closed. The separate route-smoke container is not configured with these settings; the disposable integration probe provisions its own realm and teardown.
+A missing setting does not enable fallback authentication; the flow fails closed. The disposable integration probe provisions its own realm and teardown.
 
 ## Account policy
 
 Keycloak creates or loads exactly one local account with the exact raw `decent_identity_id` only after a fresh, valid wallet proof and before consuming the pending login transaction. Explicit `login` requires exactly one existing enabled match; explicit server-bound `signup` may provision a local account after proof. Concurrent provisioning is accepted only after a fresh exact-ID lookup finds one unique enabled winner; ambiguous mappings fail closed. Keycloak retains its opaque user ID as stable OIDC `sub` and releases `decent_identity_id` only as a signed ID-token claim for configured relying parties. The disposable single-node harness verifies the claim value after JWKS signature validation; relying-party Registry verification and returning-login `(iss, sub)` mapping are external consumer responsibilities and remain unqualified here.
+
+Latest #4 artifact provenance: the build-input verifier parses `container/resolver-runtime.lock.json`; `container/build_resolver_runtime.py` verifies/materializes inputs, and `container/Dockerfile` builds the runtime. The tracked source archives and repo-extracted copies match the lockfile SHA-256 values. Older untracked source-tree dumps are not build inputs; only the archives and explicit lock/requirements files are consumed by the Docker build.
 
 ## Local checks
 
@@ -76,26 +146,39 @@ mvn -q -o clean package
 git diff --check
 ```
 
-To build the provider image after packaging:
+For the standalone local Registry rotation/readback probe, use the invocation documented above; it is a local integration check, not proof of production or network-wide Registry reliability.
+
+After `mvn -q -o clean package`, build both the resolver inputs and the full provider/runtime image from this worktree without using cached layers:
 
 ```bash
-podman build --pull=never -f container/Dockerfile \
-  -t localhost/decent-keycloak-wallet-authenticator-spike:live-slice .
+podman build --no-cache --pull=never --target resolver-builder -f container/Dockerfile \
+  -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-resolver-check .
+podman build --no-cache --pull=never --target runtime -f container/Dockerfile \
+  -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-current-check .
 ```
 
-A successful Maven build/image build is not live wallet-login qualification. Run a fresh full package after the final source/test edit and record the actual Surefire XML totals.
+A successful Maven or image build is not live wallet-login qualification. Read Surefire XML totals from the current build and use the immutable image ID/digest in the live probe.
 
 ### Disposable local integration probe
 
-`scripts/wallet_login_live_e2e.py` requires Podman, OpenSSL, sibling Identity/Registry development runtimes and the uv Python runtime. It defaults to `~/projects`; override `WALLET_IT_PROJECTS` if needed. Supply `WALLET_IT_NATIVE_LIBS` pointing to a directory containing **UBI9-compatible** `libgmp.so.10` (the host's library may require a newer glibc). The exercised library came from Red Hat's `gmp-6.2.0-13.el9.x86_64.rpm`, SHA-256 `d4529445e30b7eb9a8225b0539f70d26d585d7fe306296f948ea73114d1c171f`.
+`scripts/wallet_login_live_e2e.py` requires Podman, OpenSSL, and the pinned runtime image built from this repository. It does not mount sibling Identity or Registry source checkouts or developer Python environments.
+
+After `mvn -q -o clean package`, build both the resolver target and full provider/runtime target from the edited worktree with cache disabled. Use the local image tag for Podman in this environment, verify its immutable ID/digest, and confirm the harness provenance reports that digest. It can also accept an immutable ID if Podman resolves that ID locally. Run the harness with the immutable image ID—not a moving source tag:
 
 ```bash
-WALLET_IT_NATIVE_LIBS=/path/to/ubi9/usr/lib64 \
-  python scripts/wallet_login_live_e2e.py
+IMAGE_ID="$(podman image inspect --format '{{.Id}}' localhost/decent-keycloak-wallet-authenticator-spike:issue4-current-check)"
+WALLET_IT_IMAGE="$IMAGE_ID" python3 scripts/wallet_login_live_e2e.py
 ```
 
-When invoking with the default host Python, ensure the probe dependencies are installed; in the verified workspace, use `/home/ben/projects/decent-registry/.venv/bin/python` because that environment provides the sibling Registry/Identity runtime dependencies.
+The harness verifies the ID/digest through Podman before starting the disposable environment. This command is a loopback probe only; a passing result does not establish production Registry behavior, real TLS/browser-wallet interoperability, or shared-store replay.
 
-`WALLET_IT_IMAGE` can pin an immutable built image ID. The probe uses port 18886, checks it is free, generates disposable credentials/signing material, keeps private material outside the mounted resolver directory, and tears down its own container/Registry. It simulates trusted HTTPS proxy termination over loopback; it does not test certificates or a real wallet application. Its output is bounded stage/evidence metadata, never tokens or proof material.
+
+```python
+python scripts/rotation_registry_roundtrip.py --identifier ID --old-key OLD --new-key NEW \
+  --host 127.0.0.1 --port PORT --bootstrap PEER --datastore DIR \
+  --envelope ENVELOPE --readback READBACK
+```
+
+It constructs a finalized authorized rotation, publishes it, then performs repeated reads from fresh CLI clients and succeeds only when the new sequence and exact successor key are independently observed. The wallet-login harness runs this helper from the pinned resolver-tools image and keeps Registry results separate from Keycloak provider proof outcomes.
 
 - **Signup failure window:** Signup creates the exact enabled account after proof verification but before pending-transaction consumption. If consumption loses, the losing request publishes no accepted receipt or callback; a concurrent winner may still succeed. If accepted-receipt publication fails after consumption, the transaction has no callback. The exact Identity user may remain provisioned after a consume/receipt failure; failed provisioning attempts do not delete accounts, even when the failure appears unambiguous; avoiding deletion prevents a race from removing a user another request may already observe. Search and occupancy lookup failures, including candidate-cap overflow, are unavailable and stop before account creation. A successful create with an empty/failed exact-ID read-back returns `503`, leaves the transaction pending, and does not delete the possibly visible user. Verified duplicate/disabled/mismatched mappings remain non-success; these safeguards have local UserProvider/handler unit coverage only, not live multi-node race evidence.

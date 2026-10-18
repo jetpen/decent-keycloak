@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.core.Response;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Signature;
@@ -140,6 +141,74 @@ final class WalletLoginTransportHandlerTest {
     assertEquals(403, handler.getChallenge(issued.handle(), "https://evil.example", "cross-site", IDP_ORIGIN).status());
     assertEquals(403, handler.getChallenge(issued.handle(), WALLET_ORIGIN, "none", IDP_ORIGIN).status());
     assertEquals(404, handler.getChallenge(issued.handle(), WALLET_ORIGIN, "cross-site", "https://other-idp.example").status());
+  }
+
+  @Test
+  void resolverUnavailableMapsTo503AndKeepsPendingWithoutReceiptOrCallback() throws Exception {
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:resolver-unavailable@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var resolverExecutable = Files.createTempFile("identity-unavailable-stub-", ".sh");
+    try {
+      String wrongKey = "ab".repeat(32);
+      String output = String.join(System.lineSeparator(),
+          "Value not found for key /decent-registry/identity/" + wrongKey, "not found", "");
+      String encoded = Base64.getEncoder().encodeToString(output.getBytes(StandardCharsets.UTF_8));
+      Files.writeString(resolverExecutable, String.join(System.lineSeparator(),
+          "#!/bin/sh", "printf '%s' '" + encoded + "' | base64 -d", "exit 1", ""));
+      resolverExecutable.toFile().setExecutable(true);
+      var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, resolverExecutable.toString());
+      var resolverFailure = assertThrows(ProcessIdentityResolver.IdentityResolutionException.class,
+          () -> resolver.resolveExact(identity));
+      assertEquals("Identity lookup failed", resolverFailure.getMessage());
+      assertNull(resolverFailure.getCause());
+      WalletLoginIdentityResolver identityResolver = resolver::resolveExact;
+      var handler = new WalletLoginTransportHandler(store, identityResolver, WALLET_ORIGIN, IDP_ORIGIN,
+          exact -> true);
+
+      var response = handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN);
+
+      assertEquals(503, response.status());
+      assertTrue(store.load(issued.handle()).isPresent());
+      assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+      assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    } finally {
+      Files.deleteIfExists(resolverExecutable);
+    }
+  }
+
+  @Test
+  void exactRegistryMissMapsTo401AndKeepsPendingWithoutReceiptOrCallback() throws Exception {
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:identity-absent@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var resolverExecutable = Files.createTempFile("identity-not-found-stub-", ".sh");
+    try {
+      String expectedKey = ProcessIdentityResolver.exactRegistryObjectKeyHex(identity);
+      String output = "Value not found for key /decent-registry/identity/" + expectedKey + "\nnot found\n";
+      String encoded = Base64.getEncoder().encodeToString(output.getBytes(StandardCharsets.UTF_8));
+      Files.writeString(resolverExecutable, "#!/bin/sh\nprintf '%s' '" + encoded + "' | base64 -d\nexit 1\n");
+      resolverExecutable.toFile().setExecutable(true);
+      var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, resolverExecutable.toString());
+      WalletLoginIdentityResolver identityResolver = resolver::resolveExact;
+      var handler = new WalletLoginTransportHandler(store, identityResolver, WALLET_ORIGIN, IDP_ORIGIN,
+          exact -> true);
+
+      var response = handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN);
+
+      assertEquals(401, response.status());
+      assertTrue(store.load(issued.handle()).isPresent());
+      assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+      assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    } finally {
+      Files.deleteIfExists(resolverExecutable);
+    }
   }
 
   @Test
