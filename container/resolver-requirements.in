@@ -1,0 +1,8 @@
+# Root packages imported by the clean pinned Identity/Registry sources.
+# Registry runtime metadata and the pinned Registry uv.lock constrain the complete closure.
+libp2p
+trio
+cbor2
+cryptography
+lmdb
+PyYAML

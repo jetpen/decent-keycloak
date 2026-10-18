@@ -28,7 +28,7 @@ public final class WalletLoginTransportResourceFactory
     }
     if (bootstrapConfig != null) {
       String executable = realm.getAttribute(KEY_IDENTITY_EXECUTABLE);
-      if (executable == null || executable.isBlank()) executable = "decent-identity";
+      if (executable == null || executable.isBlank()) executable = "/opt/decent-resolver/bin/decent-identity";
       if (!executable.equals("decent-identity") && !executable.startsWith("/")) {
         throw new IllegalStateException("Identity executable must be a fixed command or absolute path");
       }

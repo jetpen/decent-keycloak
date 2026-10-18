@@ -33,6 +33,27 @@ final class WalletLoginTransportResourceFactoryTest {
   }
 
   @Test
+  void resolverExecutableDefaultsToTheBundledRuntimePathWhenRegistryIsConfigured() {
+    var session = mock(KeycloakSession.class);
+    var context = mock(KeycloakContext.class);
+    var uriInfo = mock(KeycloakUriInfo.class);
+    var realm = mock(RealmModel.class);
+    when(session.getContext()).thenReturn(context);
+    when(session.singleUseObjects()).thenReturn(mock(SingleUseObjectProvider.class));
+    when(context.getRealm()).thenReturn(realm);
+    when(context.getUri()).thenReturn(uriInfo);
+    when(uriInfo.getBaseUri()).thenReturn(URI.create("https://idp.example/auth/"));
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_REGISTRY_BOOTSTRAP))
+        .thenReturn("/ip4/127.0.0.1/tcp/9000/p2p/12D3KooWBJHhhdqp4zbtGbCX6VyE7hC2ch5uaEvxfwkmSbfo2f3X");
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_REGISTRY_CLIENT_PORT))
+        .thenReturn("9001");
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_IDENTITY_EXECUTABLE))
+        .thenReturn(null);
+
+    new WalletLoginTransportResourceFactory().create(session);
+  }
+
+  @Test
   void canonicalizesDefaultHttpsPortForFactoryAndAuthenticator() {
     assertEquals("https://idp.example", WalletLoginTransportResourceFactory.canonicalIdpOrigin(
         URI.create("https://idp.example/auth/"), "https://idp.example:443"));
