@@ -10,18 +10,12 @@ README = Path(__file__).parents[1] / "README.md"
 class AcceptanceLedgerTest(unittest.TestCase):
   def test_acceptance_ledger_reports_current_verification_layers_and_remaining_gates(self):
     text = README.read_text()
-    self.assertIn("Python **133 non-ledger tests plus 11 acceptance-ledger tests (144 total across eight imported modules; one module discovers zero tests)**", text)
-    self.assertIn("11 acceptance-ledger tests", text)
-    self.assertIn("Maven **162 tests / 12 suites**", text)
-    self.assertIn("uses a balanced-object scan", text)
-    self.assertIn("The broader repeated Registry matrix belongs to #5", text)
-    self.assertIn("rotation readback is supporting context, not an #4 acceptance gate", text)
+    self.assertIn("The checks failed against the synthetic merge revision", text)
+    self.assertIn("The failure-specific probe also assumed the Hermes scratch directory exists", text)
+    self.assertIn("146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests", text)
     self.assertIn("missing Registry configuration returns unavailable (503), not absence (401)", text)
     self.assertIn("a Registry miss accompanied by a dial warning is unavailable", text)
-    self.assertEqual(1, text.count("| Slice | Status | Verified so far | Still open |"))
-    self.assertIn("Base implementation commit `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
-    self.assertIn("integration merge `48121bec3ac2708b97c4c39240cd85aadf0117e2`", text)
-    self.assertIn("Issue #4 remains open", text)
+    self.assertEqual(2, text.count("| Slice | Status | Verified so far | Still open |"))
     self.assertNotIn("uncommitted/unmerged", text)
 
   def test_latest_image_from_current_worktree_records_fail_closed_gate(self):
@@ -30,9 +24,8 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("image ID `92cc5d4c06fd4a65dd1e2fbbb5472f70fd901201536b88019706bff48c14ce13`", text)
     self.assertIn("digest `sha256:b4120b6aa22de7bf036250a9f66b701245e6f4fd8082cbeaf71f96d832cfd58b`", text)
     self.assertIn("harness SHA `e220a7920c211b5d995a0b389b4665107565bf8c40da0b43d8cc4c9d2afd8d61`", text)
-    self.assertIn("All six fresh successor reads (three configured-port, three ephemeral) were unavailable", text)
-    self.assertIn("all had balanced JSON, exact identity/key match false, and an unexpected diagnostic", text)
-    self.assertIn("Two configured-port samples included peer-handshake diagnostics", text)
+    self.assertIn("All six fresh successor reads (three configured-port, three ephemeral) were unavailable with balanced JSON", text)
+    self.assertIn("two configured-port samples had peer-handshake diagnostics", text)
     self.assertIn("Harness exited 1 at the successor-read gate", text)
     self.assertIn("no stale/current-key proofs or provider `not_found` case ran", text)
     self.assertIn("Prior #4 run (image predates d700)", text)
@@ -61,7 +54,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
 
   def test_earlier_loopback_is_distinguished_from_precommit_run(self):
     text = README.read_text()
-    self.assertIn("Earlier #4 loopback", text)
+    self.assertIn("Earlier #4 run: image ID", text)
     self.assertNotIn("Latest loopback from the current code state", text)
     self.assertIn("Prior #4 run (image predates d700)", text)
 

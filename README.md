@@ -6,6 +6,16 @@ This repository owns the Keycloak-specific adapter for the approved, provider-ne
 
 **Local Registry network exposure:** the disposable harness uses Podman host networking and binds the Registry node to `127.0.0.1`, not all host interfaces. A regression checks the generated config. This confines the listener to local use; it does not qualify Registry availability or reliability.
 
+## PR #12 check failure and remediation
+
+The checks failed against the synthetic merge revision `0f355a8e0e6d108a117ecce45f077d26d08071f3` (PR head `cbdaf4c94b8c2292396c4d619db77376efabd2bb`). Maven passed, but the Python step ran 146 tests and reported three assertion failures plus one error: ledger assertions were stale against the merge README. The failure-specific probe also assumed the Hermes scratch directory exists on the runner. The README's second documented test command repeated `scripts.test_acceptance_workflow`; the new regression check catches duplicate module entries and requires the documented commands and CI list to match.
+
+The first remediation run on commit `04637ce45962e1903aad17ce153c1159ec13faba` fixed these Python/doc discrepancies and passed Maven 163/12, Python 146, compilation, pinned resolver-source verification, diff validation, and provider registration. The image step then failed because Buildx looked for `./Dockerfile`, while this repository's Dockerfile is `container/Dockerfile`. The workflow now selects that path explicitly and has a regression test. The next GitHub Actions run is needed to confirm this fix. The implementation remains experimental: provider qualification, independent aggregate security review, and support-policy approval are separate open gates.
+
+The exact experimental build boundary and upgrade gates are in [`docs/support-policy.md`](docs/support-policy.md); the scoped security review, test evidence and open qualifications are in [`docs/security-review.md`](docs/security-review.md). CI is defined in [`.github/workflows/acceptance.yml`](.github/workflows/acceptance.yml); it runs on pushes, pull requests and manual dispatch without path filters, pins all actions to immutable commit SHAs, grants only `contents: read`, and does not use credentials or publish artifacts. It gates Maven/Surefire, the complete Python harness and compilation, resolver/vector provenance, diff whitespace, provider registration and a no-cache amd64 provider-image build/runtime-version check. GitHub branch protection is separate: an administrator must mark the job's verified status context required.
+
+The declared target is Keycloak **26.8.0**, Temurin build JDK **21.0.12.1+1**, Red Hat OpenJDK runtime **21.0.12.1+1-LTS** from the pinned Keycloak image, the exact digest-pinned Keycloak and UBI 9/Python 3.11.13 bases listed in the policy, and Linux/amd64. The candidate GitHub workflow has not yet run on this branch, and an independent aggregate review after #5/#6 changes is still required. These docs, local tests or a passing image build do not qualify Registry rotation, two-node replay, real TLS/browser/wallet behavior, upgrades or production deployment.
+
 ## Previous bounded loopback (before configured/ephemeral comparison)
 
 Image ID `96c7012db2c2353097816f0b121969a9da7338bc9118325c5da60179629a3a17`; digest `sha256:f515944fb09df1e575baaffb7d0a7ae3cc9cc2b05866160facd1db19243a71f0`; harness SHA `75cf8018805abcbef297763613397106dbb8b357172f6f283b79565c979a2daf`. Login/PKCE, browser security/throttle, invalid-proof throttling, account denial and signup paths passed. It reached rotation sequence-2 publication/readback, then stopped after three fresh resolver reads were unavailable. The newer six-read configured/ephemeral comparison is documented below.
@@ -15,26 +25,29 @@ Image ID `96c7012db2c2353097816f0b121969a9da7338bc9118325c5da60179629a3a17`; dig
 
 # Verification layers and remaining gates
 
+Reviewed integration merge `48121bec3ac2708b97c4c39240cd85aadf0117e2`
+
 This offline acceptance ledger records implementation/build evidence separately from external qualification. **Issue #1 remains open** until the full issue's acceptance criteria pass.
 
 | Slice | Status | Verified so far | Still open |
 |---|---|---|---|
-| Keycloak #4 self-contained resolver runtime | Base implementation commit `d700281409a876b74ee025f6d27ff50b40b0fca5`; integration merge `48121bec3ac2708b97c4c39240cd85aadf0117e2`; Issue #4 remains open | Current source: Maven **162 tests / 12 suites**; Python **133 non-ledger tests plus 11 acceptance-ledger tests (144 total across eight imported modules; one module discovers zero tests)**. Leading-dash CLI argument and bundled executable default regressions pass; process-start, timeout, interruption, and output-overflow sanitized diagnostics; positive lookups reject unexpected diagnostics; missing Registry configuration returns HTTP 503 unavailable rather than 401 absence; a terminal exact miss accompanied by a dial warning is unavailable; pinned runtime inputs verified. The fresh no-cache image was built from the current #4 worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5` (ID `92cc5d4c06fd4a65dd1e2fbbb5472f70fd901201536b88019706bff48c14ce13`, digest `sha256:b4120b6aa22de7bf036250a9f66b701245e6f4fd8082cbeaf71f96d832cfd58b`; harness SHA `e220a7920c211b5d995a0b389b4665107565bf8c40da0b43d8cc4c9d2afd8d61`; image provider JAR SHA `4a2d1364180350fffc671a7f61812ecbea5e68f04c90df95f95c0b669d4fbbcd`; current Maven target SHA `c0f84827366911b7714f8590c2055c956fdd47d87cbcb01462f88ee8f5ac05c5`; all 46 ZIP entry names and uncompressed contents match despite different whole-archive hashes). It passed wallet login/PKCE/replay, signup/PKCE, preflight/security, throttling, and account-policy denial, demonstrating the positive `resolved` proof path. Rotation publication/readback reached sequence 2. All six fresh successor reads (three configured-port, three ephemeral) were unavailable; all had balanced JSON, exact identity/key match false, and an unexpected diagnostic. Two configured-port samples included peer-handshake diagnostics. The harness exited 1 at the successor-read gate before stale/current-key proofs; no provider `not_found` case ran, and the cause remains unknown. | The provider-level exact terminal `not_found` case remains unrun; missing-config 503 and dial-warning `unavailable` behavior are unit-tested only. The six fresh successor reads were resolver-tool-path evidence, not a provider-level absence case. A network-isolated image build is not demonstrated; this no-cache build downloaded hash-locked dependencies. The broader repeated Registry matrix belongs to #5; rotation readback is supporting context, not an #4 acceptance gate. |
-| Keycloak #5 repeatable current-Registry matrix | Implemented on a separate branch at `2c6a2bc`; not integrated | Offline tests and one partial live matrix run; not qualified | Exact current/miss/unavailable/history, repeated proofs and rotation |
-| Keycloak #6 two-node shared-store replay | In progress separately | Production cluster formation-only evidence; replay not qualified | Cross-node consume/status/callback one-winner |
-| Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
-| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
-| Keycloak #9 security/support policy/docs/CI | Separate implementation branch; review follow-up in progress | Local evidence only | Independent aggregate review, remote workflow and broader live/cluster gates |
+| Keycloak #4 self-contained resolver runtime | Base implementation was already merged before #9; Issue #4 remains open | Maven 163/12 and Python 146 on the exact clean PR-merge reproduction; local lookup-path regressions pass. Supplemental owner-key rotation loopback evidence remains unqualified and is not an #4 acceptance gate. | Provider-level terminal `not_found` and network-isolated image build |
+| Keycloak #5 repeatable current-Registry matrix | In progress in a separate worktree; #4 is integrated | No implementation/acceptance run | Exact current/miss/unavailable/history, repeated proofs and rotation |
+| Keycloak #6 single-node transaction replay and callback | Current feature branch `feature/issue-6-single-node-live`; last local integrated evidence is incomplete | Single-node profile against Keycloak 26.8.0/dev-file: proof 202; initial status accepted; identical retry 202; changed retry 409; one-use callback; replay no code; status 404; Code+PKCE 200 | Expiry and post-consume store-failure/recovery gates remain unqualified |
+| Keycloak #7 signup provisioning and recovery (single-node only) | Open; no longer blocked on #6 topology | Local UserProvider/handler tests; fresh signup recovery remains offline-only evidence | Run the bounded single-node signup recovery profile; do not claim distributed races |
+| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4 and Wallet #64; #9 is downstream closeout | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
+| Keycloak #9 security/support policy/docs/CI | Implemented; remote rerun pending | Commit `04637ce45962e1903aad17ce153c1159ec13faba` passed Maven 163/12, Python 146, compilation, resolver verification, diff validation and provider registration. Its image build failed because Buildx looked for a root `Dockerfile`; workflow now selects `container/Dockerfile`. | Independent aggregate security review and support-policy approval |
 | Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
 | WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
 
-Issue #1 stays open. Component work, unit tests, and loopback simulation do not close its broader acceptance criteria. WordPress HITL decisions must be resolved by the user before implementation. The base #4 runtime is present in integration merge `48121bec3ac2708b97c4c39240cd85aadf0117e2` and draft PR #10; Issue #4 remains open pending current immutable-image provider-path evidence for exact terminal `not_found` and `unavailable` outcomes; the positive `resolved` proof path passed. The six successor reads were resolver-tool-path evidence only and do not qualify the provider's missing-Identity outcome. The broader repeated Registry matrix belongs to #5; rotation readback is supporting context, not an #4 acceptance gate.
+Issue #1 stays open. Component work, unit tests, and loopback simulation do not close its broader acceptance criteria. WordPress HITL decisions must be resolved by the user before implementation. Dependency #4 is merged in the integration baseline; #5 and #6 are progressing separately and their eventual diffs still require an independent aggregate security review before any final #9 security qualification.
 
-**Earlier #4 loopback (before the later six-read comparison).** Image ID `f259700b220c2eb2f3c6d1b75055a0309901e16823affff1463a282edf59adc9`; digest `sha256:480807ab7ab77d5a169dbcea064ba4a096fcddebb324e0f44caa2e5e603547ae`; harness SHA `23cc8f48d850fee2be0451341d0ed076cd9b4532a5e0e62eef172601613861cd`. Login/PKCE, browser security/preflight, invalid-proof throttling, unmapped/disabled-account denials and signup/PKCE passed. Rotation publication/readback reached sequence 2. All six fresh lookups (three configured-port, three ephemeral-port) failed to confirm the exact successor key; the harness stopped before stale/current-key proofs. Configured-port samples had Registry-miss, dial-warning, peer-handshake and `other` categories; ephemeral samples had Registry-miss, dial-warning and `other`, with JSON-shaped lines in some samples. The harness classified every sample unavailable; exact retained output does not identify why. Root cause remains unknown. A new local regression test identified that the harness previously treated the first standalone `}` as the JSON end; it now uses a balanced-object scan, and sanitized samples separately report JSON validity and exact successor match. These fixes do not establish the live samples had nested JSON or that this was their cause. This is loopback-only evidence, not Registry reliability, real TLS/browser-wallet, or shared-store qualification.
+**Most recent #4 loopback evidence (before the #9 logging hardening; exact image/harness pair).** Image ID `f259700b220c2eb2f3c6d1b75055a0309901e16823affff1463a282edf59adc9`; digest `sha256:480807ab7ab77d5a169dbcea064ba4a096fcddebb324e0f44caa2e5e603547ae`; harness SHA `23cc8f48d850fee2be0451341d0ed076cd9b4532a5e0e62eef172601613861cd`. Login/PKCE, browser security/preflight, invalid-proof throttling, unmapped/disabled-account denials and signup/PKCE passed. Rotation publication/readback reached sequence 2. All six fresh lookups (three configured-port, three ephemeral-port) failed to confirm the exact successor key; the harness stopped before stale/current-key proofs. Configured-port samples had Registry-miss, dial-warning, peer-handshake and `other` categories; ephemeral samples had Registry-miss, dial-warning and `other`, with JSON-shaped lines in some samples. The harness classified every sample unavailable; exact retained output does not identify why. Root cause remains unknown. A new local regression test identified that the harness previously treated the first standalone `}` as the JSON end; it now uses a balanced-object scan, and sanitized samples separately report JSON validity and exact successor match. These fixes do not establish the live samples had nested JSON or that this was their cause. This is loopback-only evidence, not Registry reliability, real TLS/browser-wallet, or shared-store qualification.
 | Type | Status |
 |---|---|
 ```bash
 python3 -m unittest \
+  scripts.test_acceptance_workflow \
   scripts.test_wallet_login_result \
   scripts.test_wallet_login_transport_e2e \
   scripts.test_owner_rotation_probe \
@@ -47,11 +60,12 @@ python3 -m py_compile scripts/*.py container/*.py
 python3 container/build_resolver_runtime.py
 ```
 
-**Local checks (latest executed feature-tree commands):**
+**Local checks on the exact clean PR-merge reproduction:** Java 21 Maven 163 tests / 12 suites; Python acceptance 146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests; one imported module discovers zero). Resolver-input verification, Python compilation, actionlint, and diff checks passed locally.
 
 ```bash
 MAVEN_OPTS='-Xmx2g' mvn -q -o clean package
-python3 -m unittest \
+python3.11 -m unittest \
+  scripts.test_acceptance_workflow \
   scripts.test_wallet_login_result \
   scripts.test_wallet_login_transport_e2e \
   scripts.test_owner_rotation_probe \
@@ -60,12 +74,14 @@ python3 -m unittest \
   scripts.test_owner_rotation_envelope \
   scripts.test_live_gate_order \
   scripts.test_acceptance_ledger -q
-python3 -m py_compile scripts/*.py container/*.py
-python3 container/build_resolver_runtime.py
+python3.11 -m py_compile scripts/*.py container/*.py
+python3.11 container/build_resolver_runtime.py
+python3.11 container/verify_resolver_runtime_inputs.py \
+  --archives container/source-archives --manifest container/resolver-runtime.lock.json
 git diff --check HEAD
 ```
 
-Observed results: Maven **162 tests / 12 suites**, zero failures/errors/skips; Python **133 functional tests plus 11 acceptance-ledger tests (144 total across eight imported modules; one discovers zero tests)**. Pinned source archives passed SHA verification and resolver-input validation. Offline/package passes do not qualify the open live Registry gate.
+`python3.11 -m unittest scripts.test_acceptance_workflow scripts.test_wallet_login_result scripts.test_wallet_login_transport_e2e scripts.test_owner_rotation_probe scripts.test_signup_intent_probe scripts.test_self_contained_resolver_runtime scripts.test_owner_rotation_envelope scripts.test_live_gate_order scripts.test_acceptance_ledger -q` ran 146 tests: 141 non-ledger, 11 ledger, 2 workflow guards; one imported module discovers zero. The exact clean merge checkout Maven build passed 163/12 with zero failures/errors/skips. Python compilation, resolver-source verification, actionlint, and diff checks passed locally.
 
 # Loopback evidence
 
@@ -86,7 +102,18 @@ Observed results: Maven **162 tests / 12 suites**, zero failures/errors/skips; P
 
 ## Remaining Issue #1 gates
 
-Issue #1 remains open. The table above is the single status ledger; component work, unit tests, loopback simulation, or cluster formation alone do not qualify the broader acceptance gates. WordPress human decisions remain unresolved.
+| Slice | Status | Verified so far | Still open |
+|---|---|---|---|
+| Keycloak #4 self-contained resolver runtime | Base implementation was already merged before #9; Issue #4 remains open | Maven 163/12 and Python 146 on the exact clean PR-merge reproduction; local lookup-path regressions pass. Supplemental owner-key rotation loopback evidence remains unqualified and is not an #4 acceptance gate. | Provider-level terminal `not_found` and network-isolated image build |
+| Keycloak #5 repeatable current-Registry matrix | In progress in a separate worktree; #4 is integrated | No implementation/acceptance run | Exact current/miss/unavailable/history, repeated proofs and rotation |
+| Keycloak #6 single-node transaction replay and callback | Current feature branch `feature/issue-6-single-node-live`; last local integrated evidence is incomplete | Single-node profile against Keycloak 26.8.0/dev-file: proof 202; initial status accepted; identical retry 202; changed retry 409; one-use callback; replay no code; status 404; Code+PKCE 200 | Expiry and post-consume store-failure/recovery gates remain unqualified |
+| Keycloak #7 signup provisioning and recovery (single-node only) | Open; no longer blocked on #6 topology | Local UserProvider/handler tests; fresh signup recovery remains offline-only evidence | Run the bounded single-node signup recovery profile; do not claim distributed races |
+| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4 and Wallet #64; #9 is downstream closeout | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
+| Keycloak #9 security/support policy/docs/CI | Implemented; remote rerun pending | Commit `04637ce45962e1903aad17ce153c1159ec13faba` passed Maven 163/12, Python 146, compilation, resolver verification, diff validation and provider registration. Its image build failed because Buildx looked for a root `Dockerfile`; workflow now selects `container/Dockerfile`. | Independent aggregate security review and support-policy approval |
+| Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
+| WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
+
+Issue #1 remains open. Component work, unit tests, and loopback simulation do not close its broader acceptance criteria. WordPress HITL decisions must be resolved by the user before implementation. Dependency #4 is merged in the integration baseline; #5 and #6 are progressing separately and their eventual diffs still require an independent aggregate security review before any final #9 security qualification.
 
 ## Implemented flow shape
 

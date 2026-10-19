@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -355,13 +356,15 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertLess(main.index("rotation_progress = lambda"), main.index("result['rotated_identity_case'] = {"))
 
   def test_partial_evidence_is_reported_before_temporary_directory_cleanup(self):
+    import tempfile
     sys.path.insert(0, str(ROOT / 'scripts'))
     from wallet_login_live_e2e import report_partial_evidence_on_failure
     from contextlib import redirect_stdout
     from io import StringIO
-    import tempfile
 
-    with tempfile.TemporaryDirectory(dir=Path.home() / '.hermes/cache/scratch') as directory:
+    scratch = Path(os.environ.get('TMPDIR') or tempfile.gettempdir())
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch) as directory:
       evidence_path = Path(directory) / 'evidence.json'
       evidence_path.write_text('{"wallet_login":{"proof_post_http":202}}', encoding='utf-8')
       output = StringIO()
