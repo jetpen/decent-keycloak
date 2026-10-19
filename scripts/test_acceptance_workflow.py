@@ -16,23 +16,22 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
 
-  def test_both_documented_unittest_commands_include_workflow_guard(self):
+  def test_acceptance_job_and_documented_commands_have_same_unique_modules(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+    readme = (ROOT / "README.md").read_text()
     import re
 
-    readme = (ROOT / "README.md").read_text()
-    commands = []
-    for line in readme.splitlines():
-      if line.startswith("python") and " -m unittest" in line:
-        commands.append([])
-      elif commands and line.strip() == "```":
-        continue
-      elif commands and line.strip().endswith("-q"):
-        commands[-1].append(line)
-      elif commands and line.strip():
-        commands[-1].append(line)
-    self.assertGreaterEqual(len(commands), 2)
-    for command_lines in commands:
-      self.assertIn("scripts.test_acceptance_workflow", " ".join(command_lines))
+    commands = re.findall(r"python3(?:\.11)? -m unittest \\\n(.*?) -q", readme, re.DOTALL)
+    self.assertEqual(2, len(commands), "README must document both interpreter variants")
+    documented_lists = [re.findall(r"scripts\.test_[a-z0-9_]+", command) for command in commands]
+    for documented in documented_lists:
+      self.assertEqual(len(documented), len(set(documented)), "documented test modules must be unique")
+    job = workflow.split("      - name: Run the Python acceptance harness\n", 1)[1].split(
+        "      - name: Compile Python sources\n", 1)[0]
+    configured = re.findall(r"scripts\.test_[a-z0-9_]+", job)
+    self.assertEqual(len(configured), len(set(configured)))
+    for documented in documented_lists:
+      self.assertEqual(set(documented), set(configured))
 
 
 if __name__ == "__main__":

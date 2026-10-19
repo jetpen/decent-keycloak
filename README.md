@@ -6,7 +6,13 @@ This repository owns the Keycloak-specific adapter for the approved, provider-ne
 
 **Local Registry network exposure:** the disposable harness uses Podman host networking and binds the Registry node to `127.0.0.1`, not all host interfaces. A regression checks the generated config. This confines the listener to local use; it does not qualify Registry availability or reliability.
 
-## Issue #9: support policy, security review and CI
+## PR #12 check failure and remediation
+
+The checks failed against the synthetic merge revision `0f355a8e0e6d108a117ecce45f077d26d08071f3` (PR head `cbdaf4c94b8c2292396c4d619db77376efabd2bb`). Maven passed, but the Python step ran 146 tests and reported three assertion failures plus one error: ledger assertions were stale against the merge README. The failure-specific probe also assumed the Hermes scratch directory exists on the runner. The README's second documented test command also repeated `scripts.test_acceptance_workflow`; the new regression check catches duplicate module entries and requires the documented commands and CI list to match.
+
+
+This scoped remediation applies the acceptance-ledger, command-list, and scratch-path fixes on the exact clean merge reproduction. The corrected test counts and remaining gates are recorded below; GitHub Actions has not yet rerun on the new PR head, and the independent security review remains outstanding.
+
 
 The exact experimental build boundary and upgrade gates are in [`docs/support-policy.md`](docs/support-policy.md); the scoped security review, test evidence and open qualifications are in [`docs/security-review.md`](docs/security-review.md). CI is defined in [`.github/workflows/acceptance.yml`](.github/workflows/acceptance.yml); it runs on pushes, pull requests and manual dispatch without path filters, pins all actions to immutable commit SHAs, grants only `contents: read`, and does not use credentials or publish artifacts. It gates Maven/Surefire, the complete Python harness and compilation, resolver/vector provenance, diff whitespace, provider registration and a no-cache amd64 provider-image build/runtime-version check. GitHub branch protection is separate: an administrator must mark the job's verified status context required.
 
@@ -21,16 +27,18 @@ Image ID `96c7012db2c2353097816f0b121969a9da7338bc9118325c5da60179629a3a17`; dig
 
 # Verification layers and remaining gates
 
+Reviewed integration merge `48121bec3ac2708b97c4c39240cd85aadf0117e2`
+
 This offline acceptance ledger records implementation/build evidence separately from external qualification. **Issue #1 remains open** until the full issue's acceptance criteria pass.
 
 | Slice | Status | Verified so far | Still open |
 |---|---|---|---|
-| Keycloak #4 self-contained resolver runtime | Merged in integration baseline `48121bec3ac2708b97c4c39240cd85aadf0117e2` | Baseline source verification: Maven 161/12; Python **133 non-ledger tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one module discovers zero tests)**. Leading-dash CLI argument and bundled executable default regressions pass; process-start, timeout, interruption, and output-overflow sanitized diagnostics; positive lookups reject unexpected diagnostics; pinned runtime inputs verified. Latest loopback passed login/PKCE/replay, preflight/security, throttle, account-policy denial, and signup/PKCE. Rotation publication/readback reached sequence 2; six fresh successor reads failed exact Identity/key matching, so stale/current-key proofs did not run. | Registry/provider matrix and stale/current-key rotation proof gate remain open. |
+| Keycloak #4 self-contained resolver runtime | Base implementation was already merged before #9; Issue #4 remains open | Maven 163/12 and Python 146 on the exact clean PR-merge reproduction; local lookup-path regressions pass. Supplemental owner-key rotation loopback evidence remains unqualified and is not an #4 acceptance gate. | Provider-level terminal `not_found` and network-isolated image build |
 | Keycloak #5 repeatable current-Registry matrix | In progress in a separate worktree; #4 is integrated | No implementation/acceptance run | Exact current/miss/unavailable/history, repeated proofs and rotation |
-| Keycloak #6 two-node shared-store replay | In progress in a separate worktree | Not run | Production-mode cluster membership; cross-node consume/status/callback one-winner |
-| Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
-| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
-| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Support policy, source-review matrix, immutable-action CI and TDD logging fix; Java 21 Maven 162/12, Python 145, actionlint and no-cache provider image verified locally | Independent aggregate review after #5/#6, remote workflow run, and all live/cluster/real TLS/production gates |
+| Keycloak #6 single-node transaction replay and callback | Current feature branch `feature/issue-6-single-node-live`; last local integrated evidence is incomplete | Single-node profile against Keycloak 26.8.0/dev-file: proof 202; initial status accepted; identical retry 202; changed retry 409; one-use callback; replay no code; status 404; Code+PKCE 200 | Expiry and post-consume store-failure/recovery gates remain unqualified |
+| Keycloak #7 signup provisioning and recovery (single-node only) | Open; no longer blocked on #6 topology | Local UserProvider/handler tests; fresh signup recovery remains offline-only evidence | Run the bounded single-node signup recovery profile; do not claim distributed races |
+| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4 and Wallet #64; #9 is downstream closeout | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
+| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Java 21 Maven 163/12 and Python 146 on clean PR-merge reproduction; resolver-input verification, compilation and actionlint passed locally | Independent aggregate security review, support policy approval, and remote workflow rerun after push |
 | Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
 | WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
 
@@ -54,7 +62,7 @@ python3 -m py_compile scripts/*.py container/*.py
 python3 container/build_resolver_runtime.py
 ```
 
-**Local checks (fresh issue #9 worktree run):** the last Maven run used Eclipse Temurin **21.0.12.1+1**; Python acceptance used CPython **3.11.13**.
+**Local checks on the exact clean PR-merge reproduction:** Java 21 Maven 163 tests / 12 suites; Python acceptance 146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests; one imported module discovers zero). Resolver-input verification, Python compilation, actionlint, and diff checks passed locally.
 
 ```bash
 MAVEN_OPTS='-Xmx2g' mvn -q -o clean package
@@ -75,7 +83,7 @@ python3.11 container/verify_resolver_runtime_inputs.py \
 git diff --check HEAD
 ```
 
-Fresh issue #9 results: Maven **162 tests / 12 suites**, zero failures/errors/skips; Python **133 functional tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one module discovers zero tests)**; Python compilation, pinned resolver lock/source-archive verification and actionlint **1.7.12** passed. A no-cache Podman runtime-image build passed with image ID `3fda3cb2a3c2accca0f4893a8c655c25b5f148f9bff4190b3ca843d572198d1a` and digest `sha256:6ea9e4770afba58f92d58f5621b6bbb7baca26ab1439eb5fa8a2278bb3b5fb5a`; it reported `Keycloak 26.8.0` and `Red Hat OpenJDK 21.0.12.1+1-LTS`, and the provider SPI registration was present. This is a local package/image build, not a live login or GitHub Actions result; it does not qualify the open Registry rotation, browser/TLS/wallet or two-node gates.
+`python3.11 -m unittest scripts.test_acceptance_workflow scripts.test_wallet_login_result scripts.test_wallet_login_transport_e2e scripts.test_owner_rotation_probe scripts.test_signup_intent_probe scripts.test_self_contained_resolver_runtime scripts.test_owner_rotation_envelope scripts.test_live_gate_order scripts.test_acceptance_ledger -q` ran 146 tests: 141 non-ledger, 11 ledger, 2 workflow guards; one imported module discovers zero. The exact clean merge checkout Maven build passed 163/12 with zero failures/errors/skips. Python compilation, resolver-source verification, actionlint, and diff checks passed locally.
 
 # Loopback evidence
 
@@ -98,12 +106,12 @@ Fresh issue #9 results: Maven **162 tests / 12 suites**, zero failures/errors/sk
 
 | Slice | Status | Verified so far | Still open |
 |---|---|---|---|
-| Keycloak #4 self-contained resolver runtime | Merged in integration baseline `48121bec3ac2708b97c4c39240cd85aadf0117e2` | Baseline source verification: Maven 161/12; Python **133 non-ledger tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one module discovers zero tests)**. Leading-dash CLI argument and bundled executable default regressions pass; process-start, timeout, interruption, and output-overflow sanitized diagnostics; positive lookups reject unexpected diagnostics; pinned runtime inputs verified. Latest loopback passed login/PKCE/replay, preflight/security, throttle, account-policy denial, and signup/PKCE. Rotation publication/readback reached sequence 2; six fresh successor reads failed exact Identity/key matching, so stale/current-key proofs did not run. | Registry/provider matrix and stale/current-key rotation proof gate remain open. |
+| Keycloak #4 self-contained resolver runtime | Base implementation was already merged before #9; Issue #4 remains open | Maven 163/12 and Python 146 on the exact clean PR-merge reproduction; local lookup-path regressions pass. Supplemental owner-key rotation loopback evidence remains unqualified and is not an #4 acceptance gate. | Provider-level terminal `not_found` and network-isolated image build |
 | Keycloak #5 repeatable current-Registry matrix | In progress in a separate worktree; #4 is integrated | No implementation/acceptance run | Exact current/miss/unavailable/history, repeated proofs and rotation |
-| Keycloak #6 two-node shared-store replay | In progress in a separate worktree | Not run | Production-mode cluster membership; cross-node consume/status/callback one-winner |
-| Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
-| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
-| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Support policy, source-review matrix, immutable-action CI and TDD logging fix; Java 21 Maven 162/12, Python 145, actionlint and no-cache provider image verified locally | Independent aggregate review after #5/#6, remote workflow run, and all live/cluster/real TLS/production gates |
+| Keycloak #6 single-node transaction replay and callback | Current feature branch `feature/issue-6-single-node-live`; last local integrated evidence is incomplete | Single-node profile against Keycloak 26.8.0/dev-file: proof 202; initial status accepted; identical retry 202; changed retry 409; one-use callback; replay no code; status 404; Code+PKCE 200 | Expiry and post-consume store-failure/recovery gates remain unqualified |
+| Keycloak #7 signup provisioning and recovery (single-node only) | Open; no longer blocked on #6 topology | Local UserProvider/handler tests; fresh signup recovery remains offline-only evidence | Run the bounded single-node signup recovery profile; do not claim distributed races |
+| Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4 and Wallet #64; #9 is downstream closeout | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
+| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Java 21 Maven 163/12 and Python 146 on clean PR-merge reproduction; resolver-input verification, compilation and actionlint passed locally | Independent aggregate security review, support policy approval, and remote workflow rerun after push |
 | Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
 | WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
 
