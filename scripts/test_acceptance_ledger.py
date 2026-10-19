@@ -10,29 +10,60 @@ README = Path(__file__).parents[1] / "README.md"
 class AcceptanceLedgerTest(unittest.TestCase):
   def test_acceptance_ledger_reports_current_verification_layers_and_remaining_gates(self):
     text = README.read_text()
-    self.assertIn("Python **133 non-ledger tests plus 10 acceptance-ledger tests (143 total across eight imported modules; one module discovers zero tests)**", text)
-    self.assertIn("10 acceptance-ledger tests", text)
+    self.assertIn("Python **133 non-ledger tests plus 11 acceptance-ledger tests (144 total across eight imported modules; one module discovers zero tests)**", text)
+    self.assertIn("11 acceptance-ledger tests", text)
+    self.assertIn("Maven **162 tests / 12 suites**", text)
     self.assertIn("uses a balanced-object scan", text)
+    self.assertIn("The broader repeated Registry matrix belongs to #5", text)
+    self.assertIn("rotation readback is supporting context, not an #4 acceptance gate", text)
+    self.assertIn("missing Registry configuration returns unavailable (503), not absence (401)", text)
+    self.assertIn("a Registry miss accompanied by a dial warning is unavailable", text)
+    self.assertEqual(1, text.count("| Slice | Status | Verified so far | Still open |"))
+    self.assertIn("Base implementation commit `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
+    self.assertIn("integration merge `48121bec3ac2708b97c4c39240cd85aadf0117e2`", text)
+    self.assertIn("Issue #4 remains open", text)
+    self.assertNotIn("uncommitted/unmerged", text)
 
-  def test_exact_image_evidence_records_rotation_outcome_and_unqualified_registry_matrix(self):
+  def test_latest_image_from_current_worktree_records_fail_closed_gate(self):
     text = README.read_text()
-    self.assertIn("Prior run: image `sha256:480807ab7ab77d5a169dbcea064ba4a096fcddebb324e0f44caa2e5e603547ae`", text)
-    self.assertIn("Latest: image `sha256:29fe182466744bf7d9286fde27331cce784041170898eed430bfb8490ae8f602`", text)
-    self.assertIn("All six fresh successor reads failed exact Identity/key matching", text)
-    self.assertIn("Receipt contains sanitized per-read JSON-balance/exact-match booleans", text)
+    self.assertIn("Latest #4 run from the current worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
+    self.assertIn("image ID `92cc5d4c06fd4a65dd1e2fbbb5472f70fd901201536b88019706bff48c14ce13`", text)
+    self.assertIn("digest `sha256:b4120b6aa22de7bf036250a9f66b701245e6f4fd8082cbeaf71f96d832cfd58b`", text)
+    self.assertIn("harness SHA `e220a7920c211b5d995a0b389b4665107565bf8c40da0b43d8cc4c9d2afd8d61`", text)
+    self.assertIn("All six fresh successor reads (three configured-port, three ephemeral) were unavailable", text)
+    self.assertIn("all had balanced JSON, exact identity/key match false, and an unexpected diagnostic", text)
+    self.assertIn("Two configured-port samples included peer-handshake diagnostics", text)
+    self.assertIn("Harness exited 1 at the successor-read gate", text)
+    self.assertIn("no stale/current-key proofs or provider `not_found` case ran", text)
+    self.assertIn("Prior #4 run (image predates d700)", text)
+    self.assertIn("latest no-cache image was built from the current #4 worktree", text)
+    self.assertIn("provider JAR inside that image has SHA-256 `4a2d1364180350fffc671a7f61812ecbea5e68f04c90df95f95c0b669d4fbbcd`", text)
+    self.assertIn("current Maven target JAR SHA-256 is `c0f84827366911b7714f8590c2055c956fdd47d87cbcb01462f88ee8f5ac05c5`", text)
+    self.assertIn("all 46 ZIP entry names and uncompressed contents match", text)
+    self.assertIn("downloaded hash-locked dependency artifacts", text)
+    self.assertIn("network-isolated image build remains unshown", text)
 
-
-
-
-
-
-
-  def test_current_source_run_stopped_before_registry_rotation_or_proof(self):
+  def test_separate_registry_matrix_run_is_not_conflated_with_issue_four(self):
     text = README.read_text()
-    self.assertIn("Prior run: image `sha256:480807ab7ab77d5a169dbcea064ba4a096fcddebb324e0f44caa2e5e603547ae`", text)
-    self.assertIn("Latest: image `sha256:29fe182466744bf7d9286fde27331cce784041170898eed430bfb8490ae8f602`", text)
-    self.assertIn("All six fresh successor reads failed exact Identity/key matching", text)
-    self.assertIn("Receipt contains sanitized per-read JSON-balance/exact-match booleans", text)
+    self.assertIn("Separate #5 matrix attempt (not the #4 loopback run)", text)
+    self.assertIn("harness SHA `3743c2b44e2f40f9f4ad3179d1d9a9767b0797661ce6dd9d6fc8729d1a13a7a6`", text)
+    self.assertIn("provider_registry_inconsistent", text)
+    self.assertIn("pending with no receipt or callback", text)
+    self.assertIn("second missing-Identity attempt stopped at owner-key generation", text)
+    self.assertIn("per-attempt key-filename fix was added afterward and was not live-verified", text)
+
+
+
+
+
+
+
+
+  def test_earlier_loopback_is_distinguished_from_precommit_run(self):
+    text = README.read_text()
+    self.assertIn("Earlier #4 loopback", text)
+    self.assertNotIn("Latest loopback from the current code state", text)
+    self.assertIn("Prior #4 run (image predates d700)", text)
 
   def test_disposable_probe_documents_immutable_image_invocation(self):
     text = README.read_text()
@@ -65,26 +96,26 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn("This attribution fix is source-tested but has not yet been rebuilt into an immutable image and rerun", text)
 
   def test_provider_401_is_not_inferred_as_registry_miss(self):
-      harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
-      start = harness.index('def classify_provider_identity_outcome(')
-      end = harness.index('\n\ndef missing_identity_flow(', start)
-      classifier = harness[start:end]
-      assert "if provider_http == 401:" in classifier
-      assert "return 'provider_denied_unclassified'" in classifier
-      assert 'not_found' not in classifier
+    harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
+    start = harness.index('def classify_provider_identity_outcome(')
+    end = harness.index('\n\ndef missing_identity_flow(', start)
+    classifier = harness[start:end]
+    self.assertIn("if provider_http == 401:", classifier)
+    self.assertIn("return 'provider_denied_unclassified'", classifier)
+    self.assertNotIn('not_found', classifier)
 
   def test_registry_listener_is_loopback_only(self):
-      harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
-      start = harness.split("def start_registry(temp, image):", 1)[1].split("def start_resolver_tools(", 1)[0]
-      assert "host: 127.0.0.1" in start
-      assert "host: 0.0.0.0" not in start
+    harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
+    start = harness.split("def start_registry(temp, image):", 1)[1].split("def start_resolver_tools(", 1)[0]
+    self.assertIn("host: 127.0.0.1", start)
+    self.assertNotIn("host: 0.0.0.0", start)
 
   def test_authenticator_preserves_keycloaks_execution_tracking_on_wallet_challenge(self):
-      source = (README.parents[0] / "src/main/java/org/decentwallet/keycloak/wallet/WalletChallengeAuthenticator.java").read_text()
-      challenge_start = source.index("public void authenticate(AuthenticationFlowContext context)")
-      action_start = source.index("public void action(AuthenticationFlowContext context)", challenge_start)
-      body = source[challenge_start:action_start]
-      body = body[body.index("String accessCode = context.generateAccessCode();"):]
-      assert "CURRENT_AUTHENTICATION_EXECUTION" not in body
-      assert "LAST_PROCESSED_EXECUTION" not in body
-      assert "context.getActionUrl(accessCode)" in body
+    source = (README.parents[0] / "src/main/java/org/decentwallet/keycloak/wallet/WalletChallengeAuthenticator.java").read_text()
+    challenge_start = source.index("public void authenticate(AuthenticationFlowContext context)")
+    action_start = source.index("public void action(AuthenticationFlowContext context)", challenge_start)
+    body = source[challenge_start:action_start]
+    body = body[body.index("String accessCode = context.generateAccessCode();"):]
+    self.assertNotIn("CURRENT_AUTHENTICATION_EXECUTION", body)
+    self.assertNotIn("LAST_PROCESSED_EXECUTION", body)
+    self.assertIn("context.getActionUrl(accessCode)", body)

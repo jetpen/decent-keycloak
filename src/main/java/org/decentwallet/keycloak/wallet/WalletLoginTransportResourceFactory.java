@@ -20,7 +20,9 @@ public final class WalletLoginTransportResourceFactory
   @Override
   public RealmResourceProvider create(KeycloakSession session) {
     var realm = session.getContext().getRealm();
-    WalletLoginIdentityResolver resolver = identityId -> null;
+    WalletLoginIdentityResolver resolver = identityId -> {
+      throw new ProcessIdentityResolver.IdentityResolutionException("Registry resolver is not configured");
+    };
     String bootstrapConfig = realm.getAttribute(KEY_REGISTRY_BOOTSTRAP);
     String clientPortConfig = realm.getAttribute(KEY_REGISTRY_CLIENT_PORT);
     if ((bootstrapConfig == null) != (clientPortConfig == null)) {
@@ -36,7 +38,6 @@ public final class WalletLoginTransportResourceFactory
           splitBootstrap(bootstrapConfig), parsePort(clientPortConfig), executable);
       resolver = currentIdentity::resolveExact;
     }
-    if (resolver == null) resolver = identityId -> null;
     WalletLoginIdentityResolver sharedResolver = resolver;
     boolean acceptSignup = realm.isRegistrationAllowed();
     String walletOrigin = realm.getAttribute(KEY_WALLET_ORIGIN);

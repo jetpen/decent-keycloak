@@ -1,6 +1,8 @@
 package org.decentwallet.keycloak.wallet;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.core.Response;
 import java.nio.charset.StandardCharsets;
@@ -144,7 +146,7 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
-  void resolverUnavailableMapsTo503AndKeepsPendingWithoutReceiptOrCallback() throws Exception {
+  void dialWarningOnExactRegistryMissMapsTo503AndKeepsPendingWithoutReceiptOrCallback() throws Exception {
     var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
     var issued = store.issue(BINDING);
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
@@ -152,9 +154,10 @@ final class WalletLoginTransportHandlerTest {
     byte[] proof = signedProof(issued.challenge(), identity, keyPair);
     var resolverExecutable = Files.createTempFile("identity-unavailable-stub-", ".sh");
     try {
-      String wrongKey = "ab".repeat(32);
+      String exactKey = ProcessIdentityResolver.exactRegistryObjectKeyHex(identity);
       String output = String.join(System.lineSeparator(),
-          "Value not found for key /decent-registry/identity/" + wrongKey, "not found", "");
+          "Failed to open TCP stream: all attempts to connect to /ip4/127.0.0.1/tcp/9000 failed",
+          "Value not found for key /decent-registry/identity/" + exactKey, "not found", "");
       String encoded = Base64.getEncoder().encodeToString(output.getBytes(StandardCharsets.UTF_8));
       Files.writeString(resolverExecutable, String.join(System.lineSeparator(),
           "#!/bin/sh", "printf '%s' '" + encoded + "' | base64 -d", "exit 1", ""));
@@ -178,6 +181,45 @@ final class WalletLoginTransportHandlerTest {
     } finally {
       Files.deleteIfExists(resolverExecutable);
     }
+  }
+
+  @Test
+  void factoryWithoutRegistryConfigurationReturnsUnavailableNotIdentityAbsence() throws Exception {
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:resolver-unconfigured@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var context = mock(org.keycloak.models.KeycloakContext.class);
+    var uriInfo = mock(org.keycloak.models.KeycloakUriInfo.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    when(session.getContext()).thenReturn(context);
+    when(session.singleUseObjects()).thenReturn(provider);
+    when(context.getRealm()).thenReturn(realm);
+    when(context.getUri()).thenReturn(uriInfo);
+    when(uriInfo.getBaseUri()).thenReturn(java.net.URI.create(IDP_ORIGIN + "/auth/"));
+    when(uriInfo.getQueryParameters()).thenReturn(new jakarta.ws.rs.core.MultivaluedHashMap<>());
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_WALLET_ORIGIN)).thenReturn(WALLET_ORIGIN);
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_REGISTRY_BOOTSTRAP)).thenReturn(null);
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_REGISTRY_CLIENT_PORT)).thenReturn(null);
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_IDP_ORIGIN)).thenReturn(null);
+    when(realm.isRegistrationAllowed()).thenReturn(false);
+
+    var resource = (WalletLoginTransportResource) new WalletLoginTransportResourceFactory().create(session);
+    var handlerField = WalletLoginTransportResource.class.getDeclaredField("handler");
+    handlerField.setAccessible(true);
+    var handler = (WalletLoginTransportHandler) handlerField.get(resource);
+
+    var response = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+
+    assertEquals(503, response.status());
+    assertTrue(store.load(issued.handle()).isPresent());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
   }
 
   @Test
