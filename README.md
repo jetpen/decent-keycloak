@@ -30,7 +30,7 @@ This offline acceptance ledger records implementation/build evidence separately 
 | Keycloak #6 two-node shared-store replay | In progress in a separate worktree | Not run | Production-mode cluster membership; cross-node consume/status/callback one-winner |
 | Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
 | Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
-| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Support policy, source-review matrix, immutable-action CI and TDD logging fix; Java 21 Maven 162/12, Python 143, actionlint and no-cache provider image verified locally | Independent aggregate review after #5/#6, remote workflow run, and all live/cluster/real TLS/production gates |
+| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Support policy, source-review matrix, immutable-action CI and TDD logging fix; Java 21 Maven 162/12, Python 145, actionlint and no-cache provider image verified locally | Independent aggregate review after #5/#6, remote workflow run, and all live/cluster/real TLS/production gates |
 | Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
 | WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
 
@@ -41,6 +41,7 @@ Issue #1 stays open. Component work, unit tests, and loopback simulation do not 
 |---|---|
 ```bash
 python3 -m unittest \
+  scripts.test_acceptance_workflow \
   scripts.test_wallet_login_result \
   scripts.test_wallet_login_transport_e2e \
   scripts.test_owner_rotation_probe \
@@ -58,6 +59,7 @@ python3 container/build_resolver_runtime.py
 ```bash
 MAVEN_OPTS='-Xmx2g' mvn -q -o clean package
 python3.11 -m unittest \
+  scripts.test_acceptance_workflow \
   scripts.test_wallet_login_result \
   scripts.test_wallet_login_transport_e2e \
   scripts.test_owner_rotation_probe \
@@ -96,7 +98,7 @@ Fresh issue #9 results: Maven **162 tests / 12 suites**, zero failures/errors/sk
 | Keycloak #6 two-node shared-store replay | In progress in a separate worktree | Not run | Production-mode cluster membership; cross-node consume/status/callback one-winner |
 | Keycloak #7 signup consume-race recovery | Blocked on #6 | Not qualified cross-node | Provisioning, consume loss, receipt/callback failure and fresh-signup recovery |
 | Keycloak #8 TLS/browser/native wallet + Code/PKCE | Pending #4, Wallet #64 and #9 | Loopback simulation only | Trusted TLS, real browser/wallet and OIDC client |
-| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Support policy, source-review matrix, immutable-action CI and TDD logging fix; Java 21 Maven 162/12, Python 143, actionlint and no-cache provider image verified locally | Independent aggregate review after #5/#6, remote workflow run, and all live/cluster/real TLS/production gates |
+| Keycloak #9 security/support policy/docs/CI | Implemented on this feature branch; merge and GitHub CI run pending | Support policy, source-review matrix, immutable-action CI and TDD logging fix; Java 21 Maven 162/12, Python 145, actionlint and no-cache provider image verified locally | Independent aggregate review after #5/#6, remote workflow run, and all live/cluster/real TLS/production gates |
 | Wallet #64 proof signer | Separate issue/worktree | Prior Android JVM/vector tests; not merged | Delivery/review and real wallet client integration |
 | WordPress #6 relying party | Blocked on human decisions #2–#5 | Not implemented | Returning `(iss,sub)` mapping and signup-only Registry policy |
 
