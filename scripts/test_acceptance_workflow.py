@@ -16,6 +16,11 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
 
+  def test_provider_image_build_uses_repository_dockerfile_path(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+    build = workflow.split("      - name: Build and check the immutable-base provider image\n", 1)[1]
+    self.assertIn("--file container/Dockerfile", build)
+
   def test_acceptance_job_and_documented_commands_have_same_unique_modules(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     readme = (ROOT / "README.md").read_text()
