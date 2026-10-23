@@ -520,6 +520,11 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
     self.assertIn('COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./', dockerfile)
     self.assertIn('COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py', dockerfile)
+    self.assertIn('COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./', dockerfile)
+    self.assertIn('scripts/test_pinned_dht_peer_outcomes.py', dockerfile)
+    self.assertIn('scripts/test_pinned_registry_lookup_outcomes.py', dockerfile)
+    self.assertIn('python scripts/test_pinned_dht_peer_outcomes.py', dockerfile)
+    self.assertIn('python scripts/test_pinned_registry_lookup_outcomes.py', dockerfile)
     self.assertIn('python3.11 verify_resolver_runtime_inputs.py', dockerfile)
     self.assertNotIn('ARG IDENTITY_ARCHIVE_SHA256=', dockerfile)
     self.assertNotIn('ARG REGISTRY_ARCHIVE_SHA256=', dockerfile)
@@ -558,9 +563,25 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       for name in ('identity', 'registry'):
         source = ROOT / 'container/source-archives' / f'{name}.tar.gz'
         (archives / f'{name}.tar.gz').write_bytes(source.read_bytes())
+      for name, filename in (
+          ('pinned_lookup_outcomes', 'pinned_lookup_outcomes.py'),
+          ('runtime_patcher', 'patch_resolver_runtime.py'),
+      ):
+        source = ROOT / 'container' / filename
+        (manifest_directory / filename).write_bytes(source.read_bytes())
+        original_lock.setdefault('repo_overlays', {})[name] = {
+            'file': filename,
+            'sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        }
       manifest = manifest_directory / 'resolver-runtime.lock.json'
       manifest.write_text(json.dumps(original_lock))
       verifier.verify_source_archives(archives, manifest)
+      overlay_path = manifest_directory / 'pinned_lookup_outcomes.py'
+      overlay_bytes = overlay_path.read_bytes()
+      overlay_path.write_bytes(overlay_bytes + b'altered')
+      with self.assertRaisesRegex(RuntimeError, 'resolver overlay checksum mismatch'):
+        verifier.verify_source_archives(archives, manifest)
+      overlay_path.write_bytes(overlay_bytes)
 
       import io
       import tarfile
@@ -801,14 +822,19 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     expected_miss = 'Value not found for key /decent-registry/identity/' + expected_key
     wrong_miss = 'Value not found for key /decent-registry/identity/' + 'ab' * 32
 
+    clean_summary = (
+        'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0' + chr(10)
+        + 'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0' + chr(10)
+    )
+
     self.assertEqual('not_found', classify_identity_lookup(
-        expected_miss + chr(10) + 'not found', 1, identifier)[0])
+        clean_summary + expected_miss + chr(10) + 'not found', 1, identifier)[0])
     self.assertEqual('unavailable', classify_identity_lookup(
-        wrong_miss + chr(10) + 'not found', 1, identifier)[0])
+        clean_summary + wrong_miss + chr(10) + 'not found', 1, identifier)[0])
     self.assertEqual('unavailable', classify_identity_lookup(
-        expected_miss + chr(10) + wrong_miss + chr(10) + 'not found', 1, identifier)[0])
+        clean_summary + expected_miss + chr(10) + wrong_miss + chr(10) + 'not found', 1, identifier)[0])
     self.assertEqual('unavailable', classify_identity_lookup(
-        expected_miss + chr(10) + 'not found', 1)[0])
+        clean_summary + expected_miss + chr(10) + 'not found', 1)[0])
 
   def test_rotation_helper_uses_a_real_ephemeral_port_for_independent_reads(self):
     helper = (ROOT / 'scripts/rotation_registry_roundtrip.py').read_text()

@@ -15,6 +15,9 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests", text)
     self.assertIn("missing Registry configuration returns unavailable (503), not absence (401)", text)
     self.assertIn("a Registry miss accompanied by a dial warning is unavailable", text)
+    self.assertIn("Current isolated offline branch: Java 21 Maven 179 tests and Python acceptance 183 tests pass", text)
+    self.assertIn("pass 11 peer-outcome and 5 Registry propagation cases", text)
+    self.assertIn("candidate has not been image-built or live-qualified", text)
     self.assertEqual(2, text.count("| Slice | Status | Verified so far | Still open |"))
     self.assertNotIn("uncommitted/unmerged", text)
 

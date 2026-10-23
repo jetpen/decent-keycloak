@@ -1256,7 +1256,20 @@ def stop_registry(node, container):
       node.wait(timeout=5)
 
 
+def parse_dht_lookup_summary_line(line):
+  match = re.fullmatch(
+      r'DHT_LOOKUP_SUMMARY stage=(get_value|remote_identity) attempts=(\d{1,3}) '
+      r'empty=(\d{1,3}) failed=(\d{1,3}) timeouts=(\d{1,3}) incomplete=(\d{1,3})',
+      line)
+  if not match:
+    return None
+  stage, *counts = match.groups()
+  return stage, *(int(value) for value in counts)
+
+
 def identity_lookup_category(line):
+  if parse_dht_lookup_summary_line(line) is not None:
+    return 'dht_lookup_summary'
   if line == 'not found':
     return 'not_found'
   miss_prefix = 'Value not found for key /decent-registry/identity/'
@@ -1283,7 +1296,8 @@ def identity_lookup_category(line):
   if line.startswith('Dialing ') or line.startswith('Connected to '):
     value = line.split(' ', 1)[1]
     return 'peer_status' if value.strip() else 'other'
-  if line.startswith('{') or line.startswith('  "') or line.startswith('    "') or line.strip() == '}':
+  stripped = line.strip()
+  if stripped.startswith('{') or (stripped.startswith('"') and ':' in stripped) or stripped == '}':
     return 'json'
   if line.startswith('history unavailable:'):
     return 'history_unavailable'
@@ -1293,41 +1307,22 @@ def identity_lookup_category(line):
 
 
 def classify_identity_lookup(stdout, exit_code, expected_identifier=None):
-  def category(line):
-    if line == 'not found':
-      return 'not_found'
-    if line.startswith('Value not found for key /decent-registry/identity/'):
-      key = line.rsplit('/', 1)[-1]
-      return 'registry_miss' if len(key) == 64 and all(ch in '0123456789abcdefABCDEF' for ch in key) else 'other'
-    if line.startswith('Failed to open TCP stream: all attempts to connect to '):
-      endpoint = line.removeprefix('Failed to open TCP stream: all attempts to connect to ').removesuffix(' failed')
-      return 'dial_warning' if endpoint and not any(ch.isspace() for ch in endpoint) else 'other'
-    if line.startswith('failed to upgrade security for peer '):
-      suffix = ': handshake failed when upgrading to secure connection'
-      short_suffix = ': handshake failed'
-      peer = line.removeprefix('failed to upgrade security for peer ')
-      if peer.endswith(suffix):
-        peer = peer[:-len(suffix)]
-      elif peer.endswith(short_suffix):
-        peer = peer[:-len(short_suffix)]
-      else:
-        return 'other'
-      alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-      return 'peer_handshake' if peer.startswith('12D3Koo') and len(peer) == 52 and all(c in alphabet for c in peer) else 'other'
-    if line.startswith('Dialing ') or line.startswith('Connected to '):
-      value = line.split(' ', 1)[1]
-      return 'peer_status' if value and not any(character.isspace() for character in value) else 'other'
-    if line.startswith('Failed to send request to peer: ') or line.startswith('Failed to connect to peer: '):
-      return 'peer_error'
-    if line.startswith('history unavailable:'):
-      return 'history_unavailable'
-    if line.startswith('Traceback') or line.startswith('File ') or 'Error:' in line:
-      return 'traceback'
-    if line.startswith('{') or (line.strip().startswith('"') and ':' in line) or line.strip() == '}':
-      return 'json'
-    return 'other'
   lines = stdout.splitlines()
-  categories = [category(line.strip()) for line in lines if line.strip()]
+  categories = []
+  summaries = {}
+  invalid_summary = False
+  for line in lines:
+    stripped = line.strip()
+    if not stripped:
+      continue
+    summary = parse_dht_lookup_summary_line(stripped)
+    if stripped.startswith('DHT_LOOKUP_SUMMARY '):
+      if summary is None or summary[0] in summaries:
+        invalid_summary = True
+      else:
+        summaries[summary[0]] = summary[1:]
+      continue
+    categories.append(identity_lookup_category(stripped))
   peer_handshake_or_error = any(category in {'peer_handshake', 'peer_error'} for category in categories)
   if peer_handshake_or_error:
     return 'unavailable', categories
@@ -1373,8 +1368,12 @@ def classify_identity_lookup(stdout, exit_code, expected_identifier=None):
   if peer_handshake_or_error:
     return 'unavailable', categories
   explicit_terminal_miss = exit_code == 1 and categories[-1:] == ['not_found']
-  absence_only = explicit_terminal_miss and all(
-      item in ('registry_miss', 'not_found') for item in categories)
+  required_stages = {'get_value', 'remote_identity'}
+  summaries_clean = (not invalid_summary and set(summaries) == required_stages
+      and all(attempts > 0 and empty == attempts and failed == 0 and timeouts == 0 and incomplete == 0
+          for attempts, empty, failed, timeouts, incomplete in summaries.values()))
+  absence_only = (explicit_terminal_miss and summaries_clean
+      and all(item in ('registry_miss', 'not_found') for item in categories))
   if expected_identifier is None:
     absence_only = False
   if (exit_code == 1 and explicit_terminal_miss and absence_only
@@ -2797,8 +2796,10 @@ def sanitized_resolver_diagnostic_lines(text):
   if not isinstance(text, str):
     return []
   allowed = {'registry_miss', 'dial_warning', 'peer_handshake', 'peer_error',
-      'history_unavailable', 'traceback', 'process_start', 'nonzero_exit', 'unknown', 'success',
+      'history_unavailable', 'dht_lookup_unavailable', 'traceback', 'process_start', 'nonzero_exit', 'unknown', 'success',
       'timeout', 'interrupted', 'termination_interrupted', 'output_overflow'}
+  dht_count = r'[0-9]{1,3}'
+  dht_stage = re.compile(r'(?:get_value|remote_identity):' + '/'.join([dht_count] * 5))
   output = []
   for line in text.splitlines()[-300:]:
     if len(line) > 2048:
@@ -2807,11 +2808,22 @@ def sanitized_resolver_diagnostic_lines(text):
     if marker not in line:
       continue
     suffix = line.split(marker, 1)[1].strip()
-    match = re.fullmatch(r'exit=(-?\d+), reason=([a-z_|]+), lines=(\d+), capped=(true|false)', suffix)
+    match = re.fullmatch(
+        r'exit=(-?[0-9]+), reason=([a-z_|]+), lines=([0-9]+), capped=(true|false), dht=([^,]+)', suffix)
     if not match:
       output.append('invalid')
       continue
-    exit_code, reason, count, _ = match.groups()
+    exit_code, reason, count, _, dht = match.groups()
+    stage_summaries = [] if dht == 'none' else dht.split('|')
+    parsed_stages = [dht_stage.fullmatch(summary) for summary in stage_summaries]
+    if (dht not in {'none', 'invalid'} and (not parsed_stages or any(item is None for item in parsed_stages)
+        or len(stage_summaries) > 2
+        or len({item.group(0).split(':', 1)[0] for item in parsed_stages if item}) != len(stage_summaries))):
+      output.append('invalid')
+      continue
+    if dht == 'invalid':
+      output.append('invalid')
+      continue
     cats = reason.split('|')
     if (int(exit_code) < -1 or int(exit_code) > 255 or int(count) > 64
         or not cats or any(cat not in allowed for cat in cats)

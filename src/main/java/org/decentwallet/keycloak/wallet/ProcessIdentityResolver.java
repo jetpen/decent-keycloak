@@ -10,6 +10,8 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Calls the decent-identity CLI and requires its result to preserve the exact identifier bytes. */
 public final class ProcessIdentityResolver implements WalletIdentityKeyResolver {
@@ -24,6 +26,9 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
   private static final String DIALING_PREFIX = "Dialing ";
   private static final int IDENTITY_OBJECT_KEY_HEX_LENGTH = 64;
   private static final int MAX_DIAGNOSTIC_LINES = 64;
+  private static final Pattern DHT_LOOKUP_SUMMARY_PATTERN = Pattern.compile(
+      "DHT_LOOKUP_SUMMARY stage=(get_value|remote_identity) attempts=(\\d{1,3}) empty=(\\d{1,3}) "
+          + "failed=(\\d{1,3}) timeouts=(\\d{1,3}) incomplete=(\\d{1,3})");
   private static final org.jboss.logging.Logger LOG =
       org.jboss.logging.Logger.getLogger(ProcessIdentityResolver.class);
   private static final ObjectMapper RESULT_MAPPER = new ObjectMapper(
@@ -108,7 +113,10 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
       logSanitizedDiagnostics(outputText, exit, "output_overflow");
       throw new IdentityResolutionException("Identity lookup response exceeded limit");
     }
-    if (exit == 1 && isConfirmedIdentityNotFound(outputText, exactRegistryObjectKeyHex(identityId))) return null;
+    if (exit == 1 && isConfirmedIdentityNotFound(outputText, exactRegistryObjectKeyHex(identityId))) {
+      logSanitizedDiagnostics(outputText, exit, "not_found");
+      return null;
+    }
     if (exit == 3 || stripRecognizedDhtDiagnostics(outputText).startsWith("history unavailable:")) {
       logSanitizedDiagnostics(outputText, exit, "history_unavailable");
       throw new IdentityResolutionException("Identity history unavailable");
@@ -153,10 +161,16 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     boolean peerError = false;
     boolean historyUnavailable = false;
     boolean traceback = false;
+    boolean dhtLookupUnavailable = false;
     int unknown = 0;
     for (String line : lines) {
       if (line.isBlank()) continue;
-      if (line.startsWith("history unavailable:")) historyUnavailable = true;
+      DhtLookupSummary summary = parseDhtLookupSummary(line);
+      if (summary != null) {
+        if (!summary.isCleanAbsence()) dhtLookupUnavailable = true;
+      }
+      else if (line.startsWith("DHT_LOOKUP_SUMMARY ")) unknown = Math.min(unknown + 1, MAX_DIAGNOSTIC_LINES);
+      else if (line.startsWith("history unavailable:")) historyUnavailable = true;
       else if (line.startsWith("Traceback") || line.startsWith("File ") || line.contains("Error:")) traceback = true;
       else if (isRegistryIdentityMiss(line)) registryMiss = true;
       else if (isKnownDialWarning(line)) dialWarning = true;
@@ -172,6 +186,7 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
         peerHandshake ? "peer_handshake" : null,
         peerError ? "peer_error" : null,
         historyUnavailable ? "history_unavailable" : null,
+        dhtLookupUnavailable ? "dht_lookup_unavailable" : null,
         traceback ? "traceback" : null,
         unknown > 0 ? "unknown" : null)
         .filter(java.util.Objects::nonNull).toList());
@@ -202,9 +217,21 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
       reason += "," + fallback;
     }
     if (reason == null || !reason.matches("[a-z_,|]+")) reason = "unknown";
-    LOG.debugf("[WALLET-RESOLVER-DIAG] exit=%d, reason=%s, lines=%d, capped=%s",
+    LOG.debugf("[WALLET-RESOLVER-DIAG] exit=%d, reason=%s, lines=%d, capped=%s, dht=%s",
         exit, reason.replace(',', '|'), Math.min(totalLines, MAX_DIAGNOSTIC_LINES),
-        totalLines > MAX_DIAGNOSTIC_LINES);
+        totalLines > MAX_DIAGNOSTIC_LINES, sanitizedDhtSummaries(output));
+  }
+
+  private static String sanitizedDhtSummaries(String output) {
+    java.util.Map<String, DhtLookupSummary> summaries = new java.util.TreeMap<>();
+    for (String line : output.split("\\R", -1)) {
+      if (!line.startsWith("DHT_LOOKUP_SUMMARY ")) continue;
+      DhtLookupSummary summary = parseDhtLookupSummary(line);
+      if (summary == null || summaries.putIfAbsent(summary.stage(), summary) != null) return "invalid";
+    }
+    if (summaries.isEmpty()) return "none";
+    return summaries.values().stream().map(DhtLookupSummary::sanitized)
+        .collect(java.util.stream.Collectors.joining("|"));
   }
 
   private static boolean isPeerHandshakeFailure(String line) {
@@ -248,11 +275,26 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     while (terminalLine >= 0 && lines[terminalLine].isEmpty()) terminalLine--;
     if (terminalLine < 1 || !"not found".equals(lines[terminalLine])) return false;
     boolean sawRegistryMiss = false;
+    DhtLookupSummary getValueSummary = null;
+    DhtLookupSummary remoteSummary = null;
     for (int index = 0; index < terminalLine; index++) {
       String line = lines[index];
       if (isKnownDialWarning(line)) return false;
+      DhtLookupSummary summary = parseDhtLookupSummary(line);
+      if (summary != null) {
+        if (!summary.isCleanAbsence()) return false;
+        if (summary.stage().equals("get_value")) {
+          if (getValueSummary != null) return false;
+          getValueSummary = summary;
+        } else {
+          if (remoteSummary != null) return false;
+          remoteSummary = summary;
+        }
+        continue;
+      }
       if (isRegistryIdentityMiss(line)) {
-        if (!expectedObjectKeyHex.equalsIgnoreCase(line.substring(REGISTRY_MISS_PREFIX.length()))) {
+        if (sawRegistryMiss
+            || !expectedObjectKeyHex.equalsIgnoreCase(line.substring(REGISTRY_MISS_PREFIX.length()))) {
           return false;
         }
         sawRegistryMiss = true;
@@ -260,7 +302,34 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
       }
       return false;
     }
-    return sawRegistryMiss;
+    return sawRegistryMiss && getValueSummary != null && remoteSummary != null;
+  }
+
+  private static DhtLookupSummary parseDhtLookupSummary(String line) {
+    Matcher matcher = DHT_LOOKUP_SUMMARY_PATTERN.matcher(line);
+    if (!matcher.matches()) return null;
+    try {
+      return new DhtLookupSummary(
+          matcher.group(1),
+          Integer.parseInt(matcher.group(2)),
+          Integer.parseInt(matcher.group(3)),
+          Integer.parseInt(matcher.group(4)),
+          Integer.parseInt(matcher.group(5)),
+          Integer.parseInt(matcher.group(6)));
+    } catch (NumberFormatException invalidCount) {
+      return null;
+    }
+  }
+
+  private record DhtLookupSummary(
+      String stage, int attempts, int empty, int failed, int timeouts, int incomplete) {
+    boolean isCleanAbsence() {
+      return attempts > 0 && empty == attempts && failed == 0 && timeouts == 0 && incomplete == 0;
+    }
+
+    String sanitized() {
+      return stage + ":" + attempts + "/" + empty + "/" + failed + "/" + timeouts + "/" + incomplete;
+    }
   }
 
   private static boolean isRegistryIdentityMiss(String line) {
@@ -381,6 +450,7 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
   }
 
   private static boolean isRecognizedDhtDiagnostic(String line) {
+    if (parseDhtLookupSummary(line) != null) return true;
     if (line.startsWith(DIALING_PREFIX) || line.startsWith(CONNECTED_PREFIX)) {
       String endpoint = line.substring(line.indexOf(' ') + 1);
       return !endpoint.isBlank();

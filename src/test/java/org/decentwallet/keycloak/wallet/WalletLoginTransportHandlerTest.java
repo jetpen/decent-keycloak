@@ -278,7 +278,9 @@ final class WalletLoginTransportHandlerTest {
     var resolverExecutable = Files.createTempFile("identity-not-found-stub-", ".sh");
     try {
       String expectedKey = ProcessIdentityResolver.exactRegistryObjectKeyHex(identity);
-      String output = "Value not found for key /decent-registry/identity/" + expectedKey + "\nnot found\n";
+      String output = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0\n"
+          + "DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0\n"
+          + "Value not found for key /decent-registry/identity/" + expectedKey + "\nnot found\n";
       String encoded = Base64.getEncoder().encodeToString(output.getBytes(StandardCharsets.UTF_8));
       Files.writeString(resolverExecutable, "#!/bin/sh\nprintf '%s' '" + encoded + "' | base64 -d\nexit 1\n");
       resolverExecutable.toFile().setExecutable(true);

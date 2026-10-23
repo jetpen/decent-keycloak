@@ -32,6 +32,16 @@
     "runtime_library_sha256": "b9d1265de01c92a6565272aa3ffa30034fe3656c73c348fc988a2e65389d6782",
     "runtime_library_source": "pinned UBI9 Python builder image"
   },
+  "repo_overlays": {
+    "pinned_lookup_outcomes": {
+      "file": "pinned_lookup_outcomes.py",
+      "sha256": "7e38a8a2006eabd2bb392656826080c1699c4818e8de697edefc96db7d803625"
+    },
+    "runtime_patcher": {
+      "file": "patch_resolver_runtime.py",
+      "sha256": "c68a6b13c9116ed08e4e37108f277d2fb861ca7044e7994bfb89f80e25190f32"
+    }
+  },
   "sources": {
     "identity": {
       "url": "https://github.com/jetpen/decent-identity/archive/2caec24de52c2dbe241e72fe317281c051d03f89.tar.gz",

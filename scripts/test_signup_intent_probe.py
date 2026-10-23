@@ -371,10 +371,15 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertEqual('unavailable', probe.exact_registry_lookup_outcome(
         malformed_key_output, 0, identifier))
     miss_key = hashlib.sha256(identifier.encode('utf-8')).hexdigest()
+    clean_summary = '\n'.join((
+        'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0',
+        'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0'))
     miss_output = '\n'.join((
+        clean_summary,
         'Value not found for key /decent-registry/identity/' + miss_key,
         'not found'))
     handshake_output = '\n'.join((
+        clean_summary,
         'Value not found for key /decent-registry/identity/' + miss_key,
         'failed to upgrade security for peer 12D3KooWBJHhhdqp4zbtGbCX6VyE7hC2ch5uaEvxfwkmSbfo2f3X: handshake failed',
         'not found'))

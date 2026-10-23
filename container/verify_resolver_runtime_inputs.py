@@ -18,8 +18,27 @@ def sha256(path: Path) -> str:
   return digest.hexdigest()
 
 
+def verify_repo_overlays(directory: Path, manifest: dict) -> None:
+  overlays = manifest.get("repo_overlays")
+  if not isinstance(overlays, dict) or set(overlays) != {"pinned_lookup_outcomes", "runtime_patcher"}:
+    raise RuntimeError("resolver manifest must lock the repository-owned runtime overlays")
+  for name, entry in overlays.items():
+    if not isinstance(entry, dict):
+      raise RuntimeError(f"resolver overlay entry is invalid: {name}")
+    filename = entry.get("file")
+    expected_hash = entry.get("sha256")
+    if not isinstance(filename, str) or Path(filename).name != filename:
+      raise RuntimeError(f"resolver overlay filename is invalid: {name}")
+    if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+      raise RuntimeError(f"resolver overlay checksum is invalid: {name}")
+    overlay_path = directory / filename
+    if not overlay_path.is_file() or sha256(overlay_path) != expected_hash:
+      raise RuntimeError(f"resolver overlay checksum mismatch: {name}")
+
+
 def verify_source_archives(archive_directory: Path, manifest_path: Path) -> None:
   manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+  verify_repo_overlays(manifest_path.parent, manifest)
   sources = manifest.get("sources")
   if not isinstance(sources, dict) or set(sources) != {"identity", "registry"}:
     raise RuntimeError("resolver manifest must lock Identity and Registry sources")
