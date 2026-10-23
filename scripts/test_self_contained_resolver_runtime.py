@@ -878,9 +878,10 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('--find-links=/resolver-build/wheelhouse', dockerfile)
     self.assertIn('--require-hashes', dockerfile)
 
-  def test_network_isolated_build_provides_local_resolver_config_for_registry_help(self):
+  def test_resolver_builder_does_not_write_buildkit_managed_resolv_conf(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
-    self.assertIn("printf 'nameserver 127.0.0.1\\n' > /etc/resolv.conf", dockerfile)
+    builder_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[0]
+    self.assertNotIn('/etc/resolv.conf', builder_stage)
     runtime_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
         'FROM keycloak-with-resolver AS runtime', 1)[0]
     self.assertIn('if [ ! -e /etc/resolv.conf ]', runtime_stage)

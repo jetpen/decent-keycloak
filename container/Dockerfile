@@ -52,7 +52,6 @@ unset PYTHONHOME
 export LD_LIBRARY_PATH=/opt/decent-resolver/lib
 exec /opt/decent-resolver/venv/bin/python -c 'from decent_registry.cli import main; main()' "$@"
 EOF
-RUN printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 RUN chmod 0755 /opt/decent-resolver/bin/decent-identity /opt/decent-resolver/bin/decent-registry \
  && cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py \
  && python3.11 -m compileall -q /opt/decent-resolver/identity-src/src /opt/decent-resolver/registry-src/src \
