@@ -205,6 +205,7 @@ public final class WalletLoginTransportHandler {
           consumed.get().intent());
     } catch (RuntimeException ex) {
       // Nonce is consumed; no OIDC result unless its separate accepted receipt persists.
+      LOG.warnf("Wallet accepted receipt publication unavailable (request=%s, cause=post_consume_receipt_failure)", requestId);
       return HttpResult.empty(503);
     }
     return HttpResult.json(202, Map.of("status", "pending"));
