@@ -639,17 +639,29 @@ def remove_owned_container(cid_file):
     container_id = _inspect_cid(cid_file)
     if container_id is None or _inspect_cid(cid_file) != container_id:
       return {'removed': False, 'retained_cid': True}
-    removed = run(['podman', 'rm', '--force', container_id], timeout=20)
-    if removed.returncode != 0:
+    try:
+      run(['podman', 'rm', '--force', container_id], timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+      pass
+    try:
+      after = run(['podman', 'inspect', '--format', '{{.Id}}', container_id], timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
       return {'removed': False, 'retained_cid': True}
-    after = run(['podman', 'inspect', '--format', '{{.Id}}', container_id], timeout=15)
-    if after.returncode == 0 or not re.search(
-        r'(?:no such|not found|does not exist|no container.*found)', after.stdout, re.IGNORECASE):
+    absence_marker = re.compile(
+        r'(?:no such (?:container|object)|(?:container|object)\b.*\b'
+        r'(?:not found|does not exist)|no (?:container|object)\b.*\bfound)',
+        re.IGNORECASE)
+    absence_confirmed = (after.returncode != 0 and any(
+        container_id in line and absence_marker.search(line) is not None
+        for line in after.stdout.splitlines()))
+    if not absence_confirmed:
       return {'removed': False, 'retained_cid': True}
   except (OSError, subprocess.TimeoutExpired):
     return {'removed': False, 'retained_cid': True}
   try:
     Path(cid_file).unlink()
+  except FileNotFoundError:
+    return {'removed': True, 'retained_cid': False}
   except OSError:
     return {'removed': True, 'retained_cid': True}
   return {'removed': True, 'retained_cid': False}
