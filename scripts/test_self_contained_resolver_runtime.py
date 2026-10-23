@@ -661,6 +661,13 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, 'duplicate normalized path'):
         verifier.verify_wheelhouse_archive(work, manifest)
 
+  def test_each_dockerfile_run_step_is_network_isolated(self):
+    dockerfile = (ROOT / 'container/Dockerfile').read_text()
+    run_lines = [line for line in dockerfile.splitlines() if line.startswith('RUN ')]
+
+    self.assertTrue(run_lines)
+    self.assertTrue(all(line.startswith('RUN --network=none ') for line in run_lines), run_lines)
+
   def test_build_downloads_no_unpinned_sources(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     download_script = ROOT / 'container/download_resolver_sources.sh'
@@ -674,13 +681,13 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     link_index = next(index for index, line in enumerate(lines)
         if 'ln -s libgmp.so.10.4.0 /opt/decent-resolver/lib/libgmp.so.10' in line)
     self.assertTrue(lines[link_index].rstrip().endswith(chr(92)))
-    self.assertEqual('RUN python3.11 verify_resolver_runtime_inputs.py --archives . --manifest resolver-runtime.lock.json \\', lines[link_index + 3])
+    self.assertEqual('RUN --network=none python3.11 verify_resolver_runtime_inputs.py --archives . --manifest resolver-runtime.lock.json \\', lines[link_index + 3])
 
   def test_runtime_target_installs_provider_and_builds_keycloak(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1]
     self.assertIn('COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/', runtime_stage)
-    self.assertIn('RUN /opt/keycloak/bin/kc.sh build', runtime_stage)
+    self.assertIn('RUN --network=none /opt/keycloak/bin/kc.sh build', runtime_stage)
     self.assertIn('--spi-single-use-object--provider=infinispan', runtime_stage)
 
   def test_resolver_image_tag_is_resolved_once_to_an_immutable_id_before_containers_start(self):
