@@ -24,6 +24,8 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
   private static final String DIALING_PREFIX = "Dialing ";
   private static final int IDENTITY_OBJECT_KEY_HEX_LENGTH = 64;
   private static final int MAX_DIAGNOSTIC_LINES = 64;
+  private static final org.jboss.logging.Logger LOG =
+      org.jboss.logging.Logger.getLogger(ProcessIdentityResolver.class);
   private static final ObjectMapper RESULT_MAPPER = new ObjectMapper(
       JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
       .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -57,8 +59,7 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     var command = new java.util.ArrayList<String>();
     command.add(executable);
     command.add("get");
-    command.add("--identifier");
-    command.add(identityId);
+    command.add("--identifier=" + identityId);
     command.add("--host");
     command.add("127.0.0.1");
     command.add("--port");
@@ -69,7 +70,13 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     builder.environment().clear();
     builder.environment().put("PATH", "/usr/local/bin:/usr/bin:/bin");
     builder.environment().put("LANG", "C.UTF-8");
-    Process process = builder.start();
+    Process process;
+    try {
+      process = builder.start();
+    } catch (java.io.IOException startFailure) {
+      logSanitizedDiagnostics("", -1, "process_start");
+      throw new IdentityResolutionException("Identity process could not start", startFailure);
+    }
     BoundedOutput output = new BoundedOutput(MAX_OUTPUT_BYTES);
     Thread reader = Thread.ofPlatform().daemon().start(() -> output.drain(process.getInputStream()));
     final boolean finished;
@@ -79,6 +86,7 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
       boolean terminated = false;
       try { terminated = terminateProcessWithinGrace(process); }
       catch (InterruptedException terminationInterrupted) { interrupted.addSuppressed(terminationInterrupted); }
+      logSanitizedDiagnostics(output.text(), -1, "interrupted");
       Thread.currentThread().interrupt();
       throw new IdentityResolutionException("Identity lookup interrupted", !terminated);
     }
@@ -86,20 +94,34 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
       boolean terminated;
       try { terminated = terminateProcessWithinGrace(process); }
       catch (InterruptedException interrupted) {
+        logSanitizedDiagnostics(output.text(), -1, "termination_interrupted");
         Thread.currentThread().interrupt();
         throw new IdentityResolutionException("Identity lookup termination interrupted", true);
       }
+      logSanitizedDiagnostics(output.text(), -1, "timeout");
       throw new IdentityResolutionException("Identity lookup timed out", !terminated);
     }
     reader.join(TimeUnit.SECONDS.toMillis(1));
-    if (output.overflowed()) throw new IdentityResolutionException("Identity lookup response exceeded limit");
     int exit = process.exitValue();
     String outputText = output.text();
-    if (exit == 1 && isConfirmedIdentityNotFound(outputText)) return null;
+    if (output.overflowed()) {
+      logSanitizedDiagnostics(outputText, exit, "output_overflow");
+      throw new IdentityResolutionException("Identity lookup response exceeded limit");
+    }
+    if (exit == 1 && isConfirmedIdentityNotFound(outputText, exactRegistryObjectKeyHex(identityId))) return null;
     if (exit == 3 || stripRecognizedDhtDiagnostics(outputText).startsWith("history unavailable:")) {
+      logSanitizedDiagnostics(outputText, exit, "history_unavailable");
       throw new IdentityResolutionException("Identity history unavailable");
     }
-    if (exit != 0) throw new IdentityResolutionException("Identity lookup failed");
+    if (exit != 0) {
+      logSanitizedDiagnostics(outputText, exit, "nonzero_exit");
+      throw new IdentityResolutionException("Identity lookup failed");
+    }
+    String diagnostics = diagnosticReason(outputText);
+    if (!diagnostics.isEmpty() && !"dial_warning".equals(diagnostics)) {
+      logSanitizedDiagnostics(outputText, exit, diagnostics);
+      throw new IdentityResolutionException("Identity lookup diagnostics were inconclusive");
+    }
     try {
       IdentityResolutionResult result = RESULT_MAPPER.readValue(extractIdentityJson(outputText), IdentityResolutionResult.class);
       if (result.seq < 0 || !identityId.equals(result.identifier) || result.ownerNameHex == null
@@ -114,11 +136,89 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
       System.arraycopy(publicKey, 0, spki, prefix.length, publicKey.length);
       java.security.KeyFactory.getInstance("Ed25519").generatePublic(new X509EncodedKeySpec(spki));
       return new ResolvedIdentityKey(identityId, publicKey);
-    } catch (IdentityResolutionException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new IdentityResolutionException("Identity lookup result was invalid", e);
+    } catch (IdentityResolutionException ex) {
+      logSanitizedDiagnostics(outputText, exit, diagnosticReason(outputText));
+      throw ex;
+    } catch (Exception ex) {
+      logSanitizedDiagnostics(outputText, exit, diagnosticReason(outputText));
+      throw new IdentityResolutionException("Identity lookup result was invalid", ex);
     }
+  }
+
+  static String diagnosticReason(String output) {
+    String[] lines = output.split("\\R", -1);
+    boolean registryMiss = false;
+    boolean dialWarning = false;
+    boolean peerHandshake = false;
+    boolean peerError = false;
+    boolean historyUnavailable = false;
+    boolean traceback = false;
+    int unknown = 0;
+    for (String line : lines) {
+      if (line.isBlank()) continue;
+      if (line.startsWith("history unavailable:")) historyUnavailable = true;
+      else if (line.startsWith("Traceback") || line.startsWith("File ") || line.contains("Error:")) traceback = true;
+      else if (isRegistryIdentityMiss(line)) registryMiss = true;
+      else if (isKnownDialWarning(line)) dialWarning = true;
+      else if (isPeerHandshakeFailure(line)) peerHandshake = true;
+      else if (line.startsWith("Failed to send request to peer: ")
+          || line.startsWith("Failed to connect to peer: ")) peerError = true;
+      else if (isJsonStructuralLine(line) || isPeerStatusLine(line)) { }
+      else unknown = Math.min(unknown + 1, MAX_DIAGNOSTIC_LINES);
+    }
+    return String.join(",", java.util.stream.Stream.of(
+        registryMiss ? "registry_miss" : null,
+        dialWarning ? "dial_warning" : null,
+        peerHandshake ? "peer_handshake" : null,
+        peerError ? "peer_error" : null,
+        historyUnavailable ? "history_unavailable" : null,
+        traceback ? "traceback" : null,
+        unknown > 0 ? "unknown" : null)
+        .filter(java.util.Objects::nonNull).toList());
+  }
+
+  private static boolean isJsonStructuralLine(String line) {
+    String trimmed = line.stripLeading();
+    return trimmed.startsWith("{") || trimmed.startsWith("}") || trimmed.startsWith("[")
+        || trimmed.startsWith("]") || trimmed.startsWith("\"");
+  }
+
+  private static boolean isPeerStatusLine(String line) {
+    if (!line.startsWith(DIALING_PREFIX) && !line.startsWith(CONNECTED_PREFIX)) return false;
+    String value = line.substring(line.indexOf(' ') + 1);
+    return !value.isBlank();
+  }
+
+  static int nonEmptyLineCount(String output) {
+    return (int) java.util.Arrays.stream(output.split("\\R", -1)).filter(line -> !line.isBlank()).count();
+  }
+
+  private static void logSanitizedDiagnostics(String output, int exit, String fallback) {
+    int totalLines = nonEmptyLineCount(output);
+    String reason = diagnosticReason(output);
+    if (reason.isEmpty()) reason = fallback;
+    else if (java.util.Set.of("timeout", "interrupted", "termination_interrupted", "output_overflow")
+        .contains(fallback) && !java.util.List.of(reason.split(",")).contains(fallback)) {
+      reason += "," + fallback;
+    }
+    if (reason == null || !reason.matches("[a-z_,|]+")) reason = "unknown";
+    LOG.debugf("[WALLET-RESOLVER-DIAG] exit=%d, reason=%s, lines=%d, capped=%s",
+        exit, reason.replace(',', '|'), Math.min(totalLines, MAX_DIAGNOSTIC_LINES),
+        totalLines > MAX_DIAGNOSTIC_LINES);
+  }
+
+  private static boolean isPeerHandshakeFailure(String line) {
+    String prefix = "failed to upgrade security for peer ";
+    String secureSuffix = ": handshake failed when upgrading to secure connection";
+    String shortSuffix = ": handshake failed";
+    if (!line.startsWith(prefix)) return false;
+    String peer = line.substring(prefix.length(),
+        line.endsWith(secureSuffix) ? line.length() - secureSuffix.length()
+            : line.endsWith(shortSuffix) ? line.length() - shortSuffix.length() : 0);
+    return (line.endsWith(secureSuffix) || line.endsWith(shortSuffix))
+        && peer.startsWith("12D3Koo") && peer.length() == 52
+        && peer.chars().allMatch(character -> "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+            .indexOf(character) >= 0);
   }
 
   static boolean terminateProcessWithinGrace(Process process) throws InterruptedException {
@@ -130,14 +230,31 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     }
   }
 
-  static boolean isConfirmedIdentityNotFound(String output) {
+  static String exactRegistryObjectKeyHex(String identityId) {
+    try {
+      return java.util.HexFormat.of().formatHex(
+          java.security.MessageDigest.getInstance("SHA-256").digest(identityId.getBytes(StandardCharsets.UTF_8)));
+    } catch (java.security.NoSuchAlgorithmException unavailable) {
+      throw new IllegalStateException("SHA-256 is unavailable", unavailable);
+    }
+  }
+
+  static boolean isConfirmedIdentityNotFound(String output, String expectedObjectKeyHex) {
+    if (expectedObjectKeyHex == null || !expectedObjectKeyHex.matches("[0-9a-fA-F]{64}")) {
+      return false;
+    }
     String[] lines = output.split("\\R", -1);
-    if (lines.length < 2 || !"not found".equals(lines[lines.length - 1])) return false;
+    int terminalLine = lines.length - 1;
+    while (terminalLine >= 0 && lines[terminalLine].isEmpty()) terminalLine--;
+    if (terminalLine < 1 || !"not found".equals(lines[terminalLine])) return false;
     boolean sawRegistryMiss = false;
-    for (int index = 0; index < lines.length - 1; index++) {
+    for (int index = 0; index < terminalLine; index++) {
       String line = lines[index];
-      if (isKnownDialWarning(line)) continue;
+      if (isKnownDialWarning(line)) return false;
       if (isRegistryIdentityMiss(line)) {
+        if (!expectedObjectKeyHex.equalsIgnoreCase(line.substring(REGISTRY_MISS_PREFIX.length()))) {
+          return false;
+        }
         sawRegistryMiss = true;
         continue;
       }

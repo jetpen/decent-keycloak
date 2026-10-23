@@ -24,8 +24,10 @@ class OwnerRotationProbeTest(unittest.TestCase):
     flow = self._function(source, 'stale_key_rotation_flow')
 
     self.assertIn("helper = project / 'scripts/rotation_registry_roundtrip.py'", flow)
-    self.assertIn("str(PROJECTS / 'decent-registry/.venv/bin/python')", flow)
-    self.assertIn("str(helper)", flow)
+    self.assertNotIn("str(PROJECTS / 'decent-registry/.venv/bin/python')", flow)
+    self.assertIn("'/opt/decent-resolver/rotation_registry_roundtrip.py'", flow)
+    self.assertIn("str(old_key_in_tools)", flow)
+    self.assertIn("str(new_key_in_tools)", flow)
     assert "separate Identity resolver confirms seq 2 and exact successor key" in flow
     assert "status == 401" in flow
     assert "rotation_browser, rotation_csrf" in flow
@@ -36,15 +38,11 @@ class OwnerRotationProbeTest(unittest.TestCase):
     assert "start_rotation_transaction()" in flow
     assert "callback.startswith(f'https://idp.example:{KC_PORT}/auth/')" in flow
 
-  def test_rotation_fixture_publishes_old_identity_once_and_only_generates_successor_key_locally(self):
+  def test_live_entry_point_rotates_the_same_mapped_identity_not_a_fixture_pair(self):
     main = self._function(LIVE_PROBE.read_text(), 'main')
-    rotation_start = main.index("rotated_old_key, rotated_wrapper, rotated_identifier = write_identity(")
-    rotation_end = main.index("result['rotated_identity_case'] = stale_key_rotation_flow(", rotation_start)
-    setup = main[rotation_start:rotation_end]
-    self.assertEqual(setup.count('write_identity('), 1)
-    self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor')", setup)
-    self.assertNotIn('rotated_old_identifier', setup)
-    self.assertIn('preprovision rotated-Identity local mapping', setup)
+    self.assertEqual(main.count("label='wallet-login-rotated'"), 1)
+    self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor', IMAGE)", main)
+    self.assertIn("rotation_result = stale_key_rotation_flow(", main)
 
   def test_rotation_helper_uses_registry_predecessor_and_publish_readback_apis(self):
     helper = (PROJECT / 'scripts/rotation_registry_roundtrip.py').read_text()
@@ -67,17 +65,30 @@ class OwnerRotationProbeTest(unittest.TestCase):
     self.assertIn('trio.run(rotate_and_confirm, args)', helper)
 
 
-  def test_live_entry_point_rotates_the_same_mapped_identity_not_a_fixture_pair(self):
+  def test_live_probe_signing_inputs_use_short_lived_private_tempfiles(self):
+    source = LIVE_PROBE.read_text()
+    auth = self._function(source, 'auth_flow')
+    denied = self._function(source, 'account_mapping_denial_flow')
+    rotation = self._function(source, 'stale_key_rotation_flow')
+    signup = self._function(source, 'signup_wallet_flow')
+    for body in (auth, denied, rotation, signup):
+      self.assertIn('write_private_signing_input(', body)
+      self.assertIn("os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)", source)
+      self.assertIn("unlink(missing_ok=True)", body)
+    self.assertNotIn("Path(SCRATCH) / f'wallet-login-", rotation)
+    self.assertNotIn("Path(SCRATCH) / f'signup-signing-", signup)
+    self.assertNotIn("'-signing-input.json'", denied)
+
     main = self._function(LIVE_PROBE.read_text(), 'main')
     self.assertEqual(main.count("label='wallet-login-rotated'"), 1)
-    self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor')", main)
+    self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor', IMAGE)", main)
     self.assertIn("client, rotated_old_key, rotated_key, rotated_identifier", main)
     self.assertNotIn("identity_id=rotated_identifier", main)
 
   def test_rotation_fixture_publishes_old_identity_once_and_only_generates_successor_key_locally(self):
     main = self._function(LIVE_PROBE.read_text(), 'main')
     rotation_start = main.index("rotated_old_key, rotated_wrapper, rotated_identifier = write_identity(")
-    rotation_end = main.index("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor')", rotation_start)
+    rotation_end = main.index("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor', IMAGE)", rotation_start)
     setup = main[rotation_start:rotation_end]
     self.assertEqual(setup.count('write_identity('), 1)
     self.assertNotIn('identity_id=', setup)
@@ -115,9 +126,9 @@ class OwnerRotationProbeTest(unittest.TestCase):
   def test_live_entry_point_runs_rotation_with_separate_mapped_identity(self):
     source = LIVE_PROBE.read_text()
     main_body = self._function(source, 'main')
-    self.assertIn("result['rotated_identity_case'] = stale_key_rotation_flow(", main_body)
+    self.assertIn("rotation_result = stale_key_rotation_flow(", main_body)
     self.assertIn("rotated_old_key, rotated_wrapper, rotated_identifier = write_identity(", main_body)
-    self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor')", main_body)
+    self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor', IMAGE)", main_body)
     self.assertIn("client, rotated_old_key, rotated_key, rotated_identifier", main_body)
     self.assertIn('local_mapping_persisted', main_body)
 

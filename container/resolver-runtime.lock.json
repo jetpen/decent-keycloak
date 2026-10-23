@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "python": {
+    "version": "3.11.13",
+    "platform": "x86_64-linux-gnu",
+    "builder_image": "registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c",
+    "runtime_abi": "UBI 9 / glibc 2.34"
+  },
+  "registry_dependency_lock": {
+    "registry_lock_constraints_sha256": "70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539",
+    "registry_lock_sha256": "89c971e7f9b414d9bd4fd490b5c31ec9fbae706a2ea12dd8a1da1a2668b9b7c7"
+  },
+  "runtime_requirements": {
+    "manifest": "resolver-requirements.in",
+    "registry_constraints": "registry-lock-constraints.txt",
+    "lock": "resolver-requirements.lock.txt",
+    "lock_sha256": "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff",
+    "registry_constraints_sha256": "70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539"
+  },
+  "wheelhouse": {
+    "archive": "resolver-wheelhouse.tar.gz",
+    "archive_sha256": "3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587",
+    "file_count": 67,
+    "python_version": "3.11.13",
+    "platform": "x86_64-linux-gnu"
+  },
+  "gmp": {
+    "version": "6.2.0-13.el9",
+    "devel_rpm_url": "https://dl.rockylinux.org/pub/rocky/9/devel/x86_64/os/Packages/g/gmp-devel-6.2.0-13.el9.x86_64.rpm",
+    "devel_rpm_sha256": "8dae9819eeba660528c52e7c5a3ac1e354084ea5782088160d9b46e9d43dde97",
+    "runtime_library": "libgmp.so.10.4.0",
+    "runtime_library_sha256": "b9d1265de01c92a6565272aa3ffa30034fe3656c73c348fc988a2e65389d6782",
+    "runtime_library_source": "pinned UBI9 Python builder image"
+  },
+  "sources": {
+    "identity": {
+      "url": "https://github.com/jetpen/decent-identity/archive/2caec24de52c2dbe241e72fe317281c051d03f89.tar.gz",
+      "commit": "2caec24de52c2dbe241e72fe317281c051d03f89",
+      "archive_sha256": "0d86022748ee9c8d197718a833d819037e5a32bbe2aff7e3a545083c44dd78e2",
+      "requirements_lock": "resolver-requirements.lock.txt",
+      "requirements_source": "production imports against the pinned Registry runtime closure"
+    },
+    "registry": {
+      "url": "https://github.com/jetpen/decent-registry/archive/0fa9a6b631bd77725418e990ae9ea4d974dc546c.tar.gz",
+      "commit": "0fa9a6b631bd77725418e990ae9ea4d974dc546c",
+      "archive_sha256": "bf3e912ad18a9bf33f2d7aaebbc0ce43d34708e9d449e8daf81793a70917e098",
+      "requirements_lock": "resolver-requirements.lock.txt",
+      "requirements_source": "pyproject.toml runtime requirements constrained to its pinned uv.lock"
+    }
+  }
+}

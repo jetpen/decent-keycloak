@@ -121,8 +121,8 @@ public final class WalletChallengeAuthenticator implements Authenticator {
           .setResponseHeader("Referrer-Policy", "no-referrer")
           .createForm("wallet-login.ftl");
       context.challenge(response);
-    } catch (RuntimeException failure) {
-      LOG.error("Wallet challenge rendering failed", failure);
+    } catch (RuntimeException ignored) {
+      LOG.error("Wallet challenge rendering failed");
       failClosed(context);
     }
   }

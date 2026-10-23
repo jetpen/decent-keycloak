@@ -1,4 +1,4 @@
-"""Publish a validated owner-key rotation and independently read it back."""
+"""Publish a Registry rotation; evidence is written only after exact fresh-peer readback."""
 from __future__ import annotations
 
 import argparse
@@ -46,6 +46,14 @@ def state_fields(state: Any) -> tuple[int, bytes]:
     if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != 32:
         raise RuntimeError("Registry predecessor owner key is invalid")
     return seq, bytes(public_key)
+
+
+def fresh_readback_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 async def rotate_and_confirm(args: argparse.Namespace) -> None:
@@ -136,7 +144,7 @@ async def rotate_and_confirm(args: argparse.Namespace) -> None:
         observed = await get_identity_record(
             identifier=args.identifier,
             host=args.host,
-            port=0,
+            port=fresh_readback_port(),
             bootstrap=[args.bootstrap],
         )
         if (observed is not None and observed.seq == expected_seq

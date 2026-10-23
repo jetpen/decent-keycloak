@@ -1,0 +1,124 @@
+name: Wallet-login acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wallet-login-acceptance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provider-acceptance:
+    name: Provider acceptance (Java 21 / Python 3.11 / amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the supported JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21.0.12.1+1'
+
+      - name: Set up the acceptance Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11.13'
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Record toolchain versions
+        run: |
+          java -version
+          javac -version
+          python --version
+          mvn --version
+
+      - name: Build and test with Maven
+        run: mvn --batch-mode --no-transfer-progress clean package
+
+      - name: Require clean Surefire totals
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path('target/surefire-reports').glob('TEST-*.xml'))
+          if not reports:
+              raise SystemExit('Surefire produced no XML reports')
+          suites = []
+          for report in reports:
+              root = ET.parse(report).getroot()
+              suites.extend([root] if root.tag == 'testsuite' else root.findall('.//testsuite'))
+          if not suites:
+              raise SystemExit('Surefire reports contain no testsuite records')
+          totals = {
+              key: sum(int(suite.attrib.get(key, '0')) for suite in suites)
+              for key in ('tests', 'failures', 'errors', 'skipped')
+          }
+          print('Surefire totals: ' + ', '.join(f'{key}={value}' for key, value in totals.items()))
+          if totals['tests'] == 0 or any(totals[key] != 0 for key in ('failures', 'errors', 'skipped')):
+              sys.exit('Surefire acceptance requires tests > 0 and zero failures/errors/skips')
+          PY
+
+      - name: Run the Python acceptance harness
+        run: >-
+          python -m unittest
+          scripts.test_wallet_login_result
+          scripts.test_wallet_login_transport_e2e
+          scripts.test_owner_rotation_probe
+          scripts.test_signup_intent_probe
+          scripts.test_self_contained_resolver_runtime
+          scripts.test_owner_rotation_envelope
+          scripts.test_live_gate_order
+          scripts.test_acceptance_ledger
+          scripts.test_acceptance_workflow
+          -q
+
+      - name: Compile Python sources
+        run: python -m py_compile scripts/*.py container/*.py
+
+      - name: Verify pinned resolver sources and runtime provenance
+        run: |
+          python container/build_resolver_runtime.py
+          python container/verify_resolver_runtime_inputs.py \
+            --archives container/source-archives \
+            --manifest container/resolver-runtime.lock.json
+
+      - name: Validate the submitted diff
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$PR_BASE_SHA" ]; then
+            git diff --check "$PR_BASE_SHA...HEAD"
+          else
+            git diff --check HEAD^ HEAD
+          fi
+
+      - name: Verify provider service registration
+        run: |
+          provider_jar=target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar
+          unzip -p "$provider_jar" META-INF/services/org.keycloak.authentication.AuthenticatorFactory \
+            | grep -Fx 'org.decentwallet.keycloak.wallet.WalletChallengeAuthenticatorFactory'
+
+      - name: Build and check the immutable-base provider image
+        run: |
+          image=decent-keycloak-wallet-provider:acceptance
+          docker buildx build --platform linux/amd64 --pull --no-cache --load \
+            --file container/Dockerfile --target runtime --tag "$image" .
+          version_output=$(docker run --rm --entrypoint /opt/keycloak/bin/kc.sh "$image" --version)
+          printf '%s\n' "$version_output"
+          printf '%s\n' "$version_output" | grep -Fx 'Keycloak 26.8.0'
+          printf '%s\n' "$version_output" | grep -Fx 'JVM: 21.0.12.1 (Red Hat, Inc. OpenJDK 64-Bit Server VM 21.0.12.1+1-LTS)'

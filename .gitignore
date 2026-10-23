@@ -1,6 +1,13 @@
-
 # Maven build output
 target/
 
 # Python test/runtime artifacts
 scripts/__pycache__/
+container/__pycache__/
+.pytest_cache/
+
+# Local materializations of checksum-pinned resolver source archives
+container/.cache/resolver-downloads/
+container/identity-src/
+container/registry-src/
+container/sources/

@@ -23,21 +23,29 @@ final class WalletLoginAccountMapping {
     }
   }
 
+  private static boolean hasExactIdentity(UserModel user, String identityId) {
+    return identityId.equals(user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE));
+  }
+
+  private static List<UserModel> boundedCandidates(Stream<UserModel> candidates, String unavailableMessage) {
+    if (candidates == null) throw new IllegalStateException(unavailableMessage);
+    List<UserModel> scan = candidates
+        .filter(java.util.Objects::nonNull)
+        .limit(MAX_IDENTITY_CANDIDATES + 1)
+        .toList();
+    if (scan.size() > MAX_IDENTITY_CANDIDATES) throw new IllegalStateException(unavailableMessage);
+    return scan;
+  }
+
   static UserModel ensureEnabledUser(UserProvider users, RealmModel realm, String identityId,
       boolean createIfMissing) {
     if (users == null || realm == null || identityId == null || identityId.isEmpty()) return null;
     List<UserModel> matches;
     try (Stream<UserModel> candidates = users.searchForUserByUserAttributeStream(
         realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-      if (candidates == null) throw new IllegalStateException("identity mapping lookup unavailable");
-      List<UserModel> scan = candidates
-          .filter(java.util.Objects::nonNull)
-          .limit(MAX_IDENTITY_CANDIDATES + 1)
-          .toList();
-      if (scan.size() > MAX_IDENTITY_CANDIDATES) throw new IllegalStateException("identity mapping lookup unavailable");
+      List<UserModel> scan = boundedCandidates(candidates, "identity mapping lookup unavailable");
       matches = scan.stream()
-          .filter(user -> identityId.equals(
-              user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
+          .filter(user -> hasExactIdentity(user, identityId))
           .limit(2)
           .toList();
     }
@@ -61,10 +69,8 @@ final class WalletLoginAccountMapping {
       List<UserModel> exactMatches;
       try (Stream<UserModel> rechecked = users.searchForUserByUserAttributeStream(
           realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-        if (rechecked == null) throw new IllegalStateException("identity mapping read-back unavailable");
-        exactMatches = rechecked.filter(java.util.Objects::nonNull)
-            .filter(user -> identityId.equals(
-                user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
+        exactMatches = boundedCandidates(rechecked, "identity mapping read-back unavailable").stream()
+            .filter(user -> hasExactIdentity(user, identityId))
             .limit(2).toList();
       } catch (RuntimeException readbackUnavailable) {
         throw new IllegalStateException("identity mapping read-back unavailable", readbackUnavailable);
@@ -87,11 +93,9 @@ final class WalletLoginAccountMapping {
       }
       try (Stream<UserModel> rechecked = users.searchForUserByUserAttributeStream(
           realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-        if (rechecked == null) throw new IdentityMappingUnavailableException(null);
-        List<UserModel> exactMatches = rechecked
-            .filter(java.util.Objects::nonNull)
-            .filter(user -> identityId.equals(
-                user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
+        List<UserModel> scan = boundedCandidates(rechecked, "identity mapping read-back unavailable");
+        List<UserModel> exactMatches = scan.stream()
+            .filter(user -> hasExactIdentity(user, identityId))
             .limit(2)
             .toList();
         if (exactMatches.isEmpty()) {
@@ -120,15 +124,9 @@ final class WalletLoginAccountMapping {
     if (users == null || realm == null || identityId == null || identityId.isEmpty()) return false;
     try (Stream<UserModel> candidates = users.searchForUserByUserAttributeStream(
         realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
-      if (candidates == null) throw new IllegalStateException("identity mapping lookup unavailable");
-      List<UserModel> scan = candidates.filter(java.util.Objects::nonNull)
-          .limit(MAX_IDENTITY_CANDIDATES + 1).toList();
-      if (scan.size() > MAX_IDENTITY_CANDIDATES) {
-        throw new IllegalStateException("identity mapping lookup unavailable");
-      }
+      List<UserModel> scan = boundedCandidates(candidates, "identity mapping lookup unavailable");
       return scan.stream()
-          .filter(user -> identityId.equals(
-              user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)))
+          .filter(user -> hasExactIdentity(user, identityId))
           .limit(2).count() == 1;
     }
   }

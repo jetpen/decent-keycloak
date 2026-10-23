@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 import unittest
@@ -20,6 +21,8 @@ class SignupIntentProbeTest(unittest.TestCase):
     import tempfile
 
     with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / "run-owned-cids"
+      cid_dir.mkdir(mode=0o700)
       observed = {}
       def fake_run(argv, **kwargs):
         if argv[0] == "ss":
@@ -29,10 +32,12 @@ class SignupIntentProbeTest(unittest.TestCase):
         observed["argv"] = argv
         return subprocess.CompletedProcess(argv, 125, "", "")
 
-      with patch.object(probe, "SCRATCH", Path(scratch)), patch.object(probe, "run", side_effect=fake_run), \
+      with patch.object(probe, "SCRATCH", Path(scratch)), \
+           patch.object(probe, "RUN_CID_DIR", cid_dir), \
+           patch.object(probe, "run", side_effect=fake_run), \
            patch.object(probe, "Client", side_effect=AssertionError("discovery must not run after failed launch")):
         with self.assertRaisesRegex(RuntimeError, "start disposable Keycloak"):
-          probe.start_keycloak("test", "fixture-only-value", Path(scratch) / "wrapper", 1234, "bootstrap")
+          probe.start_keycloak("test", "fixture-only-value", Path(scratch) / "wrapper", 1234, "bootstrap", "sha256:" + "a" * 64)
 
       self.assertEqual(observed["mode"], 0o600)
       self.assertNotIn("fixture-only-value", observed["argv"])
@@ -46,7 +51,7 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertNotIn("AdminPassword(client.privateClientAdminCredential)", flow)
     self.assertIn("admin_call(admin_client, admin, 'GET'", flow)
     self.assertIn("admin_client, admin, 'GET'", flow)
-    self.assertIn("signup_wallet_flow(signup_browser, signup_key, signup_identifier, container, client)", source)
+    self.assertIn("signup_result = signup_wallet_flow(signup_browser, signup_key, signup_identifier,", source)
 
 
   def test_signup_action_trace_parser_preserves_only_allowlisted_methods_and_line_numbers(self):
@@ -351,6 +356,7 @@ class SignupIntentProbeTest(unittest.TestCase):
 
   def test_exact_registry_precheck_requires_a_valid_record_for_the_requested_identity(self):
     identifier = 'mailto:verified@example.test'
+    expected_key = hashlib.sha256(identifier.encode('utf-8')).hexdigest()
     record = {'identifier': identifier, 'owner_name_hex': identifier.encode('utf-8').hex(),
         'seq': 2, 'owner_public_key_hex': 'ab' * 32}
     stdout = json.dumps(record, indent=2)
@@ -364,11 +370,12 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertFalse(probe.exact_registry_lookup_succeeded(malformed_key_output, 0, identifier))
     self.assertEqual('unavailable', probe.exact_registry_lookup_outcome(
         malformed_key_output, 0, identifier))
+    miss_key = hashlib.sha256(identifier.encode('utf-8')).hexdigest()
     miss_output = '\n'.join((
-        'Value not found for key /decent-registry/identity/' + 'ab' * 32,
+        'Value not found for key /decent-registry/identity/' + miss_key,
         'not found'))
     handshake_output = '\n'.join((
-        'Value not found for key /decent-registry/identity/' + 'ab' * 32,
+        'Value not found for key /decent-registry/identity/' + miss_key,
         'failed to upgrade security for peer 12D3KooWBJHhhdqp4zbtGbCX6VyE7hC2ch5uaEvxfwkmSbfo2f3X: handshake failed',
         'not found'))
     self.assertEqual('not_found', probe.exact_registry_lookup_outcome(miss_output, 1, identifier))
@@ -523,9 +530,9 @@ class SignupIntentProbeTest(unittest.TestCase):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     main = source[source.index("def main():"):]
     self.assertIn("signup_browser = Client()", main)
-    self.assertIn("signup_wallet_flow(signup_browser, signup_key, signup_identifier, container, client)", main)
-    signup = main.index("result['signup_case'] = signup_wallet_flow(")
-    rotation = main.index("result['rotated_identity_case'] = stale_key_rotation_flow(")
+    self.assertIn("signup_result = signup_wallet_flow(signup_browser, signup_key, signup_identifier,", main)
+    signup = main.index("signup_result = signup_wallet_flow(")
+    rotation = main.index("rotation_result = stale_key_rotation_flow(")
     self.assertLess(signup, rotation)
 
   def test_disposable_realm_registers_email_login_and_preserves_unique_emails(self):
@@ -568,7 +575,7 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertNotIn("provision_exact_identity_user(", main)
     signup_flow = source[source.index("def signup_wallet_flow("):source.index("\ndef missing_identity_flow")]
     self.assertIn("signup proof provisions exact account before pending consume", signup_flow)
-    self.assertIn("signup_wallet_flow(signup_browser, signup_key, signup_identifier, container, client)", main)
+    self.assertIn("signup_result = signup_wallet_flow(signup_browser, signup_key, signup_identifier,", main)
     self.assertIn("label='wallet-login-signup'", main)
 
 
@@ -597,7 +604,7 @@ class SignupIntentProbeTest(unittest.TestCase):
           return 200, {}, b"signup-intent-bound-to-new-transaction"
         raise AssertionError((method, path))
     with self.assertRaisesRegex(RuntimeError, "fresh wallet transaction is bound to signup intent"):
-      probe.signup_wallet_flow(FakeClient(), Path("missing-key"), "identity", "container", FakeClient())
+      probe.signup_wallet_flow(FakeClient(), Path("missing-key"), "identity", "container", FakeClient(), lambda *_: None, "sha256:" + "a" * 64)
     posts = [event for event in events if event[0] == "POST"]
     self.assertEqual(1, len(posts))
     self.assertEqual("/auth/action?session_code=opaque&execution=e", posts[0][1])

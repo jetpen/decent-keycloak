@@ -3,64 +3,132 @@
 from __future__ import annotations
 
 from pathlib import Path
+import unittest
 
 README = Path(__file__).parents[1] / "README.md"
-def test_acceptance_ledger_reports_fresh_signup_evidence_and_remaining_gates():
+
+class AcceptanceLedgerTest(unittest.TestCase):
+  def test_acceptance_ledger_reports_current_verification_layers_and_remaining_gates(self):
     text = README.read_text()
-    assert "latest clean Maven package passed 146 tests across 12 suites" in text
-    assert "Latest two disposable runs" in text
-    assert "462028d4532af88ba30f03632c81cb4d7f8d37823e754e8d4ff9668beb1e3d5e" in text
-    assert "The first completed all scenarios (exit 0)" in text
-    assert "A repeat on the same image exited 1 at current-key proof HTTP 503" in text
-    assert "Registry negative and repeatability remain unqualified" in text
+    self.assertIn("The checks failed against the synthetic merge revision", text)
+    self.assertIn("The failure-specific probe also assumed the Hermes scratch directory exists", text)
+    self.assertIn("146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests", text)
+    self.assertIn("missing Registry configuration returns unavailable (503), not absence (401)", text)
+    self.assertIn("a Registry miss accompanied by a dial warning is unavailable", text)
+    self.assertEqual(2, text.count("| Slice | Status | Verified so far | Still open |"))
+    self.assertNotIn("uncommitted/unmerged", text)
 
-    assert "Still open from Issue #1" in text
-    assert "request-correlated reproducible attribution of account-policy denials under concurrent traffic" in text
-    assert "self-contained reproducible pinned runtime" in text
-    assert "two-node shared-store replay" in text
-    assert "Issue #1 remains open" in text
-    assert "native challenge GET with browser metadata absent" in text
-    assert "no real wallet client has qualified it" in text
-    assert "wallet challenge response stays exactly `{profile,challenge,csrf_token}`" in text
-    assert "not an additional wallet challenge-response field" in text
-
-
-
-def test_rotation_section_reports_bounded_current_image_result():
+  def test_previous_current_worktree_image_records_fail_closed_gate(self):
     text = README.read_text()
-    assert "Latest two disposable runs" in text
-    assert "current-key proof HTTP 503" in text
-    assert "Registry negative and repeatability remain unqualified" in text
+    self.assertIn("Previous #4 run from the current worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
+    self.assertIn("image ID `92cc5d4c06fd4a65dd1e2fbbb5472f70fd901201536b88019706bff48c14ce13`", text)
+    self.assertIn("digest `sha256:b4120b6aa22de7bf036250a9f66b701245e6f4fd8082cbeaf71f96d832cfd58b`", text)
+    self.assertIn("harness SHA `e220a7920c211b5d995a0b389b4665107565bf8c40da0b43d8cc4c9d2afd8d61`", text)
+    self.assertIn("All six fresh successor reads (three configured-port, three ephemeral) were unavailable with balanced JSON", text)
+    self.assertIn("two configured-port samples had peer-handshake diagnostics", text)
+    self.assertIn("Harness exited 1 at the successor-read gate", text)
+    self.assertIn("no stale/current-key proofs or provider `not_found` case ran", text)
+    self.assertIn("Prior #4 run (image predates d700)", text)
+    self.assertIn("A prior pre-wheelhouse no-cache image was built from the #4 worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
+    self.assertIn("provider JAR inside that image has SHA-256 `4a2d1364180350fffc671a7f61812ecbea5e68f04c90df95f95c0b669d4fbbcd`", text)
+    self.assertIn("current Maven target JAR SHA-256 is `c0f84827366911b7714f8590c2055c956fdd47d87cbcb01462f88ee8f5ac05c5`", text)
+    self.assertIn("all 46 ZIP entry names and uncompressed contents match", text)
+    self.assertIn("downloaded hash-locked dependency artifacts", text)
+    self.assertIn("That historical no-cache image build downloaded hash-locked dependency artifacts and was not network-isolated", text)
 
-
-def test_live_probe_results_do_not_claim_production_qualification():
+  def test_latest_offline_build_and_live_probe_keep_missing_id_gate_open(self):
     text = README.read_text()
-    assert "Both are single-node loopback/synthetic-signer/host-mounted-runtime simulations" in text
-    assert "current-key proof HTTP 503" in text
-    assert "Registry negative and repeatability remain unqualified" in text
-    assert "two-node shared-store replay" in text
+    self.assertIn("Latest #4 live probe on offline-built runtime from staging fingerprint `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`", text)
+    self.assertIn("wheelhouse `container/resolver-wheelhouse.tar.gz` (67 files, 32,102,893 bytes", text)
+    self.assertIn("SHA-256 `3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587`", text)
+    self.assertIn("The no-cache build used `--pull=never --network=none` and succeeded", text)
+    self.assertIn("runtime image ID `b142c93da454437ef8e74dc5ab57e8b5149c632ebb1ba73c412c95247d489157`", text)
+    self.assertIn("runner SHA `606e86f9335ef568c0dbec91008c7a987151d8dc6d41fcaabd238af84d260e8e`", text)
+    self.assertIn("On this `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` snapshot, the documented Python suite passed 150 tests", text)
+    self.assertIn("the full Python suite passed 151 tests on the documentation/test-only follow-up", text)
+    self.assertIn("A separate stopped-Registry lookup classified `unavailable`", text)
+    self.assertIn("Missing Identity produced Registry miss + terminal `not found` with repeated `dial_warning`, so classifier returned `unavailable`", text)
+    self.assertIn("Later snapshot `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` passed a no-cache `--network=none` build and partial live qualification", text)
+    self.assertIn("clean provider-level terminal `not_found` for a missing Identity without disqualifying dial-warning diagnostics", text)
+    self.assertIn("Multi-node/cross-node qualification is not an acceptance requirement under parent Issue #1.", text)
+    self.assertNotIn("multi-node shared-store replay", text)
+    self.assertNotIn("has not yet been qualified across nodes", text)
+    self.assertIn("no actionable standards/security findings", text)
+    self.assertNotIn("network-isolated image build remains unshown", text)
 
-
-
-
-
-
-
-
-def test_admission_cooldown_and_emergency_promotion_are_bounded():
+  def test_separate_registry_matrix_run_is_not_conflated_with_issue_four(self):
     text = README.read_text()
-    assert "The resolver gets a ten-second execution timeout" in text
-    assert "two-second forced-termination grace" in text
-    assert "The shared admission key expires after two seconds, even if the resolver is still running" in text
-    assert "promotion cannot cancel an already-admitted sibling lookup" in text
+    self.assertIn("Separate #5 matrix attempt (not the #4 loopback run)", text)
+    self.assertIn("harness SHA `3743c2b44e2f40f9f4ad3179d1d9a9767b0797661ce6dd9d6fc8729d1a13a7a6`", text)
+    self.assertIn("provider_registry_inconsistent", text)
+    self.assertIn("pending with no receipt or callback", text)
+    self.assertIn("second missing-Identity attempt stopped at owner-key generation", text)
+    self.assertIn("per-attempt key-filename fix was added afterward and was not live-verified", text)
 
 
-def test_authenticator_preserves_keycloaks_execution_tracking_on_wallet_challenge():
+
+
+
+
+
+
+  def test_earlier_loopback_is_distinguished_from_precommit_run(self):
+    text = README.read_text()
+    self.assertIn("Earlier #4 run: image ID", text)
+    self.assertNotIn("Latest loopback from the current code state", text)
+    self.assertIn("Prior #4 run (image predates d700)", text)
+
+  def test_disposable_probe_documents_immutable_image_invocation(self):
+    text = README.read_text()
+    self.assertIn("podman build --no-cache --pull=never --target resolver-builder", text)
+    self.assertIn("podman build --no-cache --pull=never --target runtime", text)
+    self.assertIn("podman image inspect --format '{{.Id}}'", text)
+    self.assertIn('WALLET_IT_IMAGE="$IMAGE_ID" python3 scripts/wallet_login_live_e2e.py', text)
+
+  def test_runtime_configuration_documents_bundled_executable_default(self):
+    text = README.read_text()
+    self.assertIn("decent.wallet.identity.executable", text)
+    self.assertIn("defaults to `/opt/decent-resolver/bin/decent-identity`", text)
+
+  def test_failure_receipt_sanitizes_live_resolver_categories_before_cleanup(self):
+    source = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
+    self.assertIn("latest_resolver_diagnostics", source)
+    self.assertIn("record_resolver_diagnostics(container)", source)
+    self.assertIn("capture_live_resolver_diagnostics(\n            container, result, checkpoint)", source)
+    start = source.index('def record_resolver_diagnostics(')
+    end = source.index('def classify_oidc_action_error(', start)
+    capture = source[start:end]
+    self.assertIn("return sanitized_resolver_diagnostic_lines(logs.stdout)", capture)
+    self.assertIn("categories = safe_resolver_diagnostic_snapshot(container)", capture)
+    self.assertIn("marker = '[WALLET-RESOLVER-DIAG]'", source)
+    self.assertNotIn("timestamp/logger-prefixed output", README.read_text())
+
+  def test_stale_acceptance_wording_was_removed(self):
+    text = README.read_text()
+    self.assertNotIn("The latest run's three fresh resolver reads were unavailable", text)
+    self.assertNotIn("This attribution fix is source-tested but has not yet been rebuilt into an immutable image and rerun", text)
+
+  def test_provider_401_is_not_inferred_as_registry_miss(self):
+    harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
+    start = harness.index('def classify_provider_identity_outcome(')
+    end = harness.index('\n\ndef missing_identity_flow(', start)
+    classifier = harness[start:end]
+    self.assertIn("if provider_http == 401:", classifier)
+    self.assertIn("return 'provider_denied_unclassified'", classifier)
+    self.assertNotIn('not_found', classifier)
+
+  def test_registry_listener_is_loopback_only(self):
+    harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
+    start = harness.split("def start_registry(temp, image, run_seconds=300):", 1)[1].split("def start_resolver_tools(", 1)[0]
+    self.assertIn("host: 127.0.0.1", start)
+    self.assertNotIn("host: 0.0.0.0", start)
+
+  def test_authenticator_preserves_keycloaks_execution_tracking_on_wallet_challenge(self):
     source = (README.parents[0] / "src/main/java/org/decentwallet/keycloak/wallet/WalletChallengeAuthenticator.java").read_text()
     challenge_start = source.index("public void authenticate(AuthenticationFlowContext context)")
     action_start = source.index("public void action(AuthenticationFlowContext context)", challenge_start)
     body = source[challenge_start:action_start]
     body = body[body.index("String accessCode = context.generateAccessCode();"):]
-    assert "CURRENT_AUTHENTICATION_EXECUTION" not in body
-    assert "LAST_PROCESSED_EXECUTION" not in body
-    assert "context.getActionUrl(accessCode)" in body
+    self.assertNotIn("CURRENT_AUTHENTICATION_EXECUTION", body)
+    self.assertNotIn("LAST_PROCESSED_EXECUTION", body)
+    self.assertIn("context.getActionUrl(accessCode)", body)

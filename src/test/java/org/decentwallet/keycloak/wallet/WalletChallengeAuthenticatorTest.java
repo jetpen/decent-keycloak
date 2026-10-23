@@ -9,6 +9,9 @@ import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -412,6 +415,74 @@ final class WalletChallengeAuthenticatorTest {
     verify(store).getAccepted(handle, binding);
     verify(store, org.mockito.Mockito.never()).takeAccepted(handle, binding);
     verify(context).failure(AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+  }
+
+  @Test
+  void challengeRenderingFailureDoesNotLogExceptionMessageOrStack() {
+    String privateMarker = "session-code-private-marker";
+    var transactionStore = mock(WalletLoginTransactionStore.class);
+    when(transactionStore.issue(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.eq(WalletLoginTransactionStore.Intent.LOGIN)))
+        .thenThrow(new IllegalStateException(privateMarker));
+    var authenticator = new WalletChallengeAuthenticator(() -> transactionStore);
+    var context = mock(AuthenticationFlowContext.class);
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var keycloakContext = mock(org.keycloak.models.KeycloakContext.class);
+    var uriInfo = mock(org.keycloak.models.KeycloakUriInfo.class);
+    var rootSession = mock(org.keycloak.sessions.RootAuthenticationSessionModel.class);
+    var authSession = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var config = mock(org.keycloak.models.AuthenticatorConfigModel.class);
+    when(context.getSession()).thenReturn(session);
+    when(context.getAuthenticationSession()).thenReturn(authSession);
+    when(context.getHttpRequest()).thenReturn(mock(org.keycloak.http.HttpRequest.class));
+    when(context.getRealm()).thenReturn(realm);
+    when(context.getAuthenticatorConfig()).thenReturn(config);
+    when(config.getConfig()).thenReturn(Map.of("trusted-origins", "https://idp.example"));
+    when(session.getContext()).thenReturn(keycloakContext);
+    when(keycloakContext.getUri()).thenReturn(uriInfo);
+    when(uriInfo.getBaseUri()).thenReturn(URI.create("https://idp.example/auth/"));
+    when(realm.getId()).thenReturn("realm-id");
+    when(realm.getName()).thenReturn("demo");
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_SITE_LABEL)).thenReturn("Wallet Site");
+    when(authSession.getClient()).thenReturn(client);
+    when(authSession.getParentSession()).thenReturn(rootSession);
+    when(rootSession.getId()).thenReturn("root-session-id");
+    when(authSession.getTabId()).thenReturn("tab-id");
+    when(client.getId()).thenReturn("client-id");
+    when(client.getClientId()).thenReturn("client-public");
+    when(client.isEnabled()).thenReturn(true);
+    when(client.isStandardFlowEnabled()).thenReturn(true);
+    when(client.getRedirectUris()).thenReturn(Set.of("https://site.example/callback"));
+    when(authSession.getRedirectUri()).thenReturn("https://site.example/callback");
+    var logger = java.util.logging.LogManager.getLogManager().getLogger(
+        WalletChallengeAuthenticator.class.getName());
+    var capture = new CapturingLogHandler();
+    var oldLevel = logger.getLevel();
+    try {
+      logger.addHandler(capture);
+      logger.setLevel(java.util.logging.Level.ALL);
+
+      authenticator.authenticate(context);
+
+      var record = capture.record;
+      assertNotNull(record);
+      assertTrue(record.getMessage().contains("Wallet challenge rendering failed"));
+      assertNull(record.getThrown());
+      assertFalse(record.getMessage().contains(privateMarker));
+      verify(context).failure(AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+    } finally {
+      logger.removeHandler(capture);
+      logger.setLevel(oldLevel);
+    }
+  }
+
+  private static final class CapturingLogHandler extends java.util.logging.Handler {
+    private java.util.logging.LogRecord record;
+    @Override public void publish(java.util.logging.LogRecord value) { record = value; }
+    @Override public void flush() {}
+    @Override public void close() {}
   }
 
   @Test

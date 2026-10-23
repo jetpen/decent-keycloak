@@ -1,6 +1,5 @@
 """Disposable local integration probe; not cluster/TLS/wallet-client qualification."""
 import base64
-import cbor2
 import hashlib
 import html.parser
 import json
@@ -19,15 +18,561 @@ import uuid
 from pathlib import Path
 
 
-PROJECTS = Path(os.environ.get('WALLET_IT_PROJECTS', str(Path.home() / 'projects')))
-REGISTRY_CLI = str(PROJECTS / 'decent-registry/.venv/bin/decent-registry')
-IDENTITY_SOURCE = str(PROJECTS / 'decent-identity/src')
-IDENTITY_VENV = str(PROJECTS / 'decent-identity/.venv')
-REGISTRY_VENV = str(PROJECTS / 'decent-registry/.venv')
-UV_PYTHON = os.environ.get('WALLET_IT_PYTHON_ROOT', str(Path.home() / '.local/share/uv/python'))
-KC_LIB = os.environ['WALLET_IT_NATIVE_LIBS']
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 SCRATCH = os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch'))
-IMAGE = os.environ.get('WALLET_IT_IMAGE', 'localhost/decent-keycloak-wallet-authenticator-spike:live-slice')
+RESOLVER_WRAPPER = '/opt/decent-resolver/bin/decent-identity'
+REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID = 'infinispan'
+EXPIRY_WAIT_MARGIN_SECONDS = 5
+EXPIRY_CONTAINER_LIFETIME_SECONDS = 1200
+
+
+def parse_keycloak_show_config(output):
+  """Extract only known effective config values, ignoring source annotations."""
+  allowed = {'kc.db': 'database_mode_effective', 'kc.cache': 'cache_mode_effective',
+      'kc.cache-stack': 'cache_stack_effective',
+      'kc.spi-single-use-object--provider': 'single_use_object_provider_path'}
+  values = {}
+  duplicates = set()
+  for line in output.splitlines() if isinstance(output, str) else ():
+    match = re.fullmatch(
+        r'\s*(kc\.(?:db|cache|cache-stack|spi-single-use-object--provider))'
+        r'\s*=\s*([A-Za-z0-9_.-]{1,96})'
+        r'(?:\s+\([A-Za-z0-9_.-]{1,96}\))?\s*', line)
+    if match is None:
+      continue
+    key, value = match.groups()
+    if key in values:
+      duplicates.add(key)
+    else:
+      values[key] = value
+  return {result_name: values[key] for key, result_name in allowed.items()
+      if key in values and key not in duplicates}
+
+
+def runtime_baseline_is_verified(facts):
+  return (facts.get('keycloak_version') == '26.8.0'
+      and facts.get('keycloak_nodes') == 'one'
+      and facts.get('database_mode_effective') == facts.get('database_mode_configured')
+      and facts.get('cache_mode_effective') == facts.get('cache_mode_configured'))
+
+
+def runtime_qualification_is_verified(facts):
+  provider = facts.get('single_use_object_provider_path')
+  return (runtime_baseline_is_verified(facts)
+      and provider == REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID
+      and provider in facts.get('single_use_object_provider_ids', []))
+
+
+def keycloak_runtime_provenance(client, token, keycloak_container_id=None):
+  """Capture allowlisted server facts; never infer provider selection from availability."""
+  facts = {
+      'keycloak_version': 'unavailable', 'keycloak_nodes': 'unknown',
+      'database_mode_configured': 'dev-file', 'database_mode_effective': 'unavailable',
+      'cache_mode_configured': 'local', 'cache_mode_effective': 'unavailable',
+      'cache_stack_effective': None,
+      'single_use_object_provider_path': 'unavailable', 'single_use_object_provider_ids': [],
+      'keycloak_config_read_status': 'container_id_unverified',
+      'keycloak_config_fields_present': [],
+      'runtime_qualification_status': 'open_runtime_facts_unavailable',
+  }
+  try:
+    status, _, raw = client.request('GET', '/auth/admin/serverinfo',
+        headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}, timeout=5)
+    info = json.loads(raw) if status == 200 else {}
+    version = info.get('systemInfo', {}).get('version') if isinstance(info, dict) else None
+    if isinstance(version, str) and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+      facts['keycloak_version'] = version
+    providers = info.get('providers', {}) if isinstance(info, dict) else {}
+    single = providers.get('single-use-object', providers.get('singleUseObject')) \
+        if isinstance(providers, dict) else None
+    configured_providers = single.get('providers') if isinstance(single, dict) else None
+    if isinstance(configured_providers, dict):
+      facts['single_use_object_provider_ids'] = sorted(provider_id
+          for provider_id, details in configured_providers.items()
+          if isinstance(provider_id, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', provider_id)
+          and isinstance(details, dict))
+  except (OSError, ValueError, TypeError, AttributeError, urllib.error.URLError):
+    pass
+  if isinstance(keycloak_container_id, str) and re.fullmatch(r'[0-9a-f]{64}', keycloak_container_id):
+    try:
+      inspected = run(['podman', 'inspect', '--format', '{{.Id}}', keycloak_container_id], timeout=8)
+    except subprocess.TimeoutExpired:
+      facts['keycloak_config_read_status'] = 'container_inspect_timeout'
+    except OSError:
+      facts['keycloak_config_read_status'] = 'container_inspect_error'
+    else:
+      if inspected.returncode != 0 or inspected.stdout.strip() != keycloak_container_id:
+        facts['keycloak_config_read_status'] = 'container_id_unverified'
+      else:
+        facts['keycloak_nodes'] = 'one'
+        try:
+          shown = run(['podman', 'exec', keycloak_container_id,
+              '/opt/keycloak/bin/kc.sh', 'show-config', '--all'], timeout=8)
+        except subprocess.TimeoutExpired:
+          facts['keycloak_config_read_status'] = 'show_config_timeout'
+        except OSError:
+          facts['keycloak_config_read_status'] = 'show_config_error'
+        else:
+          if shown.returncode != 0:
+            facts['keycloak_config_read_status'] = 'show_config_nonzero'
+          else:
+            parsed = parse_keycloak_show_config(shown.stdout)
+            facts.update(parsed)
+            present = sorted(parsed)
+            facts['keycloak_config_fields_present'] = present
+            required = {'database_mode_effective', 'cache_mode_effective',
+                'single_use_object_provider_path'}
+            facts['keycloak_config_read_status'] = (
+                'show_config_fields_complete' if required.issubset(present)
+                else 'show_config_fields_missing')
+  facts['runtime_qualification_status'] = ('runtime_facts_verified'
+      if runtime_qualification_is_verified(facts)
+      else 'open_runtime_facts_unavailable')
+  return facts
+
+
+def _prepare_resolver_runtime():
+  lock_path = PROJECT_DIR / 'container/resolver-runtime.lock.json'
+  runtime_lock_path = PROJECT_DIR / 'container/resolver-requirements.lock.txt'
+  harness_path = PROJECT_DIR / 'scripts/wallet_login_live_e2e.py'
+  lock = json.loads(lock_path.read_text())
+  return {
+      'identity_commit': lock['sources']['identity']['commit'],
+      'registry_commit': lock['sources']['registry']['commit'],
+      'harness_sha256': hashlib.sha256(harness_path.read_bytes()).hexdigest(),
+      'runtime_manifest_sha256': hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+      'runtime_lock_sha256': hashlib.sha256(runtime_lock_path.read_bytes()).hexdigest(),
+  }
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def report_partial_evidence_on_failure(evidence_path, diagnostic_provider=None):
+  try:
+    yield
+  except Exception as failure:
+    if diagnostic_provider is not None:
+      try:
+        evidence = sanitize_live_checkpoint(diagnostic_provider())
+        if evidence:
+          print('partial_evidence=' + json.dumps(evidence, sort_keys=True))
+      except Exception:
+        print('resolver_diagnostic_status=unavailable')
+    if evidence_path.exists():
+      print('partial_evidence=' + evidence_path.read_text(encoding='utf-8'))
+    print('harness_status=failed; failure_type=' + type(failure).__name__)
+    raise
+
+
+def checkpoint_signup_stage(result, stage, fields, checkpoint):
+  """Persist one bounded signup phase before its next failure gate."""
+  if stage not in {'intent', 'proof', 'account', 'callback', 'token'}:
+    return
+  allowed = {
+      'signup_intent_action_http', 'signup_proof_http', 'exact_mapped_users',
+      'pkce_token_http', 'callback_http', 'callback_replay', 'oidc_state_preserved',
+  }
+  safe = {}
+  for name, value in fields.items():
+    if name not in allowed:
+      continue
+    if name in {'exact_mapped_users'}:
+      if type(value) is int and 0 <= value <= 2:
+        safe[name] = value
+    elif name in {'callback_replay', 'oidc_state_preserved'}:
+      if type(value) is bool:
+        safe[name] = value
+    elif name.endswith('_http') and type(value) is int and 100 <= value <= 599:
+      safe[name] = value
+  result['signup_case'] = {**result.get('signup_case', {}), 'stage': stage, **safe}
+  checkpoint()
+
+
+def checkpoint_live_case(result, case_name, fields, checkpoint):
+  if case_name not in {
+      'rotated_identity_case', 'ambiguous_account_case', 'unmapped_account_case',
+      'disabled_account_case', 'wallet_login', 'browser_preflight', 'negative_case',
+  }:
+    return
+  result[case_name] = sanitize_live_checkpoint({case_name: fields}).get(case_name, {})
+  checkpoint()
+
+
+def checkpoint_rotation_stage(result, stage, fields, checkpoint):
+  if stage not in {'publish', 'readback', 'stale_proof', 'stale_pending',
+      'stale_attempt', 'stale_proof_pending', 'current_proof', 'current_attempt', 'current_accepted', 'callback',
+      'mapping'}:
+    return
+  allowed = {
+      'rotation_publish', 'current_sequence', 'stale_key_proof_http',
+      'stale_transaction_remains_pending', 'current_key_proof_http',
+      'current_transaction_accepted', 'callback_available', 'resolver_samples',
+      'attempt_number', 'status_http', 'status_pending', 'local_mapping_persisted',
+      'port_strategy'}
+  enums = {'rotation_publish': {'published', 'read_back_exact', 'passed', 'failed'},
+      'port_strategy': {'configured', 'ephemeral'}}
+  http_fields = {'stale_key_proof_http', 'current_key_proof_http'}
+  boolean_fields = {'stale_transaction_remains_pending', 'current_transaction_accepted',
+      'callback_available', 'status_pending', 'local_mapping_persisted'}
+  safe = {}
+  for key, value in fields.items():
+    if key not in allowed:
+      continue
+    if key in enums and isinstance(value, str) and value in enums[key]:
+      safe[key] = value
+    elif key in http_fields and type(value) is int and 100 <= value <= 599:
+      safe[key] = value
+    elif key == 'status_http' and type(value) is int and 100 <= value <= 599:
+      safe[key] = value
+    elif key in boolean_fields and type(value) is bool:
+      safe[key] = value
+    elif key == 'port_strategy' and isinstance(value, str) and value in enums['port_strategy']:
+      safe[key] = value
+    elif key == 'current_sequence' and type(value) is int and 0 <= value <= 60000:
+      safe[key] = value
+    elif key == 'attempt_number' and type(value) is int and 1 <= value <= 5:
+      safe[key] = value
+    elif key == 'resolver_samples' and isinstance(value, list) and len(value) <= 6:
+      safe[key] = [{
+          'outcome': sample['outcome'],
+          'lookup_ms': sample['lookup_ms'],
+          'peer_handshake': sample['peer_handshake'],
+          'unexpected_diagnostic': sample['unexpected_diagnostic'],
+          'json_balanced': sample['json_balanced'],
+          'exact_identity_and_successor_match': sample['exact_identity_and_successor_match'],
+          'port_strategy': sample['port_strategy'],
+          **({'diagnostic_categories': sample['diagnostic_categories']}
+              if isinstance(sample.get('diagnostic_categories'), list)
+              and len(sample['diagnostic_categories']) <= 12
+              and all(category in {'json','registry_miss','not_found','dial_warning',
+                  'peer_status','peer_handshake','peer_error','history_unavailable','traceback','other'}
+                  for category in sample['diagnostic_categories']) else {}),
+      } for sample in value if isinstance(sample, dict)
+          and sample.get('outcome') in {'resolved', 'not_found', 'unavailable'}
+          and type(sample.get('lookup_ms')) is int and 0 <= sample['lookup_ms'] <= 60000
+          and type(sample.get('peer_handshake')) is bool
+          and type(sample.get('unexpected_diagnostic')) is bool
+          and sample.get('port_strategy') in {'configured', 'ephemeral'}]
+  result['rotated_identity_case'] = {
+      **result.get('rotated_identity_case', {}), 'stage': stage, **safe}
+  checkpoint()
+
+
+def sanitize_live_checkpoint(candidate):
+  """Project live outcomes into a fixed, non-sensitive evidence schema."""
+  if not isinstance(candidate, dict):
+    return {}
+  runtime_fields = {
+      'identity_commit', 'registry_commit', 'harness_sha256',
+      'runtime_manifest_sha256', 'runtime_lock_sha256', 'image_digest', 'diagnostic_categories',
+      'keycloak_version', 'keycloak_nodes', 'database_mode_configured',
+      'database_mode_effective', 'cache_mode_configured', 'cache_mode_effective',
+      'cache_stack_effective', 'single_use_object_provider_path',
+      'single_use_object_provider_ids', 'keycloak_config_read_status',
+      'keycloak_config_fields_present', 'runtime_qualification_status',
+  }
+  scalar_fields = {
+      'proof_post_http', 'status_poll_http',
+      'invalid_proof_http', 'pkce_token_http', 'current_key_proof_http',
+      'stale_key_proof_http', 'current_sequence', 'cli_exit', 'cli_lookup_ms',
+      'provider_http', 'direct_provider_http', 'provider_lookup_ms',
+      'direct_provider_lookup_ms', 'exact_mapped_users',
+      'signup_intent_action_http', 'signup_proof_http', 'scenario',
+      'rotation_publish', 'callback_code', 'id_token_claims_checked', 'jwks_signature_verified',
+      'identical_retry_accepted', 'changed_retry_denied', 'alien_status_denied',
+      'state_preserved', 'error_returned', 'authorization_code_returned',
+      'callback_replay', 'local_mapping_persisted', 'credentialed', 'wrong_origin_denied',
+      'signature_rejected_by_verifier', 'no_acceptance_or_callback',
+      'registry_unavailable', 'local_account_mapping_decision_observed',
+      'pending_after_negative_http', 'current_registry_proof_http',
+      'http_after_five_invalid_attempts',
+      'pre_resolution_invalid_http', 'four_malformed_proofs_http',
+      'browser_challenge_http', 'browser_proof_http',
+      'missing_csrf_http', 'extra_header_http', 'wrong_origin_http',
+      'redirect_http', 'challenge_get', 'challenge_post', 'status_poll_http',
+      'get_http', 'post_http', 'redirect_http', 'invalid_proof_http',
+      'stale_transaction_remains_pending', 'current_transaction_accepted',
+      'cli_resolution', 'provider_resolution_outcome', 'registry_lookup_outcome', 'cli_output_categories',
+      'cli_output_shape', 'outcome', 'wallet_locator',
+  }
+  sequence_fields = {'current_sequence'}
+  exit_fields = {'cli_exit'}
+  allowed = {
+      'resolver_runtime', 'wallet_login', 'browser_preflight', 'negative_case',
+      'unmapped_account_case', 'disabled_account_case', 'signup_case', 'rotation_case',
+      'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case', 'expiry_case',
+  }
+  signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
+  rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
+      'stale_proof_pending', 'current_proof', 'current_attempt', 'current_accepted', 'callback', 'complete', 'mapping'}
+  expiry_stages = {'started', 'transaction_created', 'expired_proof_submitted',
+      'fresh_login_started', 'fresh_login_verified', 'complete'}
+  bool_fields = {
+      'id_token_claims_checked', 'jwks_signature_verified', 'callback_code', 'identical_retry_accepted',
+      'local_mapping_persisted',
+      'changed_retry_denied', 'alien_status_denied', 'state_preserved', 'error_returned',
+      'challenge_get', 'wrong_origin_denied', 'credentialed',
+      'authorization_code_returned', 'callback_replay', 'credentialed',
+      'wrong_origin_denied', 'signature_rejected_by_verifier', 'no_acceptance_or_callback',
+      'registry_unavailable', 'local_account_mapping_decision_observed',
+      'stale_transaction_remains_pending', 'current_transaction_accepted', 'status_pending',
+      'proof_denied', 'status_denied', 'no_accepted_receipt', 'no_callback',
+      'no_authorization_code', 'request_correlated_denial', 'response_body_safe',
+      'location_safe', 'redirects_safe', 'fresh_locator_distinct',
+      'fresh_login_transaction_available',
+  }
+  http_fields = {
+      'proof_post_http', 'status_poll_http', 'pkce_token_http', 'current_key_proof_http', 'stale_key_proof_http',
+      'provider_http', 'direct_provider_http',
+      'signup_intent_action_http', 'signup_proof_http', 'callback_http',
+      'pending_after_negative_http', 'current_registry_proof_http',
+      'http_after_five_invalid_attempts', 'four_malformed_proofs_http',
+      'pre_resolution_invalid_http',
+      'browser_challenge_http', 'browser_proof_http', 'missing_csrf_http',
+      'extra_header_http', 'wrong_origin_http', 'redirect_http',
+      'challenge_post', 'get_http', 'post_http', 'four_malformed_proofs_http',
+      'status_http', 'login_page_http', 'challenge_get_http',
+      'fresh_login_http', 'fresh_challenge_http',
+  }
+  time_fields = {'cli_lookup_ms', 'provider_lookup_ms', 'direct_provider_lookup_ms'}
+  digest_fields = {'identity_commit', 'registry_commit'}
+  enums = {
+      'scenario': {'login', 'signup', 'unmapped-account', 'disabled-account', 'rotation', 'ambiguous-account', 'account-mapping-denial'},
+      'registry_lookup_outcome': {'resolved', 'present', 'not_found', 'unavailable'},
+      'cli_resolution': {'not_found', 'unavailable', 'inconsistent'},
+      'provider_resolution_outcome': {'unavailable', 'provider_denied_unclassified', 'unexpected_status'},
+      'rotation_publish': {'passed', 'published', 'read_back_exact', 'failed'},
+      'outcome': {'accepted', 'denied', 'unavailable', 'pending', 'not_found', 'inconsistent',
+          'policy_denied', 'provider_denied_unclassified', 'registry_unavailable',
+          'provider_registry_inconsistent', 'account_mapping_unavailable', 'provider_unavailable',
+          'unexpected_acceptance', 'unexpected_status', 'unqualified', 'policy_denied',
+          'provider_denied_unclassified', 'registry_unavailable', 'provider_registry_inconsistent',
+          'account_mapping_unavailable', 'provider_unavailable'},
+      'runtime_qualification_status': {'runtime_facts_verified', 'open_runtime_facts_unavailable'},
+      'single_use_object_provider_path': {'infinispan', 'jpa', 'remote', 'unavailable'},
+      'keycloak_config_read_status': {
+          'container_id_unverified', 'container_inspect_timeout', 'container_inspect_error',
+          'show_config_timeout', 'show_config_error', 'show_config_nonzero',
+          'show_config_fields_complete', 'show_config_fields_missing'},
+  }
+
+  runtime_string_fields = {
+      'harness_sha256', 'runtime_manifest_sha256', 'runtime_lock_sha256', 'image_digest',
+  }
+  resolver_diagnostic_reasons = {
+      'registry_miss', 'dial_warning', 'peer_handshake', 'peer_error',
+      'history_unavailable', 'traceback', 'process_start', 'nonzero_exit',
+      'unknown', 'success', 'timeout', 'interrupted', 'termination_interrupted',
+      'output_overflow',
+  }
+
+  def safe_diagnostic_category(value):
+    if isinstance(value, str) and value in {'unavailable', 'invalid'}:
+      return True
+    if not isinstance(value, str) or not value.startswith('ok:'):
+      return False
+    categories = value[3:].split('|')
+    return bool(categories) and len(categories) <= 8 and len(categories) == len(set(categories)) \
+        and all(category in resolver_diagnostic_reasons for category in categories)
+
+  def safe_scalar(field, value):
+    if field == 'diagnostic_categories':
+      return isinstance(value, list) and len(value) <= 32 and all(
+          safe_diagnostic_category(item) for item in value)
+    if field in runtime_string_fields:
+      if field == 'image_digest':
+        return isinstance(value, str) and re.fullmatch(r'sha256:[0-9a-f]{64}', value) is not None
+      return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+    if field == 'keycloak_version':
+      return isinstance(value, str) and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', value) is not None
+    if field == 'keycloak_nodes':
+      return value in {'one', 'unknown'}
+    if field in {'database_mode_configured', 'database_mode_effective',
+        'cache_mode_configured', 'cache_mode_effective', 'cache_stack_effective'}:
+      return value is None or (isinstance(value, str)
+          and re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', value) is not None)
+    if field == 'single_use_object_provider_ids':
+      return isinstance(value, list) and len(value) <= 32 and all(
+          isinstance(item, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', item) is not None
+          for item in value) and value == sorted(set(value))
+    if field == 'keycloak_config_fields_present':
+      allowed_config_fields = {'database_mode_effective', 'cache_mode_effective',
+          'cache_stack_effective', 'single_use_object_provider_path'}
+      return (isinstance(value, list) and len(value) <= 4
+          and all(item in allowed_config_fields for item in value)
+          and value == sorted(set(value)))
+    if field in bool_fields:
+      return type(value) is bool
+    if field in http_fields:
+      return type(value) is int and 100 <= value <= 599
+    if field in {'ttl_seconds', 'wait_seconds'}:
+      return type(value) is int and 1 <= value <= 7200
+    if field in sequence_fields or field in time_fields:
+      return type(value) is int and 0 <= value <= 60000
+    if field in exit_fields:
+      return type(value) is int and -1 <= value <= 255
+    if field in digest_fields:
+      return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}', value) is not None
+    if field == 'cli_output_categories':
+      return isinstance(value, list) and len(value) <= 16 and all(item in {
+          'not_found', 'registry_miss', 'dial_warning', 'peer_handshake', 'peer_error',
+          'peer_status', 'json', 'history_unavailable', 'traceback', 'other',
+          'ok:registry_miss', 'ok:registry_miss|dial_warning|unknown', 'unavailable', 'invalid'}
+          for item in value)
+    if field == 'diagnostic_categories':
+      return isinstance(value, list) and len(value) <= 32 and all(
+          safe_diagnostic_category(item) for item in value)
+    if field == 'cli_output_shape':
+      return isinstance(value, list) and len(value) <= 16 and all(
+          item in {'object', 'nested_object', 'array', 'scalar'} for item in value)
+    if field in enums:
+      return isinstance(value, str) and value in enums[field]
+    if field == 'exact_mapped_users':
+      return type(value) is int and 0 <= value <= 2
+    if field == 'wallet_locator':
+      return value is True
+    return False
+
+  projected = {}
+  for key, value in candidate.items():
+    if key not in allowed or not isinstance(value, dict):
+      continue
+    if key == 'missing_identity_case' and isinstance(value, dict):
+      fields = {'cli_resolution', 'cli_exit', 'cli_output_categories', 'cli_output_shape',
+          'cli_lookup_ms', 'provider_resolution_outcome', 'direct_provider_http',
+          'status_http', 'status_pending', 'redirects_safe', 'direct_provider_lookup_ms',
+          'no_acceptance_or_callback'}
+      safe = {field: item for field, item in value.items()
+          if field in fields and safe_scalar(field, item)}
+      if safe:
+        projected[key] = safe
+      continue
+    if key == 'expiry_case':
+      stage = value.get('stage')
+      if stage not in expiry_stages:
+        continue
+      fields = {
+          'ttl_seconds', 'wait_seconds', 'login_page_http', 'challenge_get_http',
+          'proof_post_http', 'status_http', 'proof_denied', 'status_denied',
+          'no_accepted_receipt', 'no_callback', 'no_authorization_code',
+          'request_correlated_denial', 'response_body_safe', 'location_safe',
+          'redirects_safe', 'runtime_qualification_status',
+          'single_use_object_provider_path', 'fresh_login_http', 'fresh_challenge_http',
+          'fresh_locator_distinct', 'fresh_login_transaction_available'}
+      safe = {'stage': stage}
+      safe.update({field: item for field, item in value.items()
+          if field in fields and safe_scalar(field, item)})
+      if safe:
+        projected[key] = safe
+      continue
+    if key == 'rotated_identity_case' and isinstance(value, dict):
+      stage = value.get('stage')
+      if stage not in rotation_stages and stage != 'diagnostic_probe':
+        continue
+      fields = {'rotation_publish', 'current_sequence', 'current_key_proof_http',
+          'stale_key_proof_http', 'stale_transaction_remains_pending',
+          'current_transaction_accepted', 'callback_available', 'local_mapping_persisted',
+          'attempt_number', 'status_http', 'status_pending', 'diagnostic_categories',
+          'port_strategy'}
+      safe = {'stage': stage}
+      safe.update({field: item for field, item in value.items()
+          if field in fields and safe_scalar(field, item)})
+      if type(value.get('attempt_number')) is int and 1 <= value['attempt_number'] <= 5:
+        safe['attempt_number'] = value['attempt_number']
+      if type(value.get('status_http')) is int and 100 <= value['status_http'] <= 599:
+        safe['status_http'] = value['status_http']
+      if isinstance(value.get('resolver_samples'), list) and len(value['resolver_samples']) <= 6:
+        safe['resolver_samples'] = [{
+            'outcome': sample['outcome'], 'lookup_ms': sample['lookup_ms'],
+            'peer_handshake': sample['peer_handshake'],
+            'unexpected_diagnostic': sample['unexpected_diagnostic'],
+            'json_balanced': sample.get('json_balanced') is True,
+            'exact_identity_and_successor_match': sample.get('exact_identity_and_successor_match') is True,
+            'port_strategy': sample['port_strategy'],
+            **({'diagnostic_categories': sample['diagnostic_categories']}
+                if isinstance(sample.get('diagnostic_categories'), list)
+                and len(sample['diagnostic_categories']) <= 12
+                and all(category in {'json','registry_miss','not_found','dial_warning',
+                    'peer_status','peer_handshake','peer_error','history_unavailable','traceback','other'}
+                    for category in sample['diagnostic_categories']) else {}),
+        } for sample in value['resolver_samples'] if isinstance(sample, dict)
+            and sample.get('outcome') in {'resolved', 'not_found', 'unavailable'}
+            and type(sample.get('lookup_ms')) is int and 0 <= sample['lookup_ms'] <= 60000
+            and type(sample.get('peer_handshake')) is bool
+            and type(sample.get('unexpected_diagnostic')) is bool
+            and sample.get('port_strategy') in {'configured', 'ephemeral'}]
+      if stage == 'diagnostic_probe' and isinstance(value.get('diagnostic_categories'), list):
+        categories = value['diagnostic_categories']
+        if len(categories) <= 32 and all(safe_diagnostic_category(category) for category in categories):
+          safe['diagnostic_categories'] = categories
+      if safe:
+        projected[key] = safe
+      continue
+    if key == 'signup_case' and isinstance(value, dict):
+      stage = value.get('stage')
+      if stage not in signup_stages:
+        continue
+      safe = {'stage': stage}
+      safe.update({field: item for field, item in value.items()
+          if field in {'signup_intent_action_http', 'signup_proof_http',
+              'callback_http', 'pkce_token_http'} and safe_scalar(field, item)})
+      if type(value.get('exact_mapped_users')) is int and 0 <= value['exact_mapped_users'] <= 2:
+        safe['exact_mapped_users'] = value['exact_mapped_users']
+      if safe:
+        projected[key] = safe
+      continue
+    if key == 'resolver_runtime' and isinstance(value, dict):
+      safe = {field: item for field, item in value.items()
+          if field in runtime_fields and safe_scalar(field, item)}
+      if safe:
+        projected[key] = safe
+      continue
+    fields = scalar_fields
+    original_value = value
+    if key == 'negative_case' and isinstance(value.get('invalid_proof_throttle'), dict):
+      value = {field: item for field, item in value.items() if field != 'invalid_proof_throttle'}
+    safe = {field: item for field, item in value.items()
+        if field in fields and (field in runtime_fields and key == 'resolver_runtime'
+            or safe_scalar(field, item))}
+    if key == 'wallet_login' and isinstance(value.get('callback_replay'), dict):
+      callback_fields = {'redirect_http', 'state_preserved', 'error_returned',
+          'authorization_code_returned'}
+      callback = value['callback_replay']
+      safe['callback_replay'] = {field: item for field, item in callback.items()
+          if field in callback_fields and safe_scalar(field, item)}
+    if key == 'negative_case' and isinstance(original_value.get('invalid_proof_throttle'), dict):
+      throttle_fields = {'pre_resolution_invalid_http', 'four_malformed_proofs_http',
+          'http_after_five_invalid_attempts', 'no_acceptance_or_callback'}
+      throttle = original_value['invalid_proof_throttle']
+      sanitized_throttle = {}
+      for field, item in throttle.items():
+        if field not in throttle_fields:
+          continue
+        if field == 'four_malformed_proofs_http' and isinstance(item, list):
+          if len(item) <= 16 and all(type(status) is int and 100 <= status <= 599 for status in item):
+            sanitized_throttle[field] = item
+        elif safe_scalar(field, item):
+          sanitized_throttle[field] = item
+      safe['invalid_proof_throttle'] = sanitized_throttle
+    if safe:
+      projected[key] = safe
+  return projected
+
+
+def resolve_immutable_image(image):
+  if not isinstance(image, str) or not image:
+    raise RuntimeError('an explicit resolver image is required')
+  inspected = run(['podman', 'image', 'inspect', image, '--format', '{{.Id}}|{{.Digest}}'], timeout=15)
+  if inspected.returncode != 0:
+    raise RuntimeError('resolver image inspect failed')
+  fields = inspected.stdout.strip().split('|')
+  if len(fields) != 2 or re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', fields[0]) is None or re.fullmatch(r'sha256:[0-9a-f]{64}', fields[1]) is None:
+    raise RuntimeError('resolver image inspect did not return immutable image ID and digest')
+  return fields[0], fields[1]
+
+
+IMAGE = os.environ.get('WALLET_IT_IMAGE')
 KC_PORT = 18886
 IDP_ORIGIN = 'https://idp.example'
 WALLET_ORIGIN = 'https://wallet.example'
@@ -59,8 +604,440 @@ def run(args, timeout=60, env=None):
                         stderr=subprocess.STDOUT, timeout=timeout, env=env, check=False)
 
 
+RUN_CID_DIR = None
+
+
+def _cid_file(role):
+  if RUN_CID_DIR is None:
+    raise RuntimeError('run-scoped container ownership directory is unavailable')
+  if not isinstance(role, str) or re.fullmatch(r'[a-z-]{1,32}', role) is None:
+    raise ValueError('container ownership role is invalid')
+  path = Path(RUN_CID_DIR) / (role + '.cid')
+  if path.exists():
+    raise RuntimeError('run-scoped container CID file already exists')
+  return path
+
+
+def _inspect_cid(cid_file):
+  try:
+    container_id = Path(cid_file).read_text(encoding='ascii').strip()
+  except (OSError, UnicodeError):
+    return None
+  if re.fullmatch(r'[0-9a-f]{64}', container_id) is None:
+    return None
+  inspected = run(['podman', 'inspect', '--format', '{{.Id}}', container_id], timeout=15)
+  if inspected.returncode != 0 or inspected.stdout.strip() != container_id:
+    return None
+  return container_id
+
+
+def remove_owned_container(cid_file):
+  """Remove only a CID-file resource whose full ID remains verified."""
+  if RUN_CID_DIR is None or Path(cid_file).parent != Path(RUN_CID_DIR):
+    return {'removed': False, 'retained_cid': True}
+  try:
+    container_id = _inspect_cid(cid_file)
+    if container_id is None or _inspect_cid(cid_file) != container_id:
+      return {'removed': False, 'retained_cid': True}
+    removed = run(['podman', 'rm', '--force', container_id], timeout=20)
+    if removed.returncode != 0:
+      return {'removed': False, 'retained_cid': True}
+    after = run(['podman', 'inspect', '--format', '{{.Id}}', container_id], timeout=15)
+    if after.returncode == 0 or not re.search(
+        r'(?:no such|not found|does not exist|no container.*found)', after.stdout, re.IGNORECASE):
+      return {'removed': False, 'retained_cid': True}
+  except (OSError, subprocess.TimeoutExpired):
+    return {'removed': False, 'retained_cid': True}
+  try:
+    Path(cid_file).unlink()
+  except OSError:
+    return {'removed': True, 'retained_cid': True}
+  return {'removed': True, 'retained_cid': False}
+
+
+def start_owned_container(args, cid_file, timeout, stage):
+  """Accept container ownership only after inspecting the CID file's full ID."""
+  try:
+    started = run(args, timeout=timeout)
+    require(started.returncode == 0, stage)
+    container_id = _inspect_cid(cid_file)
+    if container_id is None:
+      raise RuntimeError('acceptance probe failed at container CID verified by exact full ID')
+    return started, container_id
+  except BaseException:
+    try:
+      remove_owned_container(cid_file)
+    except Exception:
+      pass
+    raise
+
+
+def cleanup_owned_resources(registry_node, resolver_tools):
+  """Attempt every cleanup and remove only resources verified by run-owned CID files."""
+  cleanup_errors = 0
+  cleanup_categories = []
+  for category, cleanup in (
+      ('registry_log_stream_stop_error', lambda: stop_registry(registry_node, '')),
+      ('resolver_tools_stop_error', lambda: stop_resolver_tools(resolver_tools))):
+    try:
+      cleanup()
+    except BaseException:
+      cleanup_errors += 1
+      cleanup_categories.append(category)
+  role_categories = {
+      'keycloak': 'keycloak', 'registry': 'registry', 'resolver-tools': 'resolver_tools'}
+  if RUN_CID_DIR is not None and RUN_CID_DIR.exists():
+    for cid_file in sorted(RUN_CID_DIR.glob('*.cid')):
+      role = role_categories.get(cid_file.stem, 'unknown_resource')
+      try:
+        status = remove_owned_container(cid_file)
+        if not status['removed'] or status['retained_cid']:
+          cleanup_errors += 1
+          cleanup_categories.append(role + '_removal_unconfirmed')
+      except BaseException:
+        cleanup_errors += 1
+        cleanup_categories.append(role + '_cleanup_error')
+    if cleanup_errors:
+      print('owned_container_cleanup_status=inconclusive')
+    else:
+      try:
+        RUN_CID_DIR.rmdir()
+      except OSError:
+        cleanup_errors += 1
+        cleanup_categories.append('cid_directory_removal_unconfirmed')
+  if cleanup_errors:
+    print('owned_container_cleanup_categories=' + json.dumps(sorted(set(cleanup_categories))))
+  return cleanup_errors
+
+
+def _contains_key(value, key):
+  if isinstance(value, dict):
+    normalized = {str(name).lower() for name in value}
+    if key == 'code':
+      found = bool(normalized & {'code', 'authorization_code', 'oidc_code'})
+    elif key == 'callback':
+      found = any(name == 'callback' or name.startswith('callback_') for name in normalized)
+    else:
+      found = key.lower() in normalized
+    return found or any(_contains_key(child, key) for child in value.values())
+  if isinstance(value, list):
+    return any(_contains_key(child, key) for child in value)
+  return False
+
+
+def _has_accepted_result(value):
+  if isinstance(value, str):
+    return value.strip().lower() == 'accepted'
+  if isinstance(value, dict):
+    if any(str(key).lower() in {'receipt', 'receipt_id', 'accepted_receipt'} for key in value):
+      return True
+    if str(value.get('status', '')).lower() == 'accepted':
+      return True
+    return any(_has_accepted_result(child) for child in value.values())
+  if isinstance(value, list):
+    return any(_has_accepted_result(child) for child in value)
+  return False
+
+
+def _expiry_body_is_safe(raw):
+  if not raw:
+    return True
+  try:
+    body = json.loads(raw)
+  except (json.JSONDecodeError, UnicodeDecodeError):
+    return False
+  return not (_has_accepted_result(body) or _contains_key(body, 'callback')
+      or _contains_key(body, 'code'))
+
+
+def _expiry_location_is_safe(location):
+  if not location:
+    return True
+  parsed = urllib.parse.urlsplit(location)
+  query = urllib.parse.parse_qs(parsed.query)
+  fragment = urllib.parse.parse_qs(parsed.fragment)
+  keys = {str(key).lower() for key in query} | {str(key).lower() for key in fragment}
+  sensitive = {'code', 'authorization_code', 'oidc_code', 'callback', 'receipt',
+      'receipt_id', 'accepted_receipt'}
+  return not (keys & sensitive
+      or any(value.lower() == 'accepted'
+          for values in (*query.values(), *fragment.values()) for value in values)
+      or any(part in {'callback', 'receipt'} for part in parsed.path.lower().split('/')))
+
+
+def _expiry_redirects_are_safe(redirects):
+  return not bool(redirects)
+
+
+def expiry_acceptance_passes(evidence):
+  return (isinstance(evidence, dict) and evidence.get('stage') == 'complete'
+      and evidence.get('login_page_http') == 200 and evidence.get('challenge_get_http') == 200
+      and evidence.get('proof_post_http') == 404 and evidence.get('status_http') == 404
+      and evidence.get('proof_denied') is True and evidence.get('status_denied') is True
+      and evidence.get('no_accepted_receipt') is True and evidence.get('no_callback') is True
+      and evidence.get('no_authorization_code') is True
+      and evidence.get('fresh_login_http') == 200
+      and evidence.get('fresh_challenge_http') == 200
+      and evidence.get('fresh_locator_distinct') is True
+      and evidence.get('fresh_login_transaction_available') is True
+      and evidence.get('request_correlated_denial') is True
+      and evidence.get('response_body_safe') is True and evidence.get('location_safe') is True
+      and evidence.get('redirects_safe') is True
+      and evidence.get('runtime_qualification_status') == 'runtime_facts_verified'
+      and evidence.get('single_use_object_provider_path') == REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID)
+
+
+def _parse_expiry_denial_provider(line, request_id, available_provider_ids):
+  if not isinstance(line, str) or not isinstance(request_id, str):
+    return None
+  providers = ('infinispan', 'jpa', 'remote')
+  provider_pattern = '|'.join(re.escape(provider_id) for provider_id in providers)
+  match = re.search(r'Wallet transaction proof rejected \(request=' + re.escape(request_id)
+      + r', reason=transaction_unavailable, provider=(' + provider_pattern + r')\)', line)
+  if match is None or match.group(1) not in available_provider_ids:
+    return None
+  return match.group(1)
+
+
+def _expiry_denial_signal(container_id, cursor, handle, available_provider_ids):
+  request_id = hashlib.sha256(handle.encode('ascii')).digest()[:16].hex()
+  deadline = time.monotonic() + 5
+  while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      return None
+    try:
+      logs = run(['podman', 'logs', '--since', str(cursor), container_id],
+          timeout=1 if remaining < 2 else 2)
+    except subprocess.TimeoutExpired:
+      continue
+    if logs.returncode == 0:
+      output = logs.stdout.decode('utf-8', errors='replace') if isinstance(logs.stdout, bytes) else logs.stdout
+      for line in output.splitlines():
+        selected = _parse_expiry_denial_provider(line, request_id, available_provider_ids)
+        if selected is not None:
+          return selected
+    time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+
+
+def transaction_ttl_seconds():
+  source = (PROJECT_DIR / 'src/main/java/org/decentwallet/keycloak/wallet/'
+      'WalletLoginTransactionStore.java').read_text(encoding='utf-8')
+  match = re.search(r'public static final long TRANSACTION_LIFESPAN_SECONDS = ([0-9]+);', source)
+  if match is None:
+    raise RuntimeError('pending transaction TTL source constant is unavailable')
+  ttl = int(match.group(1))
+  if not 1 <= ttl <= EXPIRY_CONTAINER_LIFETIME_SECONDS - 120:
+    raise RuntimeError('pending transaction TTL exceeds the bounded expiry-profile lifetime')
+  return ttl
+
+
+def expiry_profile_coordinator(client, key, identifier, container, image, checkpoint, runtime_facts):
+  """Prove a valid wallet proof is denied after the production pending TTL."""
+  ttl_seconds = transaction_ttl_seconds()
+  evidence = {'stage': 'started', 'ttl_seconds': ttl_seconds,
+      'wait_seconds': ttl_seconds + EXPIRY_WAIT_MARGIN_SECONDS,
+      'runtime_qualification_status': runtime_facts.get(
+          'runtime_qualification_status', 'open_runtime_facts_unavailable')}
+  checkpoint(evidence)
+  require(runtime_qualification_is_verified(runtime_facts),
+      'expiry runtime baseline and selected provider provenance are verified')
+  verifier = b64url(secrets.token_bytes(32))
+  query = urllib.parse.urlencode({
+      'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
+      'scope': 'openid', 'state': b64url(secrets.token_bytes(24)),
+      'nonce': b64url(secrets.token_bytes(24)),
+      'code_challenge': b64url(hashlib.sha256(verifier.encode('ascii')).digest()),
+      'code_challenge_method': 'S256',
+  })
+  login_http, _, login_page = client.request('GET',
+      f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
+  evidence['login_page_http'] = login_http
+  require(login_http == 200, 'expiry-profile Keycloak wallet login page', login_http)
+  parsed_page = login_page.decode('utf-8', errors='strict')
+  parser = LoginPageParser()
+  parser.feed(parsed_page)
+  locator = ''.join(parser.locator_parts).strip()
+  expected_prefix = (f'{IDP_ORIGIN}:{KC_PORT}/auth/realms/{REALM}/'
+      'decent-wallet-login/v1/transactions/')
+  require(locator.startswith(expected_prefix), 'expiry-profile provider-owned transaction locator')
+  status_match = re.search(r'const statusUrl = \"([^\"]+)\";', parsed_page)
+  require(status_match is not None, 'expiry-profile browser-bound status URL')
+  if status_match is None:
+    raise RuntimeError('expiry-profile browser-bound status URL is unavailable')
+  csrf_match = re.search(r'const csrfToken = \"([A-Za-z0-9_-]{43})\";', parsed_page)
+  require(csrf_match is not None, 'expiry-profile browser-bound status CSRF')
+  if csrf_match is None:
+    raise RuntimeError('expiry-profile browser-bound status CSRF is unavailable')
+  wallet = Client()
+  challenge_http, _, challenge_raw = wallet.request('GET', locator)
+  evidence['challenge_get_http'] = challenge_http
+  require(challenge_http == 200, 'expiry-profile pending challenge GET', challenge_http)
+  envelope = json.loads(challenge_raw)
+  require(set(envelope) == {'profile', 'challenge', 'csrf_token'}
+      and envelope['profile'] == 'decent-wallet-login-v1',
+      'expiry-profile challenge envelope')
+  signing_input = json.dumps({'challenge': envelope['challenge'],
+      'identity_id': identifier, 'profile': envelope['profile']},
+      ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode('utf-8')
+  with tempfile.TemporaryDirectory(prefix='wallet-expiry-signing-', dir=SCRATCH) as signing_dir:
+    payload = write_private_signing_input(Path(signing_dir), 'expiry-proof', signing_input)
+    try:
+      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key),
+          '-in', str(payload)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+          timeout=10, check=False)
+    finally:
+      payload.unlink(missing_ok=True)
+  require(signature.returncode == 0 and len(signature.stdout) == 64,
+      'expiry-profile valid Ed25519 proof signature')
+  proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
+      'identity_id': identifier, 'signature': b64url(signature.stdout)},
+      ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+  evidence['stage'] = 'transaction_created'
+  checkpoint(evidence)
+  time.sleep(evidence['wait_seconds'])
+  handle = urllib.parse.urlsplit(locator).path.rstrip('/').split('/')[-1]
+  cursor = time.time()
+  wallet_redirect_cursor = len(wallet.redirects)
+  client_redirect_cursor = len(client.redirects)
+  proof_http, proof_headers, proof_raw = wallet.request('POST', locator, proof,
+      {'Content-Type': 'application/json'})
+  evidence.update({'stage': 'expired_proof_submitted', 'proof_post_http': proof_http})
+  status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf_match.group(1)}
+  status_http, status_response_headers, status_raw = client.request('GET',
+      status_match.group(1), headers=status_headers)
+  evidence['status_http'] = status_http
+  try:
+    proof_body = json.loads(proof_raw) if proof_raw else {}
+  except (json.JSONDecodeError, UnicodeDecodeError):
+    proof_body = {}
+  try:
+    status_body = json.loads(status_raw) if status_raw else {}
+  except (json.JSONDecodeError, UnicodeDecodeError):
+    status_body = {}
+  locations = [proof_headers.get('Location', ''), status_response_headers.get('Location', '')]
+  redirect_records = (wallet.redirects[wallet_redirect_cursor:]
+      + client.redirects[client_redirect_cursor:])
+  response_body_safe = _expiry_body_is_safe(proof_raw) and _expiry_body_is_safe(status_raw)
+  location_safe = all(_expiry_location_is_safe(location) for location in locations)
+  redirects_safe = _expiry_redirects_are_safe(redirect_records)
+  no_authorization_code = (not _contains_key(proof_body, 'code')
+      and not _contains_key(status_body, 'code') and location_safe and redirects_safe)
+  no_accepted_receipt = (proof_http != 202 and not _has_accepted_result(proof_body)
+      and not _has_accepted_result(status_body) and location_safe and redirects_safe)
+  no_callback = (not _contains_key(proof_body, 'callback')
+      and not _contains_key(status_body, 'callback') and location_safe and redirects_safe)
+  if RUN_CID_DIR is None:
+    raise RuntimeError('expiry profile run-owned container directory is unavailable')
+  keycloak_cid = RUN_CID_DIR / 'keycloak.cid'
+  keycloak_id = _inspect_cid(keycloak_cid)
+  selected_provider = (_expiry_denial_signal(keycloak_id, cursor, handle,
+      runtime_facts.get('single_use_object_provider_ids', [])) if keycloak_id is not None else None)
+  request_correlated_denial = selected_provider is not None
+  if selected_provider is not None:
+    runtime_facts['single_use_object_provider_path'] = selected_provider
+    runtime_facts['runtime_qualification_status'] = (
+        'runtime_facts_verified' if runtime_qualification_is_verified(runtime_facts)
+        else 'open_runtime_facts_unavailable')
+  evidence.update({
+      'proof_denied': proof_http == 404,
+      'status_denied': status_http == 404,
+      'no_accepted_receipt': no_accepted_receipt,
+      'no_callback': no_callback,
+      'no_authorization_code': no_authorization_code,
+      'request_correlated_denial': request_correlated_denial,
+      'single_use_object_provider_path': runtime_facts.get(
+          'single_use_object_provider_path', 'unavailable'),
+      'runtime_qualification_status': runtime_facts.get(
+          'runtime_qualification_status', 'open_runtime_facts_unavailable'),
+      'response_body_safe': response_body_safe, 'location_safe': location_safe,
+      'redirects_safe': redirects_safe,
+  })
+  require(evidence['proof_denied'], 'expired valid proof is denied', proof_http)
+  require(evidence['status_denied'], 'expired transaction status is denied', status_http)
+  require(evidence['no_accepted_receipt'], 'expired proof created no accepted receipt')
+  require(evidence['no_callback'], 'expired transaction exposes no callback')
+  require(evidence['no_authorization_code'], 'expired transaction returned no OIDC authorization code')
+  require(evidence['request_correlated_denial'],
+      'expired proof has request-correlated production denial signal')
+
+  recovery_verifier = b64url(secrets.token_bytes(32))
+  recovery_query = urllib.parse.urlencode({
+      'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
+      'scope': 'openid', 'state': b64url(secrets.token_bytes(24)),
+      'nonce': b64url(secrets.token_bytes(24)),
+      'code_challenge': b64url(hashlib.sha256(recovery_verifier.encode('ascii')).digest()),
+      'code_challenge_method': 'S256',
+  })
+  fresh_login_http, _, fresh_login_page = client.request('GET',
+      f'/auth/realms/{REALM}/protocol/openid-connect/auth?{recovery_query}')
+  evidence.update({'stage': 'fresh_login_started', 'fresh_login_http': fresh_login_http})
+  checkpoint(evidence)
+  require(fresh_login_http == 200, 'new login required after transaction expiry', fresh_login_http)
+  fresh_page_text = fresh_login_page.decode('utf-8', errors='strict')
+  fresh_parser = LoginPageParser()
+  fresh_parser.feed(fresh_page_text)
+  fresh_locator = ''.join(fresh_parser.locator_parts).strip()
+  fresh_locator_distinct = (fresh_locator != locator and fresh_locator.startswith(expected_prefix))
+  evidence['fresh_locator_distinct'] = fresh_locator_distinct
+  checkpoint(evidence)
+  require(fresh_locator_distinct, 'expiry recovery starts a distinct fresh transaction')
+  fresh_csrf = re.search(r'const csrfToken = \"([A-Za-z0-9_-]{43})\";', fresh_page_text)
+  require(fresh_csrf is not None, 'fresh login status CSRF is available')
+  if fresh_csrf is None:
+    raise RuntimeError('fresh login status CSRF is unavailable')
+  fresh_wallet = Client()
+  fresh_challenge_http, _, fresh_challenge_raw = fresh_wallet.request('GET', fresh_locator)
+  try:
+    fresh_challenge = json.loads(fresh_challenge_raw) if fresh_challenge_raw else {}
+  except (json.JSONDecodeError, UnicodeDecodeError):
+    fresh_challenge = {}
+  fresh_challenge_valid = (isinstance(fresh_challenge, dict)
+      and set(fresh_challenge) == {'profile', 'challenge', 'csrf_token'}
+      and fresh_challenge.get('profile') == 'decent-wallet-login-v1'
+      and isinstance(fresh_challenge.get('challenge'), str)
+      and bool(fresh_challenge['challenge'])
+      and fresh_challenge.get('csrf_token') == fresh_csrf.group(1))
+  fresh_login_transaction_available = (fresh_challenge_http == 200
+      and fresh_locator_distinct and fresh_challenge_valid)
+  evidence.update({
+      'stage': 'fresh_login_verified', 'fresh_login_http': fresh_login_http,
+      'fresh_challenge_http': fresh_challenge_http,
+      'fresh_locator_distinct': fresh_locator_distinct,
+      'fresh_login_transaction_available': fresh_login_transaction_available,
+  })
+  checkpoint(evidence)
+  require(fresh_login_transaction_available,
+      'fresh transaction is available after expired login', fresh_challenge_http)
+  evidence['stage'] = 'complete'
+  checkpoint(evidence)
+  require(expiry_acceptance_passes(evidence), 'expiry profile acceptance gate')
+  return evidence
+
+
 def b64url(data):
   return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+
+def write_private_signing_input(parent, prefix, payload):
+  """Write short-lived challenge signing bytes without shared-temp exposure."""
+  parent = Path(parent)
+  parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  path = parent / (prefix + '-' + uuid.uuid4().hex + '.bin')
+  fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+  try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+      stream.write(payload)
+  except BaseException:
+    try:
+      os.close(fd)
+    except OSError:
+      pass
+    path.unlink(missing_ok=True)
+    raise
+  return path
 
 
 class LoginPageParser(html.parser.HTMLParser):
@@ -112,6 +1089,7 @@ class Client:
   def __init__(self):
     self.redirects = []
     self.privateClientAdminCredential: str | None = None
+    self.wallet_container_id: str | None = None
     self.opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(), LocalKeycloakRedirects())
     redirect_handler = next(handler for handler in self.opener.handlers
@@ -177,20 +1155,29 @@ def require(condition, stage, code=None):
     raise RuntimeError(f'acceptance probe failed at {stage}' + (f' (HTTP {code})' if code else ''))
 
 
-def start_registry(temp):
+def start_registry(temp, image, run_seconds=300):
   port = free_port()
   config = temp / 'registry.yaml'
+  datastore = temp / 'registry-lmdb'
+  datastore.mkdir(mode=0o700)
   config.write_text(
       f"network:\n  host: 127.0.0.1\n  port: {port}\n  bootstrap: []\n"
-      f"datastore:\n  path: {temp / 'registry-lmdb'}\nlogging:\n  verbosity: 0\n",
+      f"datastore:\n  path: {datastore}\nlogging:\n  verbosity: 0\n",
       encoding='utf-8')
+  container = f'wallet-login-registry-{uuid.uuid4().hex}'
+  cid_file = _cid_file('registry')
   node = None
   try:
-    node = subprocess.Popen(
-        [REGISTRY_CLI, '-v', 'node', '--config', str(config), '--run-seconds', '300'],
-        cwd=str(PROJECTS / 'decent-registry'), stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, bufsize=0)
-    require(node.stdout is not None, 'ephemeral Registry log stream is available')
+    _, container_id = start_owned_container(
+        ['podman', 'run', '--detach', '--cidfile', str(cid_file), '--user', '0', '--name', container, '--network', 'host',
+         '--volume', f'{config}:/tmp/registry.yaml:ro',
+         '--volume', f'{datastore}:{datastore}:rw', '--entrypoint',
+         '/opt/decent-resolver/bin/decent-registry', image,
+         '-v', 'node', '--config', '/tmp/registry.yaml', '--run-seconds', str(run_seconds)],
+        cid_file, timeout=30, stage='start packaged Registry')
+    node = subprocess.Popen(['podman', 'logs', '--follow', container_id],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    require(node.stdout is not None, 'packaged Registry log stream is available')
     bootstrap = None
     output = bytearray()
     deadline = time.monotonic() + 25
@@ -206,22 +1193,67 @@ def start_registry(temp):
         break
       if node.poll() is not None:
         break
-    require(bootstrap is not None, 'ephemeral Registry bootstrap startup')
+    if bootstrap is None:
+      process_state = 'exited' if node.poll() is not None else 'timeout'
+      output_categories = []
+      for line in output.decode('utf-8', errors='replace').splitlines():
+        if len(output_categories) == 8:
+          break
+        output_categories.append('bootstrap-marker' if '[BOOTSTRAP]' in line else 'other-log-line')
+      print('registry-startup-diagnostics:', json.dumps({
+          'process_state': process_state, 'output_categories': output_categories}, sort_keys=True))
+    require(bootstrap is not None, 'ephemeral packaged Registry startup')
     return node, bootstrap, port
   except BaseException:
-    stop_registry(node)
+    stop_registry(node, container)
     raise
 
 
-def stop_registry(node):
-  if node is None or node.poll() is not None:
-    return
-  node.terminate()
-  try:
-    node.wait(timeout=8)
-  except subprocess.TimeoutExpired:
-    node.kill()
-    node.wait(timeout=5)
+def start_resolver_tools(temp, image, lifetime=300):
+  container = f'wallet-login-resolver-tools-{uuid.uuid4().hex}'
+  temp = Path(temp)
+  cid_file = _cid_file('resolver-tools')
+  _, container_id = start_owned_container(['podman', 'run', '--detach', '--cidfile', str(cid_file),
+      '--user', '0', '--name', container, '--network', 'host', '--volume', f'{temp}:{temp}:rw',
+      '--entrypoint', '/bin/sh', image, '-lc', f'sleep {int(lifetime)}'],
+      cid_file, timeout=30, stage='start pinned resolver tools container')
+  os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = container_id
+  return container_id
+
+
+def run_image_resolver(container, args, timeout=45, image=None):
+  if image is None:
+    image = IMAGE
+  if image is None:
+    raise RuntimeError('immutable resolver image is required')
+  return run(['podman', 'exec', container,
+      '/usr/bin/env', '-i', 'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
+      RESOLVER_WRAPPER, *args], timeout=timeout)
+
+
+def run_image_registry(container, args, timeout=45, image=None):
+  if image is None:
+    image = IMAGE
+  if image is None:
+    raise RuntimeError('immutable resolver image is required')
+  return run(['podman', 'exec', container,
+      '/usr/bin/env', '-i', 'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
+      '/opt/decent-resolver/bin/decent-registry', *args], timeout=timeout)
+
+
+def stop_resolver_tools(container):
+  del container
+
+
+def stop_registry(node, container):
+  del container
+  if node is not None and node.poll() is None:
+    node.terminate()
+    try:
+      node.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+      node.kill()
+      node.wait(timeout=5)
 
 
 def identity_lookup_category(line):
@@ -260,7 +1292,7 @@ def identity_lookup_category(line):
   return 'other'
 
 
-def classify_identity_lookup(stdout, exit_code):
+def classify_identity_lookup(stdout, exit_code, expected_identifier=None):
   def category(line):
     if line == 'not found':
       return 'not_found'
@@ -287,39 +1319,86 @@ def classify_identity_lookup(stdout, exit_code):
       return 'peer_status' if value and not any(character.isspace() for character in value) else 'other'
     if line.startswith('Failed to send request to peer: ') or line.startswith('Failed to connect to peer: '):
       return 'peer_error'
-    if line.startswith('{') or line.startswith('  \"') or line.startswith('    \"') or line.strip() == '}':
+    if line.startswith('history unavailable:'):
+      return 'history_unavailable'
+    if line.startswith('Traceback') or line.startswith('File ') or 'Error:' in line:
+      return 'traceback'
+    if line.startswith('{') or (line.strip().startswith('"') and ':' in line) or line.strip() == '}':
       return 'json'
     return 'other'
   lines = stdout.splitlines()
   categories = [category(line.strip()) for line in lines if line.strip()]
-  json_lines = []
-  json_started = False
-  json_ended = False
-  for line in lines:
-    if not json_started:
-      if line.strip() == '{':
-        json_started = True
-        json_lines.append(line)
-      continue
-    if json_ended:
-      continue
-    json_lines.append(line)
-    if line.strip() == '}':
-      json_ended = True
+  peer_handshake_or_error = any(category in {'peer_handshake', 'peer_error'} for category in categories)
+  if peer_handshake_or_error:
+    return 'unavailable', categories
+  json_start = next((index for index, line in enumerate(lines)
+      if line.strip().startswith('{')), None)
+  if any(category in {'traceback', 'history_unavailable'} for category in categories):
+    return 'unavailable', categories
+  if json_start is not None:
+    json_end = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(json_start, len(lines)):
+      for character in lines[index]:
+        if in_string:
+          if escaped:
+            escaped = False
+          elif character == '\\':
+            escaped = True
+          elif character == '"':
+            in_string = False
+        elif character == '"':
+          in_string = True
+        elif character == '{':
+          depth += 1
+        elif character == '}':
+          depth -= 1
+          if depth < 0:
+            return 'unavailable', categories
+      if depth == 0 and not in_string:
+        json_end = index
+        break
+    if json_end is None or exit_code != 0:
+      return 'unavailable', categories
+    for index, line in enumerate(lines):
+      if index < json_start or index > json_end:
+        if line.strip() and identity_lookup_category(line.strip()) not in {
+            'dial_warning', 'registry_miss', 'peer_status'}:
+          return 'unavailable', categories
+    if any(category in {'registry_miss', 'not_found'} for category in categories):
+      return 'unavailable', categories
+    return 'resolved', categories
+  if peer_handshake_or_error:
+    return 'unavailable', categories
   explicit_terminal_miss = exit_code == 1 and categories[-1:] == ['not_found']
   absence_only = explicit_terminal_miss and all(
-      item in ('registry_miss', 'dial_warning', 'not_found') for item in categories)
+      item in ('registry_miss', 'not_found') for item in categories)
+  if expected_identifier is None:
+    absence_only = False
+  if (exit_code == 1 and explicit_terminal_miss and absence_only
+      and expected_identifier is not None):
+    expected_key = hashlib.sha256(expected_identifier.encode('utf-8')).hexdigest()
+    expected_miss = 'Value not found for key /decent-registry/identity/' + expected_key
+    registry_miss_lines = [line.strip() for line in lines
+        if line.strip().startswith('Value not found for key /decent-registry/identity/')]
+    absence_only = absence_only and bool(registry_miss_lines) and all(
+        line == expected_miss for line in registry_miss_lines)
+    matching_miss = any(line.strip() == expected_miss for line in lines)
+    absence_only = absence_only and matching_miss
   return ('not_found' if absence_only else 'unavailable'), categories
 
 
 def parse_exact_identity_result(stdout, identifier):
   lines = stdout.splitlines()
   result_start = None
+  diagnostics = []
   recognized_diagnostics = {'dial_warning', 'registry_miss', 'peer_handshake', 'peer_error', 'peer_status'}
   def json_structural(line):
     stripped = line.strip()
-    return (stripped in ('{', '}', '},', '[', '],') or stripped.endswith((' {', ' [', '{', '['))
-        or line.startswith('  \"') or line.startswith('    \"'))
+    return (stripped.startswith(('"', '{')) or stripped in ('}', '},', '[', '],')
+        or stripped.endswith((' {', ' [', '{', '[')))
   for index, line in enumerate(lines):
     if line.strip().startswith('{'):
       category = 'json_start'
@@ -332,7 +1411,10 @@ def parse_exact_identity_result(stdout, identifier):
     if category == 'json_start':
       result_start = index
       break
-    if category not in recognized_diagnostics and not json_structural(line):
+    if category in recognized_diagnostics:
+      diagnostics.append(category)
+      continue
+    if not json_structural(line):
       return None
   if result_start is None:
     return None
@@ -363,9 +1445,18 @@ def parse_exact_identity_result(stdout, identifier):
   if result_end is None:
     return None
   for line in lines[result_end + 1:]:
-    if line.strip() and identity_lookup_category(line.strip()) not in recognized_diagnostics and not json_structural(line):
+    if not line.strip():
+      continue
+    category = identity_lookup_category(line.strip())
+    if category in recognized_diagnostics:
+      diagnostics.append(category)
+      continue
+    if not json_structural(line):
       return None
-  if not any(line.strip().startswith('"identifier"') for line in lines[result_start:result_end + 1]):
+  if not any('"identifier"' in line and ':' in line
+      for line in lines[result_start:result_end + 1]):
+    return None
+  if any(category in {'peer_handshake', 'peer_error'} for category in diagnostics):
     return None
   def unique_object(pairs):
     result = {}
@@ -396,86 +1487,134 @@ def parse_exact_identity_result(stdout, identifier):
   return result
 
 
+def packaged_resolver_readback(stdout, exit_code, identifier, expected_public_key_hex):
+  if exit_code != 0:
+    return False
+  outcome, _ = classify_identity_lookup(stdout, exit_code)
+  if outcome != 'resolved':
+    return False
+  result = parse_exact_identity_result(stdout, identifier)
+  return result is not None and result.get('owner_public_key_hex', '').lower() == expected_public_key_hex.lower()
+
+
+def json_object_is_balanced(stdout):
+  if not isinstance(stdout, str):
+    return False
+  lines = stdout.splitlines()
+  json_start = next((index for index, line in enumerate(lines)
+      if line.strip().startswith('{')), None)
+  if json_start is None:
+    return False
+  depth = 0
+  in_string = False
+  escaped = False
+  json_end = None
+  for index in range(json_start, len(lines)):
+    for character in lines[index]:
+      if in_string:
+        if escaped:
+          escaped = False
+        elif character == '\\':
+          escaped = True
+        elif character == '"':
+          in_string = False
+      elif character == '"':
+        in_string = True
+      elif character == '{':
+        depth += 1
+      elif character == '}':
+        depth -= 1
+        if depth < 0:
+          return False
+    if depth == 0 and not in_string:
+      json_end = index
+      break
+  if json_end is None:
+    return False
+  try:
+    json.loads('\n'.join(lines[json_start:json_end + 1]))
+  except (json.JSONDecodeError, TypeError):
+    return False
+  return True
+
+
+def classify_and_parse_result(stdout, exit_code, identifier, expected_public_key_hex):
+  outcome, categories = classify_identity_lookup(stdout, exit_code, identifier)
+  exact = packaged_resolver_readback(stdout, exit_code, identifier, expected_public_key_hex)
+  return ('resolved' if outcome == 'resolved' and exact else 'unavailable', exact, categories)
+
+
 def exact_registry_lookup_succeeded(stdout, exit_code, identifier):
-  return exit_code == 0 and parse_exact_identity_result(stdout, identifier) is not None
+  outcome, _ = classify_identity_lookup(stdout, exit_code, identifier)
+  return outcome == 'resolved' and parse_exact_identity_result(stdout, identifier) is not None
 
 
 def exact_registry_lookup_outcome(stdout, exit_code, identifier):
   if exact_registry_lookup_succeeded(stdout, exit_code, identifier):
     return 'resolved'
-  resolution, _ = classify_identity_lookup(stdout, exit_code)
+  resolution, _ = classify_identity_lookup(stdout, exit_code, identifier)
   return 'not_found' if resolution == 'not_found' else 'unavailable'
 
 
-def generate_owner_key(temp, label):
+def generate_owner_key(temp, label, image):
   key = temp / (label + '-identity.pem')
-  generated = run([REGISTRY_CLI, 'keygen', '--output', str(key)])
+  key_in_container = str(key)
+  generated = run_image_registry(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+      ['keygen', '--output', key_in_container], image=image)
   require(generated.returncode == 0 and key.exists(), 'successor owner-key generation')
   return key
 
 
-def write_identity(temp, bootstrap, label='wallet-login-e2e'):
-  key = generate_owner_key(temp, label)
+def write_identity(temp, bootstrap, image, label='wallet-login-e2e'):
+  key = generate_owner_key(temp, label, image)
   identifier = label + '-' + uuid.uuid4().hex + '@example.invalid'
-
-  runtime = temp / 'runtime'
-  runtime.mkdir(mode=0o755, exist_ok=True)
-  wrapper = runtime / 'decent-identity-wrapper'
-  wrapper.write_text(
-      '#!/bin/sh\n'
-      f'export PYTHONPATH={IDENTITY_SOURCE}\n'
-      'if [ -d /opt/kc-lib ]; then export LD_LIBRARY_PATH=/opt/kc-lib; fi\n'
-      f"exec {REGISTRY_VENV}/bin/python "
-      "-c 'from decent_identity.cli import main; main()' \"$@\"\n",
-      encoding='utf-8')
-  wrapper.chmod(0o755)
-  put_env = os.environ.copy()
-  put_env['PYTHONPATH'] = IDENTITY_SOURCE
-  put = run([str(wrapper), 'put', '--identifier', identifier,
+  pub = subprocess.run(['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'],
+      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+  require(pub.returncode == 0 and len(pub.stdout) >= 32, 'extract test public key')
+  expected_public_key_hex = pub.stdout[-32:].hex()
+  put = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'], ['put', '--identifier', identifier,
              '--owner-privkey', str(key), '--seq', '1', '--host', '127.0.0.1',
-             '--port', str(free_port()), '--bootstrap', bootstrap],
-            timeout=60, env=put_env)
+             '--port', str(free_port()), '--bootstrap', bootstrap], timeout=60, image=image)
   require(put.returncode == 0, 'publish test identity to ephemeral Registry')
   observed = False
   for _ in range(10):
-    lookup = run([str(wrapper), 'get', '--identifier', identifier,
+    lookup = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'], ['get', '--identifier', identifier,
                   '--host', '127.0.0.1', '--port', str(free_port()),
-                  '--bootstrap', bootstrap], timeout=25, env=put_env)
+                  '--bootstrap', bootstrap], timeout=25, image=image)
     if lookup.returncode == 0 and '"identifier"' in lookup.stdout:
       observed = True
       break
     time.sleep(1)
   require(observed, 'separate client Registry read-back')
-  return key, wrapper, identifier
+  lookup = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'], ['get', '--identifier', identifier,
+                '--host', '127.0.0.1', '--port', str(free_port()),
+                '--bootstrap', bootstrap], timeout=25, image=image)
+  require(packaged_resolver_readback(lookup.stdout, lookup.returncode, identifier, expected_public_key_hex),
+      'pinned Registry resolver returns exact Identity ID and current owner key')
+  return key, Path(RESOLVER_WRAPPER), identifier
 
 
-def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap):
+def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, image):
   check = run(['ss', '-ltn', f'( sport = :{KC_PORT} )'], timeout=5)
   require('LISTEN' not in check.stdout, 'disposable Keycloak port available')
   env_fd, env_path = tempfile.mkstemp(prefix='wallet-login-admin-', suffix='.env', dir=SCRATCH)
   env_file = Path(env_path)
+  cid_file = _cid_file('keycloak')
   try:
     os.fchmod(env_fd, 0o600)
     with os.fdopen(env_fd, 'w', encoding='utf-8') as env_stream:
       env_stream.write('KC_BOOTSTRAP_ADMIN_PASSWORD=' + password + '\n')
     cmd = [
-        'podman', 'run', '--detach', '--rm', '--name', container, '--network', 'host',
+        'podman', 'run', '--detach', '--cidfile', str(cid_file), '--name', container, '--network', 'host',
         '--env-file', str(env_file),
         '--env', 'KC_BOOTSTRAP_ADMIN_USERNAME=wallet-admin',
-        '--env', 'LD_LIBRARY_PATH=/opt/kc-lib',
-        '--volume', f'{IDENTITY_VENV}:{IDENTITY_VENV}:ro',
-        '--volume', f'{REGISTRY_VENV}:{REGISTRY_VENV}:ro',
-        '--volume', f'{UV_PYTHON}:{UV_PYTHON}:ro',
-        '--volume', f'{IDENTITY_SOURCE}:{IDENTITY_SOURCE}:ro',
-        '--volume', f'{PROJECTS / 'decent-registry/src'}:{PROJECTS / 'decent-registry/src'}:ro',
-        '--volume', f'{KC_LIB}:/opt/kc-lib:ro',
-        '--volume', f'{wrapper_path.parent}:/opt/wallet-login-live-it:ro',
-        IMAGE, 'start-dev', '--http-enabled=true', f'--http-port={KC_PORT}',
+        image, 'start-dev', '--http-enabled=true', f'--http-port={KC_PORT}',
         '--http-relative-path=/auth', f'--hostname=https://idp.example:{KC_PORT}/auth',
-        '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1', '--db=dev-file',
-        '--log-level=org.keycloak.authentication:DEBUG,org.keycloak.services:DEBUG,org.decentwallet.keycloak.wallet:DEBUG'
+        '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1', '--db=dev-file', '--cache=local',
+        '--log-level=org.decentwallet.keycloak.wallet:DEBUG'
     ]
-    started = run(cmd, timeout=40)
+    started, container_id = start_owned_container(
+        cmd, cid_file, timeout=40, stage='start disposable Keycloak')
   finally:
     env_file.unlink(missing_ok=True)
   if started.returncode != 0:
@@ -484,6 +1623,7 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap):
     raise RuntimeError("Keycloak start returned no result")
   client = Client()
   client.privateClientAdminCredential = password
+  client.wallet_container_id = container_id
   discovery = None
   last_connection_error = None
   for _ in range(90):
@@ -498,7 +1638,7 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap):
       break
     time.sleep(1)
   if discovery is None:
-    logs = run(['podman', 'logs', '--tail', '80', container], timeout=15)
+    logs = run(['podman', 'logs', '--tail', '80', container_id], timeout=15)
     for line in logs.stdout.splitlines():
       if any(word in line.lower() for word in ('error', 'exception', 'failed', 'listening', 'started')):
         print('keycloak-log:', line[:500])
@@ -624,7 +1764,7 @@ def configure_realm(client, token, identifier, resolver_port, wrapper_path, boot
           'decent.wallet.site-name': 'Example Wallet Demo Site',
           'decent.wallet.registry.bootstrap': bootstrap,
           'decent.wallet.registry.client-port': str(resolver_port),
-          'decent.wallet.identity.executable': '/opt/wallet-login-live-it/' + wrapper_path.name,
+          'decent.wallet.identity.executable': RESOLVER_WRAPPER,
           'decent.wallet.idp-origin': f'https://idp.example:{KC_PORT}',
       },
       'clients': [{
@@ -757,7 +1897,7 @@ def verify_id_token(client, token, temp):
   return json.loads(decode(payload_segment))
 
 
-def auth_flow(client, key, identifier, container):
+def auth_flow(client, key, identifier, container, image):
   verifier = b64url(secrets.token_bytes(32))
   challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
@@ -824,12 +1964,16 @@ def auth_flow(client, key, identifier, container):
   pub = subprocess.run(['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'],
       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
   require(pub.returncode == 0 and len(pub.stdout) >= 32, 'extract test public key')
+  expected_public_key_hex = pub.stdout[-32:].hex()
   signed = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
       'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode()
-  payload = key.parent / 'signing-input.json'
-  payload.write_bytes(signed)
-  sig = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key), '-in', str(payload)],
-      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+  with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=key.parent) as signing_dir:
+    payload = write_private_signing_input(signing_dir, 'proof', signed)
+    try:
+      sig = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key), '-in', str(payload)],
+          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+    finally:
+      payload.unlink(missing_ok=True)
   require(sig.returncode == 0 and len(sig.stdout) == 64, 'Ed25519 RFC8785 proof signature')
   proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identifier, 'signature': b64url(sig.stdout)},
@@ -928,7 +2072,7 @@ def require_transport_security_headers(headers, stage, *, expect_no_store=True):
       stage + ' varies by Origin')
 
 
-def browser_preflight_flow():
+def browser_preflight_flow(image):
   browser = Client()
   query = urllib.parse.urlencode({
       'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
@@ -1052,7 +2196,7 @@ def browser_preflight_flow():
       'pending_after_negative_http': status, 'credentialed': False}
 
 
-def negative_proof_flow(identifier):
+def negative_proof_flow(identifier, image):
   browser = Client()
   verifier = b64url(secrets.token_bytes(32))
   code_challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
@@ -1106,7 +2250,7 @@ def negative_proof_flow(identifier):
       'no_acceptance_or_callback': True}
 
 
-def invalid_proof_throttle_flow():
+def invalid_proof_throttle_flow(image):
   browser = Client()
   query = urllib.parse.urlencode({
       'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
@@ -1159,7 +2303,7 @@ def invalid_proof_throttle_flow():
       'four_malformed_proofs_http': malformed_results,
       'http_after_five_invalid_attempts': throttled, 'no_acceptance_or_callback': True}
 
-def account_mapping_denial_flow(client, key, identity_id, scenario, container, resolver_port, bootstrap, wrapper_path_name):
+def account_mapping_denial_flow(client, key, identity_id, scenario, container, resolver_port, bootstrap, wrapper_path_name, image):
   token = admin_token(client, AdminPassword(client.privateClientAdminCredential))
   browser = Client()
   poll_browser = browser
@@ -1191,19 +2335,21 @@ def account_mapping_denial_flow(client, key, identity_id, scenario, container, r
       'challenge': envelope['challenge'], 'identity_id': identity_id,
       'profile': envelope['profile'],
   }, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode('utf-8')
-  payload = key.parent / (scenario + '-signing-input.json')
-  payload.write_bytes(signing_input)
-  signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key),
-      '-in', str(payload)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+  with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=key.parent) as signing_dir:
+    payload = write_private_signing_input(signing_dir, scenario, signing_input)
+    try:
+      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key),
+          '-in', str(payload)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+    finally:
+      payload.unlink(missing_ok=True)
   require(signature.returncode == 0 and len(signature.stdout) == 64,
       f'sign valid proof for {scenario} Registry identity')
   direct_started = time.monotonic()
   registry_lookup_outcome = 'unavailable'
   try:
-    direct_probe = run(['podman', 'exec', container, '/usr/bin/env', '-i',
-        'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
-        '/opt/wallet-login-live-it/' + wrapper_path_name, 'get', '--identifier', identity_id,
-        '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20)
+    direct_probe = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+        ['get', '--identifier', identity_id,
+        '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20, image=image)
     registry_lookup_outcome = exact_registry_lookup_outcome(
         direct_probe.stdout, direct_probe.returncode, identity_id)
     if registry_lookup_outcome == 'resolved':
@@ -1344,8 +2490,70 @@ def account_policy_denial_is_attributed(result):
       and result.get('no_acceptance_or_callback') is True)
 
 
+def run_bounded_resolver_attempts(attempt, max_attempts=3, *, retry_status=503,
+    can_retry=lambda: True, retry_delay_seconds=0.0):
+  if type(max_attempts) is not int or not 1 <= max_attempts <= 5:
+    raise ValueError('resolver retry count must be between one and five')
+  if type(retry_status) is not int or not 100 <= retry_status <= 599:
+    raise ValueError('retry status must be an HTTP status')
+  if not callable(can_retry):
+    raise ValueError('retry state predicate must be callable')
+  if not isinstance(retry_delay_seconds, (int, float)) or not 0 <= retry_delay_seconds <= 5:
+    raise ValueError('retry delay must be between zero and five seconds')
+  outcomes = []
+  for attempt_number in range(max_attempts):
+    status = attempt()
+    outcomes.append(status)
+    if status != retry_status or attempt_number + 1 >= max_attempts:
+      break
+    if not can_retry():
+      break
+    if retry_delay_seconds:
+      time.sleep(retry_delay_seconds)
+  return outcomes
+
+
+
+
+def rotation_readback_samples(identifier, expected_public_key_hex, configured_port,
+    lookup_at_port, fresh_port, progress):
+  samples = []
+  resolved = False
+  for _ in range(3):
+    for strategy in ('configured', 'ephemeral'):
+      port = configured_port
+      if strategy == 'ephemeral':
+        port = fresh_port()
+        if port == configured_port:
+          port = fresh_port()
+        require(port != configured_port, 'ephemeral resolver port differs from configured port')
+      started = time.monotonic()
+      lookup = lookup_at_port(port)
+      lookup_ms = int((time.monotonic() - started) * 1000)
+      outcome, categories = classify_identity_lookup(lookup.stdout, lookup.returncode, identifier)
+      lookup_ms = int((time.monotonic() - started) * 1000)
+      exact = packaged_resolver_readback(
+          lookup.stdout, lookup.returncode, identifier, expected_public_key_hex)
+      if exact:
+        outcome = 'resolved'
+        resolved = True
+      elif outcome == 'resolved':
+        outcome = 'unavailable'
+      samples.append({
+          'outcome': outcome,
+          'lookup_ms': lookup_ms,
+          'peer_handshake': 'peer_handshake' in categories,
+          'unexpected_diagnostic': any(category == 'other' for category in categories),
+          'diagnostic_categories': categories[:12],
+          'json_balanced': json_object_is_balanced(lookup.stdout),
+          'exact_identity_and_successor_match': exact,
+          'port_strategy': strategy,
+      })
+      progress(samples)
+  return samples, resolved
+
 def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
-    resolver_port, bootstrap, wrapper_name):
+    resolver_port, bootstrap, wrapper_name, progress, image, rotation_root):
   def start_rotation_transaction():
     fresh_browser = Client()
     verifier = b64url(secrets.token_bytes(32))
@@ -1383,14 +2591,14 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
     signing_input = json.dumps({'challenge': proof_envelope['challenge'],
         'identity_id': identifier, 'profile': proof_envelope['profile']},
         ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode('utf-8')
-    payload = Path(SCRATCH) / f'wallet-login-{label}-{uuid.uuid4().hex}.json'
-    payload.write_bytes(signing_input)
-    try:
-      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin',
-          '-inkey', str(key), '-in', str(payload)], stdout=subprocess.PIPE,
-          stderr=subprocess.PIPE, timeout=10, check=False)
-    finally:
-      payload.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=rotation_root) as signing_dir:
+      payload = write_private_signing_input(signing_dir, label, signing_input)
+      try:
+        signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin',
+            '-inkey', str(key), '-in', str(payload)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10, check=False)
+      finally:
+        payload.unlink(missing_ok=True)
     require(signature.returncode == 0 and len(signature.stdout) == 64,
         f'{label} Ed25519 proof signature')
     proof = json.dumps({'profile': proof_envelope['profile'],
@@ -1405,26 +2613,31 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
 
   project = Path(__file__).parents[1]
   helper = project / 'scripts/rotation_registry_roundtrip.py'
-  require(helper.is_file(), 'rotation helper script exists')
-  helper_env = os.environ.copy()
-  helper_env['PYTHONPATH'] = os.pathsep.join((
-      str(PROJECTS / 'decent-registry/src'),
-      str(IDENTITY_SOURCE),
-      str(PROJECTS / 'decent-registry/.venv/lib/python3.13/site-packages'),
-  ))
-  with tempfile.TemporaryDirectory(prefix='wallet-rotation-', dir=SCRATCH) as rotation_temp:
+  require(helper.is_file(), 'rotation helper source exists before packaged execution')
+  with tempfile.TemporaryDirectory(prefix='wallet-rotation-', dir=rotation_root) as rotation_temp:
     rotation_dir = Path(rotation_temp)
+    rotation_in_tools = rotation_dir
+    old_key_in_tools = old_key
+    new_key_in_tools = new_key
+    envelope_path = rotation_in_tools / 'rotation-envelope.cbor'
+    readback_path = rotation_in_tools / 'rotation-readback.txt'
+    completed = run(['podman', 'exec', os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+        '/usr/bin/env', '-i', 'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
+        'PYTHONPATH=/opt/decent-resolver/registry-src/src:/opt/decent-resolver/identity-src/src:'
+        '/opt/decent-resolver/venv/lib64/python3.11/site-packages:/opt/decent-resolver/venv/lib/python3.11/site-packages',
+        'LD_LIBRARY_PATH=/opt/decent-resolver/lib', '/usr/bin/python3.11',
+        '/opt/decent-resolver/rotation_registry_roundtrip.py',
+        '--identifier', identifier, '--old-key', str(old_key_in_tools),
+        '--new-key', str(new_key_in_tools), '--host', '127.0.0.1',
+        '--port', str(free_port()), '--bootstrap', bootstrap,
+        '--datastore', str(rotation_in_tools / 'writer-lmdb'),
+        '--envelope', str(envelope_path), '--readback', str(readback_path)], timeout=60)
+    progress('publish', {'rotation_publish': 'passed' if completed.returncode == 0 else 'failed'})
+    require(completed.returncode == 0, 'packaged Registry owner-key rotation', completed.returncode)
     envelope_path = rotation_dir / 'rotation-envelope.cbor'
     readback_path = rotation_dir / 'rotation-readback.txt'
-    completed = subprocess.run([
-        str(PROJECTS / 'decent-registry/.venv/bin/python'), str(helper),
-        '--identifier', identifier, '--old-key', str(old_key), '--new-key', str(new_key),
-        '--host', '127.0.0.1', '--port', str(free_port()), '--bootstrap', bootstrap,
-        '--datastore', str(rotation_dir / 'writer-lmdb'),
-        '--envelope', str(envelope_path), '--readback', str(readback_path),
-    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, env=helper_env, check=False)
-    require(completed.returncode == 0 and envelope_path.is_file() and readback_path.is_file(),
-        'publish finalized owner-key rotation and independent resolver read-back', completed.returncode)
+    require(envelope_path.is_file() and readback_path.is_file(),
+        'packaged rotation outputs visible in scratch mount')
     expected_key = subprocess.run(['openssl', 'pkey', '-in', str(new_key),
         '-pubout', '-outform', 'DER'], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, timeout=10, check=False)
@@ -1434,39 +2647,68 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
     require(len(readback) == 2 and readback[0] == '2'
         and readback[1] == expected_key.stdout[-32:].hex(),
         'separate Identity resolver confirms seq 2 and exact successor key')
-    provider_lookup = run(['podman', 'exec', container, '/usr/bin/env', '-i',
-        'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
-        'LD_LIBRARY_PATH=/opt/kc-lib',
-        '/opt/wallet-login-live-it/' + wrapper_name, 'get', '--identifier', identifier,
-        '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=30)
-    provider_categories = classify_identity_lookup(provider_lookup.stdout, provider_lookup.returncode)[1]
+    progress('readback', {'rotation_publish': 'read_back_exact', 'current_sequence': 2})
+    provider_lookup = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+        ['get', '--identifier', identifier, '--host', '127.0.0.1',
+         '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=30, image=image)
+    provider_categories = classify_identity_lookup(
+        provider_lookup.stdout, provider_lookup.returncode, identifier)[1]
     require(provider_lookup.returncode == 0 and '"identifier"' in provider_lookup.stdout,
         'production-container resolver reads the rotated Identity', provider_lookup.returncode)
-    resolver_java = run(['podman', 'exec', container, '/bin/sh', '-lc',
-        'ls -l /opt/keycloak/providers/*wallet* /opt/keycloak/providers/*identity*; ls -l /usr/local/bin /usr/bin | head'], timeout=10)
-    print('resolver-runtime-files:', resolver_java.stdout[:500])
-    print('rotated-provider-resolver-precheck:', json.dumps({
-        'exit': provider_lookup.returncode, 'categories': provider_categories}))
-    safe_output = []
-    for line in provider_lookup.stdout.splitlines():
-      category = identity_lookup_category(line)
-      if category in ('peer_status', 'dial_warning', 'registry_miss', 'peer_handshake', 'peer_error', 'history_unavailable'):
-        safe_output.append(category)
-      elif category == 'json':
-        safe_output.append('json-line')
-      elif line.strip():
-        safe_output.append('unclassified-line')
-      if len(safe_output) >= 40:
-        break
-    print('rotated-provider-resolver-output-shape:', json.dumps(safe_output))
 
-  stale_key_status = submit_signed(old_key, 'rotated-stale-key', envelope, locator,
-      rotation_browser, rotation_csrf)
+  resolver_samples, resolved_fresh_read = rotation_readback_samples(
+      identifier,
+      expected_key.stdout[-32:].hex(),
+      resolver_port,
+      lambda port: run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+          ['get', '--identifier', identifier, '--host', '127.0.0.1',
+           '--port', str(port), '--bootstrap', bootstrap], timeout=30, image=image),
+      free_port,
+      lambda samples: progress('readback', {
+          'rotation_publish': 'read_back_exact', 'current_sequence': 2,
+          'resolver_samples': samples}),
+  )
+  progress('readback', {'rotation_publish': 'read_back_exact', 'current_sequence': 2,
+      'resolver_samples': resolver_samples})
+  require(resolved_fresh_read,
+      'at least one fresh production-container read confirms the exact successor key before proofs',
+      'unavailable')
+  progress('stale_proof_pending', {})
+  stale_retry_status = []
+  def stale_attempt():
+    observed_status = submit_signed(old_key, 'rotated-stale-key', envelope, locator,
+        rotation_browser, rotation_csrf)
+    pending_status = None
+    if observed_status == 503:
+      status_code, _, status_body = rotation_browser.request('GET', rotation_status_url,
+          headers={'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+              'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': rotation_csrf})
+      status_payload = None
+      if status_code == 200:
+        try:
+          status_payload = json.loads(status_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+          pass
+      pending_status = {'status_http': status_code,
+          'status_pending': status_payload == {'status': 'pending'}}
+    stale_retry_status.append(pending_status)
+    return observed_status
+  stale_attempts = run_bounded_resolver_attempts(stale_attempt, max_attempts=3,
+      retry_status=503, can_retry=lambda: stale_retry_status[-1] is not None
+          and stale_retry_status[-1]['status_pending'], retry_delay_seconds=1)
+  for attempt_number, observed_status in enumerate(stale_attempts, start=1):
+    progress('stale_attempt', {'attempt_number': attempt_number,
+        'stale_key_proof_http': observed_status,
+        **(stale_retry_status[attempt_number - 1] or {})})
+  stale_key_status = stale_attempts[-1]
+  progress('stale_proof', {'stale_key_proof_http': stale_key_status})
   require(stale_key_status == 401, 'proof signed by pre-rotation owner is rejected', stale_key_status)
   stale_poll_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': rotation_csrf}
   stale_status, _, stale_body = rotation_browser.request('GET', rotation_status_url,
       headers=stale_poll_headers)
+  progress('stale_pending', {'stale_transaction_remains_pending':
+      stale_status == 200 and json.loads(stale_body) == {'status': 'pending'}})
   require(stale_status == 200 and json.loads(stale_body) == {'status': 'pending'},
       'stale-key rejection leaves its transaction pending without callback')
 
@@ -1486,13 +2728,41 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
   challenge_status, _, challenge_body = wallet.request('GET', current_locator)
   require(challenge_status == 200, 'fresh current-key wallet challenge')
   envelope = json.loads(challenge_body)
-  current_key_status = submit_signed(new_key, 'rotated-current-key', envelope, current_locator,
-      current_browser, current_csrf)
+  current_retry_status = []
+  def current_attempt():
+    observed_status = submit_signed(new_key, 'rotated-current-key', envelope,
+        current_locator, current_browser, current_csrf)
+    pending_status = None
+    if observed_status == 503:
+      status_code, _, status_body = current_browser.request('GET', current_status_url,
+          headers={'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+              'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': current_csrf})
+      status_payload = None
+      if status_code == 200:
+        try:
+          status_payload = json.loads(status_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+          pass
+      pending_status = {'status_http': status_code,
+          'status_pending': status_payload == {'status': 'pending'}}
+    current_retry_status.append(pending_status)
+    return observed_status
+  current_attempts = run_bounded_resolver_attempts(current_attempt, max_attempts=3,
+      retry_status=503, can_retry=lambda: current_retry_status[-1] is not None
+          and current_retry_status[-1]['status_pending'], retry_delay_seconds=1)
+  for attempt_number, observed_status in enumerate(current_attempts, start=1):
+    progress('current_attempt', {'attempt_number': attempt_number,
+        'current_key_proof_http': observed_status,
+        **(current_retry_status[attempt_number - 1] or {})})
+    progress('current_proof', {'current_key_proof_http': observed_status})
+    if observed_status == 202 or observed_status != 503:
+      break
+  current_key_status = current_attempts[-1]
+  progress('current_proof', {'current_key_proof_http': current_key_status})
   if current_key_status != 202:
-    diagnostic = run(['podman', 'exec', container, '/usr/bin/env', '-i',
-        'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8', 'LD_LIBRARY_PATH=/opt/kc-lib',
-        '/opt/wallet-login-live-it/' + wrapper_name, 'get', '--identifier', identifier,
-        '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=30)
+    diagnostic = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+        ['get', '--identifier', identifier,
+        '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=30, image=image)
     safe_categories = []
     for line in diagnostic.stdout.splitlines():
       category = identity_lookup_category(line)
@@ -1507,9 +2777,13 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': current_csrf}
   current_status, _, current_body = current_browser.request('GET', current_status_url,
       headers=current_poll_headers)
+  progress('current_accepted', {'current_transaction_accepted':
+      current_status == 200 and json.loads(current_body).get('status') == 'accepted'})
   require(current_status == 200 and json.loads(current_body).get('status') == 'accepted',
       'current-key proof is visible only to the initiating browser')
   callback = json.loads(current_body).get('callback')
+  progress('callback', {'callback_available': isinstance(callback, str)
+      and callback.startswith(f'https://idp.example:{KC_PORT}/auth/')})
   require(isinstance(callback, str) and callback.startswith(f'https://idp.example:{KC_PORT}/auth/'),
       'current-key accepted status returns the Keycloak execution callback')
   return {'rotation_publish': 'passed', 'current_sequence': 2,
@@ -1517,6 +2791,56 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
       'stale_transaction_remains_pending': True, 'current_transaction_accepted': True}
 
 
+
+
+def sanitized_resolver_diagnostic_lines(text):
+  if not isinstance(text, str):
+    return []
+  allowed = {'registry_miss', 'dial_warning', 'peer_handshake', 'peer_error',
+      'history_unavailable', 'traceback', 'process_start', 'nonzero_exit', 'unknown', 'success',
+      'timeout', 'interrupted', 'termination_interrupted', 'output_overflow'}
+  output = []
+  for line in text.splitlines()[-300:]:
+    if len(line) > 2048:
+      continue
+    marker = '[WALLET-RESOLVER-DIAG]'
+    if marker not in line:
+      continue
+    suffix = line.split(marker, 1)[1].strip()
+    match = re.fullmatch(r'exit=(-?\d+), reason=([a-z_|]+), lines=(\d+), capped=(true|false)', suffix)
+    if not match:
+      output.append('invalid')
+      continue
+    exit_code, reason, count, _ = match.groups()
+    cats = reason.split('|')
+    if (int(exit_code) < -1 or int(exit_code) > 255 or int(count) > 64
+        or not cats or any(cat not in allowed for cat in cats)
+        or len(cats) != len(set(cats))):
+      output.append('invalid')
+      continue
+    output.append('ok:' + '|'.join(cats))
+  return output[:32]
+
+
+def record_resolver_diagnostics(container):
+  logs = run(['podman', 'logs', '--tail', '300', container], timeout=15)
+  if logs.returncode != 0:
+    return ['unavailable']
+  return sanitized_resolver_diagnostic_lines(logs.stdout)
+
+
+def safe_resolver_diagnostic_snapshot(container):
+  logs = run(['podman', 'logs', '--tail', '300', container], timeout=15)
+  if logs.returncode != 0:
+    return ['unavailable']
+  return sanitized_resolver_diagnostic_lines(logs.stdout)
+
+
+def capture_live_resolver_diagnostics(container, result, checkpoint):
+  categories = safe_resolver_diagnostic_snapshot(container)
+  result.setdefault('resolver_runtime', {})['diagnostic_categories'] = categories
+  checkpoint()
+  return categories
 
 
 def classify_oidc_action_error(body):
@@ -1776,7 +3100,7 @@ def signup_form_action(html_body, idp_origin, realm, required_action=False, prof
 
 
 
-def signup_wallet_flow(client, key, identifier, container, admin_client):
+def signup_wallet_flow(client, key, identifier, container, admin_client, progress, image):
   verifier = b64url(secrets.token_bytes(32))
   code_challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
@@ -1816,6 +3140,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client):
     logs = run(['podman', 'logs', '--tail', '100', container], timeout=15)
     print('signup-action-diagnostics:', json.dumps(
         sanitize_signup_action_diagnostics(signup_page, logs.stdout), sort_keys=True))
+  progress('intent', {'signup_intent_action_http': action_status})
   require(action_status == 200, 'Keycloak action records signup intent and restarts wallet flow', action_status)
   signup_text = signup_page.decode('utf-8', errors='strict')
   require('Creating a new account with this wallet identity.' in signup_text,
@@ -1833,13 +3158,13 @@ def signup_wallet_flow(client, key, identifier, container, admin_client):
   envelope = json.loads(challenge_raw)
   signing_input = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
       'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode()
-  payload = Path(SCRATCH) / f'signup-signing-{uuid.uuid4().hex}.json'
-  payload.write_bytes(signing_input)
-  try:
-    signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key), '-in', str(payload)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
-  finally:
-    payload.unlink(missing_ok=True)
+  with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=key.parent) as signing_dir:
+    payload = write_private_signing_input(signing_dir, 'signup', signing_input)
+    try:
+      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key), '-in', str(payload)],
+          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+    finally:
+      payload.unlink(missing_ok=True)
   require(signature.returncode == 0 and len(signature.stdout) == 64, 'signup Ed25519 proof signed')
   proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identifier, 'signature': b64url(signature.stdout)}, separators=(',', ':')).encode()
@@ -1850,11 +3175,13 @@ def signup_wallet_flow(client, key, identifier, container, admin_client):
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
   require(not existing_exact_users, 'no exact Keycloak account exists before signup proof')
   proof_status, _, _ = wallet.request('POST', signup_locator, proof, {'Content-Type': 'application/json'})
+  progress('proof', {'signup_proof_http': proof_status})
   require(proof_status == 202, 'signup proof provisions exact account before pending consume', proof_status)
   exact_users = json.loads(admin_call(admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   matched = [user for user in exact_users
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
+  progress('account', {'exact_mapped_users': len(matched)})
   require(len(matched) == 1 and matched[0].get('enabled'),
       'signup provisioned exactly one enabled account with exact identity before consume')
   browser_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
@@ -1901,6 +3228,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client):
             callback_body.decode('utf-8', errors='replace'), logs.stdout).items()
         if key in ('error', 'exceptions', 'frames', 'stack_frames', 'server_error_categories',
             'status', 'content_type', 'location_path', 'forms', 'field_errors')}, sort_keys=True))
+  progress('callback', {'callback_http': callback_status})
   require(callback_status in (302, 303) and code,
       'callback, OIDC state, and no-code replay', callback_status)
   location_query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
@@ -1916,6 +3244,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client):
       urllib.parse.urlencode({'grant_type':'authorization_code','client_id':CLIENT,'code':code,
           'redirect_uri':REDIRECT,'code_verifier':verifier}).encode(),
       {'Content-Type':'application/x-www-form-urlencoded'})
+  progress('token', {'pkce_token_http': token_status})
   require(token_status == 200, 'signup authorization code exchanges with PKCE', token_status)
   claims = verify_id_token(client, json.loads(token_raw)['id_token'], key.parent)
   require(claims.get('sub') == matched[0].get('id'), 'signup returns created opaque Keycloak subject')
@@ -1925,44 +3254,53 @@ def signup_wallet_flow(client, key, identifier, container, admin_client):
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status}
 
 
-def missing_identity_flow(container, wrapper, resolver_port, bootstrap):
-  browser = Client()
-  verifier = b64url(secrets.token_bytes(32))
-  code_challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
-  state = b64url(secrets.token_bytes(24))
-  nonce = b64url(secrets.token_bytes(24))
-  query = urllib.parse.urlencode({
-      'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
-      'scope': 'openid', 'state': state, 'nonce': nonce,
-      'code_challenge': code_challenge, 'code_challenge_method': 'S256',
-  })
-  status, _, page = browser.request('GET', f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
-  require(status == 200, 'missing-Identity browser login page', status)
-  text = page.decode('utf-8', errors='strict')
-  parser = LoginPageParser()
-  parser.feed(text)
-  locator = ''.join(parser.locator_parts).strip()
-  require(locator.startswith(f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/decent-wallet-login/v1/transactions/'),
-      'missing-Identity transaction locator')
-  csrf = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', text)
-  status_url = re.search(r'const statusUrl = "([^"]+)";', text)
-  assert csrf is not None and status_url is not None
-  missing_id = 'wallet-login-unpublished-' + uuid.uuid4().hex + '@example.invalid'
-  direct_lookup_id = 'wallet-login-unpublished-direct-' + uuid.uuid4().hex + '@example.invalid'
+def classify_provider_identity_outcome(provider_http):
+  """Classify only the provider request status; a separate CLI miss is not authority."""
+  if provider_http == 503:
+    return 'unavailable'
+  if provider_http == 401:
+    return 'provider_denied_unclassified'
+  return 'unexpected_status'
+
+
+def _redirect_count(client):
+  redirects = getattr(client, 'redirects', None)
+  return len(redirects) if isinstance(redirects, list) else None
+
+
+def _no_new_redirects(client, previous_count):
+  redirects = getattr(client, 'redirects', None)
+  return (type(previous_count) is int and isinstance(redirects, list)
+      and len(redirects) == previous_count)
+
+
+def _response_has_acceptance_evidence(headers, raw_body):
+  if not isinstance(headers, dict) or any(str(name).lower() == 'location' for name in headers):
+    return True
+  if raw_body in (None, b'', ''):
+    return False
+  try:
+    body = json.loads(raw_body)
+  except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+    return True
+  return (_contains_key(body, 'code') or _contains_key(body, 'callback')
+      or _has_accepted_result(body))
+
+
+def missing_identity_flow(temp, resolver_port, bootstrap, image):
+  missing_label = 'wallet-login-unpublished-' + uuid.uuid4().hex
+  missing_id = missing_label + '@example.invalid'
+  missing_key = generate_owner_key(Path(temp), missing_label, image)
   lookup_started = time.monotonic()
-  registry_lookup = run(['podman', 'exec', container, '/usr/bin/env', '-i',
-      'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
-      '/opt/wallet-login-live-it/' + wrapper.name, 'get', '--identifier', direct_lookup_id,
-      '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20)
+  registry_lookup = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+      ['get', '--identifier', missing_id,
+      '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20, image=image)
   lookup_ms = int((time.monotonic() - lookup_started) * 1000)
   resolution_category, result_categories = classify_identity_lookup(
-      registry_lookup.stdout, registry_lookup.returncode)
-  safe_lines = []
-  for line in registry_lookup.stdout.splitlines():
-    if len(safe_lines) >= 8 or not line.strip():
-      continue
-    safe = ''.join(character if character.isalpha() or character.isspace() else ' ' for character in line)
-    safe_lines.append(' '.join(safe.split())[:100])
+      registry_lookup.stdout, registry_lookup.returncode, missing_id)
+  safe_lines = ['object' for category in result_categories if category == 'json']
+  if resolution_category == 'not_found' and result_categories[-1:] == ['not_found']:
+    safe_lines.append('terminal-not-found')
   # Start a separate transaction for the production provider path; its resolver
   # admission cooldown is per browser/client, so reusing one handle after a
   # direct lookup would return 429 without exercising Registry resolution.
@@ -1992,149 +3330,283 @@ def missing_identity_flow(container, wrapper, resolver_port, bootstrap):
   provider_status_url_value = provider_status_url.group(1)
   provider_csrf_value = provider_csrf.group(1)
   provider_wallet = Client()
+  challenge_redirect_start = _redirect_count(provider_wallet)
   challenge_status, _, challenge_raw = provider_wallet.request('GET', provider_locator)
-  require(challenge_status == 200, 'fresh provider unknown-Identity challenge GET')
+  challenge_redirects_safe = _no_new_redirects(provider_wallet, challenge_redirect_start)
+  require(challenge_status == 200 and challenge_redirects_safe,
+      'fresh provider unknown-Identity challenge GET without redirects')
   challenge_envelope = json.loads(challenge_raw)
+  signing_input = json.dumps({
+      'challenge': challenge_envelope['challenge'], 'identity_id': missing_id,
+      'profile': challenge_envelope['profile'],
+  }, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode('utf-8')
+  with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=Path(missing_key).parent) as signing_dir:
+    payload = write_private_signing_input(signing_dir, 'missing-identity', signing_input)
+    try:
+      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin',
+          '-inkey', str(missing_key), '-in', str(payload)], stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE, timeout=10, check=False)
+    finally:
+      payload.unlink(missing_ok=True)
+  require(signature.returncode == 0 and len(signature.stdout) == 64,
+      'sign exact unpublished Identity proof')
   provider_proof = json.dumps({
       'profile': challenge_envelope['profile'], 'challenge': challenge_envelope['challenge'],
-      'identity_id': direct_lookup_id, 'signature': b64url(bytes(64)),
+      'identity_id': missing_id, 'signature': b64url(signature.stdout),
   }, separators=(',', ':')).encode('utf-8')
   provider_started = time.monotonic()
-  direct_http, _, _ = provider_wallet.request('POST', provider_locator, provider_proof,
-      {'Content-Type': 'application/json'})
+  proof_redirect_start = _redirect_count(provider_wallet)
+  provider_http, provider_headers, provider_body = provider_wallet.request('POST',
+      provider_locator, provider_proof, {'Content-Type': 'application/json'})
+  proof_redirects_safe = _no_new_redirects(provider_wallet, proof_redirect_start)
   direct_provider_ms = int((time.monotonic() - provider_started) * 1000)
-  if direct_http == 401 and resolution_category == 'not_found':
-    resolution_category = 'not_found'
-  elif direct_http == 503:
-    resolution_category = 'unavailable'
-  else:
-    resolution_category = 'inconsistent'
+  provider_resolution_outcome = classify_provider_identity_outcome(provider_http)
+  require(provider_resolution_outcome in {'unavailable', 'provider_denied_unclassified'},
+      'unpublished Identity proof did not succeed or produce an unrelated response',
+      provider_http)
   status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': provider_csrf_value}
-  status_poll, _, status_raw = provider_browser.request('GET', provider_status_url_value,
-      headers=status_headers)
-  require(status_poll == 200 and json.loads(status_raw) == {'status': 'pending'},
-      'unknown identity produced no accepted receipt or callback')
+  status_redirect_start = _redirect_count(provider_browser)
+  status_poll, status_response_headers, status_raw = provider_browser.request(
+      'GET', provider_status_url_value, headers=status_headers)
+  status_redirects_safe = _no_new_redirects(provider_browser, status_redirect_start)
+  status_payload = None
+  if status_poll == 200:
+    try:
+      status_payload = json.loads(status_raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+      pass
+  status_pending = status_payload == {'status': 'pending'}
+  redirects_safe = (challenge_redirects_safe and proof_redirects_safe
+      and status_redirects_safe)
+  no_acceptance_or_callback = (status_pending and redirects_safe
+      and not _response_has_acceptance_evidence(provider_headers, provider_body)
+      and not _response_has_acceptance_evidence(status_response_headers, status_raw))
+  require(no_acceptance_or_callback,
+      'unpublished Identity produced no accepted receipt, callback, or code')
   return {'cli_resolution': resolution_category, 'cli_exit': registry_lookup.returncode,
       'cli_output_categories': result_categories, 'cli_output_shape': safe_lines,
-      'cli_lookup_ms': lookup_ms, 'direct_provider_http': direct_http,
-      'direct_provider_lookup_ms': direct_provider_ms, 'provider_http': direct_http,
-      'provider_lookup_ms': direct_provider_ms,
-      'no_acceptance_or_callback': True}
+      'cli_lookup_ms': lookup_ms, 'provider_resolution_outcome': provider_resolution_outcome,
+      'direct_provider_http': provider_http, 'status_http': status_poll,
+      'status_pending': status_pending, 'direct_provider_lookup_ms': direct_provider_ms,
+      'redirects_safe': redirects_safe,
+      'no_acceptance_or_callback': no_acceptance_or_callback}
 
 
 def main():
-  container = f'wallet-login-live-e2e-{os.getpid()}'
+  global IMAGE, RUN_CID_DIR
+  profile = os.environ.get('WALLET_IT_PROFILE', 'default')
+  if profile not in {'default', 'expiry'}:
+    raise ValueError('WALLET_IT_PROFILE must be default or expiry')
+  IMAGE, image_digest = resolve_immutable_image(IMAGE)
+  runtime_provenance = _prepare_resolver_runtime()
+  runtime_provenance['image_digest'] = image_digest
+  run_id = uuid.uuid4().hex
+  RUN_CID_DIR = Path(SCRATCH) / ('wallet-login-cids-' + run_id)
+  RUN_CID_DIR.mkdir(mode=0o700, parents=True, exist_ok=False)
+  container = f'wallet-login-live-e2e-{run_id}'
   password = secrets.token_urlsafe(32)
   registry = None
+  resolver_tools = None
   try:
     with tempfile.TemporaryDirectory(prefix='wallet-login-e2e-',
         dir=SCRATCH) as temp_dir:
+      evidence_path = Path(temp_dir) / 'live-evidence.json'
+      result = {'resolver_runtime': runtime_provenance}
+      def checkpoint():
+        evidence_path.write_text(
+            json.dumps(sanitize_live_checkpoint(result), sort_keys=True), encoding='utf-8')
+      def latest_resolver_diagnostics():
+        if resolver_tools is None:
+          return {'resolver_runtime': runtime_provenance,
+              'rotated_identity_case': {'stage': 'probe_not_started'}}
+        return {'resolver_runtime': runtime_provenance,
+            'rotated_identity_case': {'stage': 'diagnostic_probe',
+                'diagnostic_categories': record_resolver_diagnostics(container)}}
       temp = Path(temp_dir)
-      registry, bootstrap, registry_port = start_registry(temp)
-      resolver_port = free_port()
-      key, wrapper, identifier = write_identity(temp, bootstrap)
-      unmapped_key, wrapper, unmapped_identifier = write_identity(
-          temp, bootstrap, label='wallet-login-unmapped')
-      replay_key, _, replay_identifier = write_identity(
-          temp, bootstrap, label='wallet-login-replay')
-      client = start_keycloak(container, password, wrapper, resolver_port, bootstrap)
-      client.privateClientAdminCredential = password
-      token = admin_token(client, password)
-      configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
-      enable_keycloak_login_events(client, token)
-      provision_identity_attribute(client, token, 'wallet-owner-duplicate', replay_identifier)
-      probe = run(['podman', 'exec', container, '/usr/bin/env', '-i',
-          'PATH=/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
-          '/opt/wallet-login-live-it/' + wrapper.name, 'get', '--identifier', identifier,
-          '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20)
-      require(probe.returncode == 0, 'sanitized container Identity CLI lookup')
-      auth_browser = Client()
-      result = auth_flow(auth_browser, key, identifier, container)
-      result['browser_preflight'] = browser_preflight_flow()
-      result['negative_case'] = negative_proof_flow(identifier)
-      result['negative_case']['invalid_proof_throttle'] = invalid_proof_throttle_flow()
-      unmapped_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
-          'username': 'wallet-unmapped-fixture', 'enabled': True,
-      }, expected=(201,))
-      require(unmapped_status == 201, 'create pre-provisioned user without wallet Identity mapping')
-      unmapped_result = account_mapping_denial_flow(
-          client, unmapped_key, unmapped_identifier, 'unmapped-account',
-          container, resolver_port, bootstrap, wrapper.name)
-      result['unmapped_account_case'] = unmapped_account_case_evidence(unmapped_result)
-      require(account_policy_denial_is_attributed(result['unmapped_account_case']),
-          'unmapped account denial has fresh provider policy evidence',
-          result['unmapped_account_case'].get('outcome'))
+      with report_partial_evidence_on_failure(evidence_path, latest_resolver_diagnostics):
+        resolver_tools = start_resolver_tools(temp, IMAGE,
+            lifetime=EXPIRY_CONTAINER_LIFETIME_SECONDS if profile == 'expiry' else 300)
+        os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        registry, bootstrap, registry_port = start_registry(temp, IMAGE,
+            run_seconds=EXPIRY_CONTAINER_LIFETIME_SECONDS if profile == 'expiry' else 300)
+        os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        resolver_port = free_port()
+        key, wrapper, identifier = write_identity(temp, bootstrap, IMAGE)
+        if profile == 'expiry':
+          unmapped_key = replay_key = None
+          unmapped_identifier = replay_identifier = None
+        else:
+          unmapped_key, wrapper, unmapped_identifier = write_identity(
+              temp, bootstrap, IMAGE, label='wallet-login-unmapped')
+          replay_key, _, replay_identifier = write_identity(
+              temp, bootstrap, IMAGE, label='wallet-login-replay')
+        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE)
+        client.privateClientAdminCredential = password
+        if not isinstance(client.wallet_container_id, str):
+          raise RuntimeError('Keycloak container ID is unavailable')
+        container = client.wallet_container_id
+        token = admin_token(client, password)
+        runtime_provenance.update(keycloak_runtime_provenance(
+            client, token, client.wallet_container_id))
+        checkpoint()
+        require(runtime_provenance['runtime_qualification_status'] == 'runtime_facts_verified',
+            'effective Keycloak runtime provenance verified',
+            runtime_provenance['runtime_qualification_status'])
+        configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
+        enable_keycloak_login_events(client, token)
+        if profile == 'expiry':
+          def expiry_checkpoint(snapshot):
+            result['expiry_case'] = snapshot
+            checkpoint()
 
-      rotated_old_key, rotated_wrapper, rotated_identifier = write_identity(
-          temp, bootstrap, label='wallet-login-rotated')
-      rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor')
-      rotated_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
-          'username': 'wallet-rotated-owner', 'enabled': True,
-          'attributes': {'decent_identity_id': [rotated_identifier]},
-      }, expected=(201,))
-      require(rotated_status == 201, 'preprovision rotated-Identity local mapping')
-      provision_identity_attribute(client, token, 'wallet-rotated-owner', rotated_identifier)
-      replay_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
-          'username': 'wallet-replay-owner', 'enabled': True,
-          'attributes': {'decent_identity_id': [replay_identifier]},
-      }, expected=(201,))
-      require(replay_status == 201, 'preprovision replay fixture account')
-      provision_identity_attribute(client, token, 'wallet-replay-owner', replay_identifier)
-      disabled_key, _, disabled_identifier = write_identity(
-          temp, bootstrap, label='wallet-login-disabled')
-      disabled_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
-          'username': 'wallet-disabled-fixture', 'enabled': True,
-      }, expected=(201,))
-      require(disabled_status == 201, 'create distinct disabled-account fixture')
-      provision_identity_attribute(client, token, 'wallet-disabled-fixture', disabled_identifier)
-      disabled_users = json.loads(admin_call(client, token, 'GET',
-          f'/auth/admin/realms/{REALM}/users?username=wallet-disabled-fixture&exact=true')[2])
-      require(len(disabled_users) == 1, 'disabled account fixture is unique')
-      disabled_user = disabled_users[0]
-      disabled_user['enabled'] = False
-      admin_call(client, token, 'PUT',
-          f'/auth/admin/realms/{REALM}/users/{disabled_user["id"]}', disabled_user,
-          expected=(204,))
-      verified_disabled_user = json.loads(admin_call(client, token, 'GET',
-          f'/auth/admin/realms/{REALM}/users/{disabled_user["id"]}')[2])
-      require(verified_disabled_user.get('enabled') is False
-          and verified_disabled_user.get('attributes', {}).get('decent_identity_id') == [disabled_identifier],
-          'distinct disabled account has exact Registry Identity mapping and disabled status')
-      disabled_result = account_mapping_denial_flow(
-          client, disabled_key, disabled_identifier, 'disabled-account',
-          container, resolver_port, bootstrap, wrapper.name)
-      require(account_policy_denial_is_attributed(disabled_result),
-          'disabled mapped account denial has fresh provider policy evidence',
-          disabled_result.get('outcome'))
-      result['disabled_account_case'] = disabled_result
-      signup_key, _, signup_identifier = write_identity(
-          temp, bootstrap, label='wallet-login-signup')
-      signup_browser = Client()
-      result['signup_case'] = signup_wallet_flow(signup_browser, signup_key, signup_identifier, container, client)
-      result['rotated_identity_case'] = stale_key_rotation_flow(
-          client, rotated_old_key, rotated_key, rotated_identifier, container,
-          resolver_port, bootstrap, rotated_wrapper.name)
-      rotated_user = json.loads(admin_call(client, token, 'GET',
-          f'/auth/admin/realms/{REALM}/users?username=wallet-rotated-owner&exact=true')[2])
-      require(len(rotated_user) == 1
-          and rotated_user[0].get('attributes', {}).get('decent_identity_id') == [rotated_identifier],
-          'rotated account Identity mapping persisted exactly')
-      result['rotated_identity_case']['local_mapping_persisted'] = True
-      provision_identity_attribute(client, token, 'wallet-owner-duplicate', identifier)
-      ambiguity_result = account_mapping_denial_flow(
-          client, key, identifier, 'ambiguous-account', container,
-          resolver_port, bootstrap, wrapper.name)
-      require(account_policy_denial_is_attributed(ambiguity_result),
-          'ambiguous account denial has fresh provider policy evidence',
-          ambiguity_result.get('outcome'))
-      result['ambiguous_account_case'] = ambiguity_result
-      result['missing_identity_case'] = missing_identity_flow(container, wrapper, resolver_port, bootstrap)
-      print('E2E_SCENARIOS_COMPLETE: inspect per-case outcomes; overall provider qualification remains limited')
-      print('evidence=', json.dumps(result, sort_keys=True))
-  finally:
-    run(['podman', 'rm', '--force', container], timeout=25)
-    stop_registry(registry)
+          result['expiry_case'] = expiry_profile_coordinator(
+              client, key, identifier, container, IMAGE, expiry_checkpoint, runtime_provenance)
+          checkpoint()
+          print('expiry-evidence=', json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+          cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+          registry = None
+          resolver_tools = None
+          if cleanup_errors:
+            raise RuntimeError(
+                f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}')
+          return
+        provision_identity_attribute(client, token, 'wallet-owner-duplicate', replay_identifier)
+        probe = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+            ['get', '--identifier', identifier,
+            '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20, image=IMAGE)
+        require(probe.returncode == 0, 'sanitized container Identity CLI lookup')
+        auth_browser = Client()
+        result['wallet_login'] = auth_flow(auth_browser, key, identifier, container, IMAGE)
+        checkpoint()
+        result['browser_preflight'] = browser_preflight_flow(IMAGE)
+        checkpoint()
+        result['negative_case'] = negative_proof_flow(identifier, IMAGE)
+        checkpoint()
+        result['negative_case']['invalid_proof_throttle'] = invalid_proof_throttle_flow(IMAGE)
+        checkpoint()
+        unmapped_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
+            'username': 'wallet-unmapped-fixture', 'enabled': True,
+        }, expected=(201,))
+        require(unmapped_status == 201, 'create pre-provisioned user without wallet Identity mapping')
+        provision_identity_attribute(client, token, 'wallet-unmapped-fixture', replay_identifier)
+        unmapped_result = account_mapping_denial_flow(
+            client, unmapped_key, unmapped_identifier, 'unmapped-account',
+            container, resolver_port, bootstrap, wrapper.name, IMAGE)
+        result['unmapped_account_case'] = unmapped_account_case_evidence(unmapped_result)
+        checkpoint()
+        require(account_policy_denial_is_attributed(result['unmapped_account_case']),
+            'unmapped account denial has fresh provider policy evidence',
+            result['unmapped_account_case'].get('outcome'))
+
+        rotated_old_key, rotated_wrapper, rotated_identifier = write_identity(
+            temp, bootstrap, IMAGE, label='wallet-login-rotated')
+        rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor', IMAGE)
+        rotation_progress = lambda stage, fields: checkpoint_rotation_stage(
+            result, stage, fields, checkpoint)
+        rotated_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
+            'username': 'wallet-rotated-owner', 'enabled': True,
+            'attributes': {'decent_identity_id': [rotated_identifier]},
+        }, expected=(201,))
+        require(rotated_status == 201, 'preprovision rotated-Identity local mapping')
+        provision_identity_attribute(client, token, 'wallet-rotated-owner', rotated_identifier)
+        replay_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
+            'username': 'wallet-replay-owner', 'enabled': True,
+            'attributes': {'decent_identity_id': [replay_identifier]},
+        }, expected=(201,))
+        require(replay_status == 201, 'replay owner account was provisioned exactly once')
+        replay_users = json.loads(admin_call(client, token, 'GET',
+            f'/auth/admin/realms/{REALM}/users?username=wallet-replay-owner&exact=true')[2])
+        require(len(replay_users) == 1, 'replay owner fixture exists exactly once')
+        replay_user = replay_users[0]
+        replay_user['attributes'] = {'decent_identity_id': [replay_identifier]}
+        replay_status, _, _ = admin_call(client, token, 'PUT',
+            f'/auth/admin/realms/{REALM}/users/{replay_user["id"]}', replay_user, expected=(204,))
+        require(replay_status == 204, 'set replay owner Identity mapping')
+        duplicate_users = json.loads(admin_call(client, token, 'GET',
+            f'/auth/admin/realms/{REALM}/users?username=wallet-owner-duplicate&exact=true')[2])
+        require(len(duplicate_users) == 1, 'duplicate fixture account exists exactly once')
+        duplicate_user = duplicate_users[0]
+        duplicate_user['attributes'] = {'decent_identity_id': [replay_identifier]}
+        duplicate_status, _, _ = admin_call(client, token, 'PUT',
+            f'/auth/admin/realms/{REALM}/users/{duplicate_user["id"]}', duplicate_user, expected=(204,))
+        require(duplicate_status == 204, 'reset duplicate account to same Registry Identity')
+        disabled_key, _, disabled_identifier = write_identity(
+            temp, bootstrap, IMAGE, label='wallet-login-disabled')
+        disabled_status, _, _ = admin_call(client, token, 'POST', f'/auth/admin/realms/{REALM}/users', {
+            'username': 'wallet-disabled-fixture', 'enabled': True,
+        }, expected=(201,))
+        require(disabled_status == 201, 'create distinct disabled-account fixture')
+        provision_identity_attribute(client, token, 'wallet-disabled-fixture', disabled_identifier)
+        disabled_users = json.loads(admin_call(client, token, 'GET',
+            f'/auth/admin/realms/{REALM}/users?username=wallet-disabled-fixture&exact=true')[2])
+        require(len(disabled_users) == 1, 'disabled account fixture is unique')
+        disabled_user = disabled_users[0]
+        disabled_user['enabled'] = False
+        admin_call(client, token, 'PUT',
+            f'/auth/admin/realms/{REALM}/users/{disabled_user["id"]}', disabled_user,
+            expected=(204,))
+        verified_disabled_user = json.loads(admin_call(client, token, 'GET',
+            f'/auth/admin/realms/{REALM}/users/{disabled_user["id"]}')[2])
+        require(verified_disabled_user.get('enabled') is False
+            and verified_disabled_user.get('attributes', {}).get('decent_identity_id') == [disabled_identifier],
+            'distinct disabled account has exact Registry Identity mapping and disabled status')
+        disabled_result = account_mapping_denial_flow(
+            client, disabled_key, disabled_identifier, 'disabled-account',
+            container, resolver_port, bootstrap, wrapper.name, IMAGE)
+        result['disabled_account_case'] = disabled_result
+        checkpoint()
+        require(account_policy_denial_is_attributed(disabled_result),
+            'disabled mapped account denial has fresh provider policy evidence',
+            disabled_result.get('outcome'))
+        signup_key, _, signup_identifier = write_identity(
+            temp, bootstrap, IMAGE, label='wallet-login-signup')
+        signup_browser = Client()
+        signup_result = signup_wallet_flow(signup_browser, signup_key, signup_identifier,
+            container, client, lambda stage, fields: checkpoint_signup_stage(result, stage, fields, checkpoint), IMAGE)
+        result['signup_case'] = {'stage': 'complete', **signup_result}
+        checkpoint()
+        rotation_result = stale_key_rotation_flow(
+            client, rotated_old_key, rotated_key, rotated_identifier, container,
+            resolver_port, bootstrap, rotated_wrapper.name, rotation_progress, IMAGE, temp)
+        token = admin_token(client, AdminPassword(password))
+        rotated_user = json.loads(admin_call(client, token, 'GET',
+            f'/auth/admin/realms/{REALM}/users?username=wallet-rotated-owner&exact=true')[2])
+        local_mapping_persisted = (len(rotated_user) == 1
+            and rotated_user[0].get('attributes', {}).get('decent_identity_id') == [rotated_identifier])
+        rotation_progress('mapping', {'local_mapping_persisted': local_mapping_persisted})
+        require(local_mapping_persisted, 'rotated account Identity mapping persisted exactly')
+        result['rotated_identity_case'] = {
+            **result.get('rotated_identity_case', {}), 'stage': 'complete', **rotation_result,
+            'local_mapping_persisted': True}
+        checkpoint()
+        provision_identity_attribute(client, token, 'wallet-owner-duplicate', identifier)
+        ambiguity_result = account_mapping_denial_flow(
+            client, key, identifier, 'ambiguous-account', container,
+            resolver_port, bootstrap, wrapper.name, IMAGE)
+        require(account_policy_denial_is_attributed(ambiguity_result),
+            'ambiguous account denial has fresh provider policy evidence',
+            ambiguity_result.get('outcome'))
+        result['ambiguous_account_case'] = ambiguity_result
+        checkpoint()
+        result['missing_identity_case'] = missing_identity_flow(
+            temp, resolver_port, bootstrap, IMAGE)
+        checkpoint()
+        print('E2E_SCENARIOS_COMPLETE: inspect per-case outcomes; overall provider qualification remains limited')
+        runtime_provenance['diagnostic_categories'] = capture_live_resolver_diagnostics(
+            container, result, checkpoint)
+        print('evidence=', json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+  except BaseException as failure:
+    cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+    if cleanup_errors:
+      raise RuntimeError(
+          f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}') from failure
+    raise
+  else:
+    cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+    if cleanup_errors:
+      raise RuntimeError(
+          f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}')
 
 
 if __name__ == '__main__':
