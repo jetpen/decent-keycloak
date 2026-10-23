@@ -948,6 +948,152 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void committedReceiptFollowedByProviderExceptionFailsClosed() throws Exception {
+    var provider = new CommitThenThrowAcceptedReceiptStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:commit-then-throw@example.org";
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+    var issued = store.issue(BINDING);
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+
+    var failed = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+        issued.csrfToken(), proof, IDP_ORIGIN);
+    assertTrue(provider.committedThenThrew);
+    var status = handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+        issued.csrfToken(), IDP_ORIGIN, BINDING);
+    var retry = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+        issued.csrfToken(), proof, IDP_ORIGIN);
+
+    assertEquals(503, failed.status());
+    assertTrue(failed.body().isEmpty());
+    assertFalse(failed.headers().containsKey("Location"));
+    assertEquals(404, status.status());
+    assertEquals(404, retry.status());
+    assertTrue(store.peekAccepted(issued.handle()).isEmpty());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+    assertTrue(((MemoryStore) provider).entries.keySet().stream()
+        .noneMatch(key -> key.startsWith("decent-wallet-login-v1:accepted:")));
+    assertTrue(((MemoryStore) provider).entries.keySet().stream()
+        .noneMatch(key -> key.startsWith("decent-wallet-login-v1:callback:")));
+
+    var freshBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id", "fresh-root-session-id",
+        "fresh-tab-id", BINDING.redirectUri(), BINDING.canonicalOrigin());
+    var fresh = store.issue(freshBinding);
+    byte[] freshProof = signedProof(fresh.challenge(), identity, keyPair);
+    var recovered = handler.submitProof(fresh.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+        fresh.csrfToken(), freshProof, IDP_ORIGIN);
+    assertEquals(202, recovered.status());
+    assertTrue(store.callbackGateAvailable(fresh.handle(), freshBinding));
+  }
+
+  @Test
+  void acceptedReceiptIsHiddenWhileProviderPublicationCanStillFail() throws Exception {
+    var provider = new BlockingCommitThenThrowAcceptedReceiptStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var issued = store.issue(BINDING);
+    byte[] proof = signedProof(issued.challenge(), "mailto:blocked-publication@example.org", keyPair);
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+    var executor = Executors.newSingleThreadExecutor();
+    try {
+      var submission = executor.submit(() -> handler.submitProof(issued.handle(), WALLET_ORIGIN,
+          "cross-site", "application/json", issued.csrfToken(), proof, IDP_ORIGIN));
+      assertTrue(provider.receiptCommitted.await(5, TimeUnit.SECONDS),
+          "provider must commit the receipt before the injected failure is released");
+
+      assertTrue(store.peekAccepted(issued.handle()).isEmpty());
+      assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+      assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+      assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+      assertEquals(404, handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+          issued.csrfToken(), proof, IDP_ORIGIN).status());
+      assertEquals(404, handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+          issued.csrfToken(), IDP_ORIGIN, BINDING).status());
+
+      provider.releaseFailure.countDown();
+      assertEquals(503, submission.get(5, TimeUnit.SECONDS).status());
+    } finally {
+      provider.releaseFailure.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  void callbackRedemptionStartedBeforePublicationCannotConsumeAmbiguousReceipt() throws Exception {
+    var provider = new BlockingReadCommitThenThrowAcceptedReceiptStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    var consumed = store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).orElseThrow();
+    var executor = Executors.newFixedThreadPool(2);
+    try {
+      var redemption = executor.submit(() -> store.takeAccepted(issued.handle(), BINDING));
+      assertTrue(provider.acceptedReadEntered.await(5, TimeUnit.SECONDS),
+          "callback reader must enter provider after its initial availability check");
+      var publication = executor.submit(() -> store.markAccepted(issued.handle(), BINDING,
+          "proof-digest", "mailto:race-publication@example.org", "AA", consumed.csrfToken()));
+      assertTrue(provider.receiptCommitted.await(5, TimeUnit.SECONDS),
+          "accepted receipt must commit while the callback reader is in flight");
+
+      assertTrue(redemption.get(5, TimeUnit.SECONDS).isEmpty(),
+          "callback must recheck the publication gate after reading provider state");
+      provider.releaseFailure.countDown();
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> publication.get(5, TimeUnit.SECONDS));
+    } finally {
+      provider.releaseFailure.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  void callbackGateCommitThenProviderExceptionFailsClosed() throws Exception {
+    var provider = new CommitThenThrowCallbackGateStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var issued = store.issue(BINDING);
+    byte[] proof = signedProof(issued.challenge(), "mailto:callback-commit-then-throw@example.org", keyPair);
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+
+    var failed = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+        issued.csrfToken(), proof, IDP_ORIGIN);
+    var status = handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+        issued.csrfToken(), IDP_ORIGIN, BINDING);
+
+    assertTrue(provider.committedThenThrew);
+    assertEquals(503, failed.status());
+    assertTrue(failed.body().isEmpty());
+    assertFalse(failed.headers().containsKey("Location"));
+    assertEquals(404, status.status());
+    assertTrue(store.peekAccepted(issued.handle()).isEmpty());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+    assertTrue(((MemoryStore) provider).entries.keySet().stream()
+        .noneMatch(key -> key.startsWith("decent-wallet-login-v1:accepted:")));
+    assertTrue(((MemoryStore) provider).entries.keySet().stream()
+        .noneMatch(key -> key.startsWith("decent-wallet-login-v1:callback:")));
+
+    var freshBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id", "callback-retry-session",
+        "callback-retry-tab", BINDING.redirectUri(), BINDING.canonicalOrigin());
+    var fresh = store.issue(freshBinding);
+    byte[] freshProof = signedProof(fresh.challenge(), "mailto:callback-commit-then-throw@example.org", keyPair);
+    assertEquals(202, handler.submitProof(fresh.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+        fresh.csrfToken(), freshProof, IDP_ORIGIN).status());
+    assertTrue(store.callbackGateAvailable(fresh.handle(), freshBinding));
+  }
+
+  @Test
   void callbackGatePublicationFailureReturnsUnavailableWithoutReceiptOrCallback() throws Exception {
     var provider = new FailingCallbackGateStore();
     var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
@@ -1618,6 +1764,97 @@ final class WalletLoginTransportHandlerTest {
     @Override public java.time.ZoneOffset getZone() { return java.time.ZoneOffset.UTC; }
     @Override public Clock withZone(java.time.ZoneId zone) { return this; }
     @Override public java.time.Instant instant() { return now; }
+  }
+
+  private static final class BlockingReadCommitThenThrowAcceptedReceiptStore extends MemoryStore {
+    private final AtomicBoolean blockAcceptedRead = new AtomicBoolean(true);
+    private final CountDownLatch acceptedReadEntered = new CountDownLatch(1);
+    private final CountDownLatch receiptCommitted = new CountDownLatch(1);
+    private final CountDownLatch releaseFailure = new CountDownLatch(1);
+
+    @Override public Map<String, String> get(String key) {
+      if (key.startsWith("decent-wallet-login-v1:accepted:") && blockAcceptedRead.compareAndSet(true, false)) {
+        acceptedReadEntered.countDown();
+        try {
+          if (!receiptCommitted.await(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("test receipt was not committed while callback read waited");
+          }
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("test callback read interrupted", interrupted);
+        }
+      }
+      return super.get(key);
+    }
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      boolean replaced = super.replace(key, notes);
+      if (replaced && key.startsWith("decent-wallet-login-v1:accepted:")) {
+        receiptCommitted.countDown();
+        try {
+          if (!releaseFailure.await(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("test did not release committed receipt failure");
+          }
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("test receipt publication interrupted", interrupted);
+        }
+        throw new IllegalStateException("accepted receipt replacement outcome is ambiguous");
+      }
+      return replaced;
+    }
+  }
+
+  private static final class BlockingCommitThenThrowAcceptedReceiptStore extends MemoryStore {
+    private final CountDownLatch receiptCommitted = new CountDownLatch(1);
+    private final CountDownLatch releaseFailure = new CountDownLatch(1);
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      boolean replaced = super.replace(key, notes);
+      if (replaced && key.startsWith("decent-wallet-login-v1:accepted:")) {
+        receiptCommitted.countDown();
+        try {
+          if (!releaseFailure.await(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("test did not release committed receipt failure");
+          }
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("test receipt publication interrupted", interrupted);
+        }
+        throw new IllegalStateException("accepted receipt replacement outcome is ambiguous");
+      }
+      return replaced;
+    }
+  }
+
+  private static final class CommitThenThrowCallbackGateStore extends MemoryStore {
+    private boolean throwAfterCommit = true;
+    private boolean committedThenThrew;
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      boolean replaced = super.replace(key, notes);
+      if (replaced && throwAfterCommit && key.startsWith("decent-wallet-login-v1:callback:")) {
+        throwAfterCommit = false;
+        committedThenThrew = true;
+        throw new IllegalStateException("callback gate replacement outcome is ambiguous");
+      }
+      return replaced;
+    }
+  }
+
+  private static final class CommitThenThrowAcceptedReceiptStore extends MemoryStore {
+    private boolean throwAfterCommit = true;
+    private boolean committedThenThrew;
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      boolean replaced = super.replace(key, notes);
+      if (replaced && throwAfterCommit && key.startsWith("decent-wallet-login-v1:accepted:")) {
+        throwAfterCommit = false;
+        committedThenThrew = true;
+        throw new IllegalStateException("accepted receipt replacement outcome is ambiguous");
+      }
+      return replaced;
+    }
   }
 
   private static final class FailingAcceptedReceiptStore extends MemoryStore {

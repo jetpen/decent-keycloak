@@ -25,7 +25,7 @@ These commands verify offline wiring and evidence projection only. No live profi
 
 - Live single-node profile on this exact source/image/harness snapshot, including a distinct alternate-key signature over the identical signed fields, expected replay denial, callback replay to the registered redirect URI with state/error and no code, Code+PKCE, and run-owned cleanup.
 - Expired transaction rejected without an accepted receipt or callback. The prior authorized attempt failed before transaction creation; rerun requires renewed explicit authorization.
-- Post-consume receipt/store-failure and callback-gate publication/read failure remain unqualified on the production Keycloak provider/runtime.
+- Post-consume receipt/callback-gate commit-then-throw failure has offline provider-double coverage in `issue-6-postconsume.md`; production-provider behavior and live callback recovery remain unqualified.
 - Independent review of the final consolidated patch and successful CI on the pushed PR head.
 
 Do not claim Issue #6 complete, merge-ready, or closed until every in-scope gate has fresh evidence and the authorized review/merge lifecycle is complete.
