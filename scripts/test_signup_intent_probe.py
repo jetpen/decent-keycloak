@@ -14,6 +14,41 @@ import wallet_login_live_e2e as probe  # noqa: E402
 
 
 class SignupIntentProbeTest(unittest.TestCase):
+  def test_credential_file_unlink_retries_transient_errors(self):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as scratch:
+      secret = Path(scratch) / 'credential.env'
+      secret.write_text('secret')
+      original = Path.unlink
+      attempts = []
+      def transient(path, *args, **kwargs):
+        if path == secret and len(attempts) == 0:
+          attempts.append(1)
+          raise OSError('transient')
+        return original(path, *args, **kwargs)
+      with patch.object(Path, 'unlink', transient):
+        retained = probe.unlink_with_retries(secret, sleep=lambda _: None)
+      self.assertTrue(retained)
+      self.assertFalse(secret.exists())
+
+  def test_credential_file_unlink_persistent_error_is_sanitized_retained_status(self):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as scratch:
+      secret = Path(scratch) / 'credential.env'
+      secret.write_text('never-print-this')
+      with patch.object(Path, 'unlink', side_effect=PermissionError('secret-value')):
+        removed = probe.unlink_with_retries(secret, sleep=lambda _: None)
+      evidence = probe.sanitize_live_checkpoint({'resolver_runtime': {
+          'credential_file_retained': not removed}})
+      self.assertFalse(removed)
+      self.assertTrue(secret.exists())
+      self.assertNotIn('never-print-this', repr(evidence))
+      self.assertNotIn('secret-value', repr(evidence))
+
   def test_admin_env_file_launch_failure_is_checked_and_cleanup_runs(self):
     from pathlib import Path
     from unittest.mock import patch

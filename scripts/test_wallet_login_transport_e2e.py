@@ -1,14 +1,26 @@
+import contextlib
+import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
 os.environ.setdefault('WALLET_IT_NATIVE_LIBS', '/unused-test-library-path')
 sys.path.insert(0, str(Path(__file__).parent))
 
-from wallet_login_live_e2e import b64url, classify_identity_lookup  # noqa: E402
+from wallet_login_live_e2e import (  # noqa: E402
+    b64url,
+    classify_identity_lookup,
+    expiry_acceptance_flow,
+    run_acceptance_profile,
+    sanitize_live_checkpoint,
+    selected_acceptance_profile,
+)
 
 
 class AuthStatusBindingProbeTest(unittest.TestCase):
@@ -22,6 +34,405 @@ class AuthStatusBindingProbeTest(unittest.TestCase):
     self.assertIn("'wrong_realm'", body)
     self.assertIn('wrong_binding_statuses', body)
     self.assertIn('all(status == 404 for status in wrong_binding_statuses.values())', body)
+
+
+  def test_expiry_profile_runs_expiry_branch_and_persists_sanitized_checkpoint(self):
+    import json
+    import wallet_login_live_e2e as probe
+
+    calls = []
+    waits = []
+    progress = []
+    locator_a = f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}/decent-wallet-login/v1/transactions/' + 'a' * 43
+    locator_b = f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}/decent-wallet-login/v1/transactions/' + 'b' * 43
+    status_url = f'/auth/realms/{probe.REALM}/decent-wallet-login/v1/transactions/' + 'a' * 43 + '/status'
+    csrf = 'C' * 43
+
+    def login_page(locator):
+      return (f'<p id="wallet-locator">{locator}</p>'
+          f'<script>const csrfToken = "{csrf}"; const statusUrl = "{status_url}";</script>').encode()
+
+    class FakeClient:
+      redirect_on_expired_proof = False
+      redirect_on_expired_status = False
+
+      def __init__(self):
+        self.index = len(calls)
+        self.login_count = 0
+        self.redirects = []
+        calls.append([])
+
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        calls[self.index].append((method, path, data, headers))
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          self.login_count += 1
+          locator = locator_a if self.login_count == 1 else locator_b
+          return 200, {}, login_page(locator)
+        if method == 'GET' and path == locator_a:
+          return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+              'challenge': 'challenge-value', 'csrf_token': csrf}).encode()
+        if method == 'POST' and path == locator_a:
+          proof = json.loads(data)
+          if proof['challenge'] != 'challenge-value' or proof['identity_id'] != 'fixture-id':
+            raise AssertionError('proof does not bind to the fresh pending transaction')
+          if self.redirect_on_expired_proof:
+            self.redirects.append({'status': 302, 'target_query_names': ['code', 'state']})
+          return 404, {}, b''
+        if method == 'GET' and path == status_url:
+          if self.redirect_on_expired_status:
+            self.redirects.append({'status': 302, 'target_query_names': ['code', 'state']})
+          return 404, {}, b''
+        if method == 'GET' and path == locator_b:
+          return 200, {}, b'{}'
+        raise AssertionError('unexpected expiry request')
+
+    def expiry_branch():
+      return probe.expiry_acceptance_flow(None, 'fixture-id', client_factory=FakeClient,
+          wait=waits.append,
+          signer=lambda envelope, identity: json.dumps({'profile': envelope['profile'],
+              'challenge': envelope['challenge'], 'identity_id': identity,
+              'signature': 'A' * 86}).encode(),
+          progress=lambda stage, fields: progress.append((stage,
+              sanitize_live_checkpoint({'expiry_case': fields})['expiry_case'])))
+
+    FakeClient.redirect_on_expired_proof = True
+    with self.assertRaisesRegex(RuntimeError, 'expired proof response redirected'):
+      expiry_branch()
+    calls.clear()
+    waits.clear()
+    progress.clear()
+
+    FakeClient.redirect_on_expired_proof = False
+    FakeClient.redirect_on_expired_status = True
+    with self.assertRaisesRegex(RuntimeError, 'expired status response redirected'):
+      expiry_branch()
+    FakeClient.redirect_on_expired_status = False
+    calls.clear()
+    waits.clear()
+    progress.clear()
+
+    with patch.dict(os.environ, {'WALLET_IT_PROFILE': 'expiry'}):
+      profile = selected_acceptance_profile()
+    self.assertEqual('expiry', profile)
+    selected = run_acceptance_profile(profile, expiry_branch,
+        lambda: self.fail('expiry profile must not execute the full matrix'))
+    checkpoint = sanitize_live_checkpoint(selected)
+
+    self.assertEqual([301], waits)
+    self.assertEqual([3, 2, 1], [len(requests) for requests in calls])
+    self.assertEqual(['GET', 'GET', 'GET'], [request[0] for request in calls[0]])
+    self.assertEqual(['GET', 'POST'], [request[0] for request in calls[1]])
+    self.assertEqual(locator_a, calls[1][1][1])
+    self.assertEqual(csrf, calls[0][1][3]['X-Decent-CSRF'])
+    self.assertIn('/protocol/openid-connect/auth?', calls[0][2][1])
+    self.assertEqual(['GET'], [request[0] for request in calls[2]])
+    self.assertEqual(locator_b, calls[2][0][1])
+    self.assertEqual(['transaction_issued', 'challenge_fetched', 'proof_submitted',
+        'expired_denied', 'fresh_login', 'fresh_login'],
+        [stage for stage, _ in progress])
+    self.assertEqual(200, progress[0][1]['login_page_http'])
+    self.assertEqual(200, progress[1][1]['challenge_http'])
+    self.assertEqual('complete', checkpoint['expiry_case']['stage'])
+    self.assertEqual('expiry', checkpoint['expiry_case']['profile'])
+    self.assertEqual(300, checkpoint['expiry_case']['lifetime_seconds'])
+    self.assertEqual(404, checkpoint['expiry_case']['proof_http'])
+    self.assertEqual(404, checkpoint['expiry_case']['status_http'])
+    self.assertTrue(checkpoint['expiry_case']['proof_body_empty'])
+    self.assertTrue(checkpoint['expiry_case']['status_body_empty'])
+    self.assertFalse(checkpoint['expiry_case']['proof_location_present'])
+    self.assertFalse(checkpoint['expiry_case']['proof_redirect_followed'])
+    self.assertFalse(checkpoint['expiry_case']['status_location_present'])
+    self.assertFalse(checkpoint['expiry_case']['status_redirect_followed'])
+    self.assertFalse(checkpoint['expiry_case']['accepted_status'])
+    self.assertFalse(checkpoint['expiry_case']['oidc_code_exposed'])
+    self.assertFalse(checkpoint['expiry_case']['status_callback_exposed'])
+    self.assertTrue(checkpoint['expiry_case']['fresh_login_transaction_available'])
+    self.assertEqual(200, checkpoint['expiry_case']['fresh_challenge_http'])
+    self.assertNotIn('callback_url', checkpoint['expiry_case'])
+    self.assertNotIn('identity_id', checkpoint['expiry_case'])
+    unsafe = sanitize_live_checkpoint({'expiry_case': {'stage': 'complete', 'profile': 'expiry',
+        'proof_http': 404, 'proof_body_empty': True, 'identity_id': 'private-id',
+        'signature': 'private-signature', 'callback_url': 'https://rp.example/?code=secret',
+        'fresh_login_transaction_available': 'true'}})
+    self.assertEqual({'stage': 'complete', 'profile': 'expiry', 'proof_http': 404,
+        'proof_body_empty': True}, unsafe['expiry_case'])
+    with self.assertRaises(ValueError):
+      run_acceptance_profile('multi-node', expiry_branch, lambda: None)
+    with self.assertRaisesRegex(ValueError, 'issue6-single-node'):
+      selected_acceptance_profile({'WALLET_IT_PROFILE': 'unknown'})
+
+  def test_single_node_profile_runs_auth_then_expiry_with_bounded_checkpoint(self):
+    events = []
+    checkpoints = []
+
+    def auth_flow():
+      events.append('auth_flow')
+      return {'wallet_login': {'proof_post_http': 202, 'changed_retry_denied': True}}
+
+    def expiry_flow():
+      events.append('expiry_flow')
+      return {'stage': 'complete', 'profile': 'expiry', 'lifetime_seconds': 300,
+          'wait_seconds': 301, 'proof_http': 404, 'proof_body_empty': True,
+          'status_http': 404, 'status_body_empty': True,
+          'fresh_login_transaction_available': True}
+
+    selected = run_acceptance_profile('issue6-single-node', expiry_flow, auth_flow,
+        checkpoint=lambda snapshot: checkpoints.append(sanitize_live_checkpoint(snapshot)))
+    final = sanitize_live_checkpoint(selected)
+
+    self.assertEqual(['auth_flow', 'expiry_flow'], events)
+    self.assertEqual(2, len(checkpoints))
+    self.assertEqual(202, checkpoints[0]['wallet_login']['proof_post_http'])
+    self.assertNotIn('expiry_case', checkpoints[0])
+    self.assertEqual(['auth_flow'], checkpoints[0]['issue6_single_node_case']['phase_order'])
+    self.assertFalse(checkpoints[0]['issue6_single_node_case']['expiry_flow_complete'])
+    self.assertEqual('issue6-single-node', selected['profile'])
+    self.assertFalse(selected['broad_matrix_started'])
+    self.assertEqual('complete', final['issue6_single_node_case']['stage'])
+    self.assertEqual(['auth_flow', 'expiry_flow'], final['issue6_single_node_case']['phase_order'])
+    self.assertTrue(final['issue6_single_node_case']['auth_flow_complete'])
+    self.assertTrue(final['issue6_single_node_case']['expiry_flow_complete'])
+    inconsistent = sanitize_live_checkpoint({'issue6_single_node_case': {
+        'stage': 'complete', 'auth_flow_complete': True,
+        'expiry_flow_complete': False, 'phase_order': ['auth_flow']}})
+    self.assertNotIn('issue6_single_node_case', inconsistent)
+    self.assertEqual(202, final['wallet_login']['proof_post_http'])
+    self.assertEqual(301, final['expiry_case']['wait_seconds'])
+    self.assertEqual(404, final['expiry_case']['proof_http'])
+    self.assertTrue(final['expiry_case']['fresh_login_transaction_available'])
+    unsafe = sanitize_live_checkpoint({'expiry_case': {'stage': 'complete',
+        'proof_http': 404, 'identity_id': 'private-id', 'signature': 'private-signature',
+        'callback_url': 'https://rp.example/?code=secret'}})
+    self.assertNotIn('identity_id', unsafe['expiry_case'])
+    self.assertNotIn('signature', unsafe['expiry_case'])
+    self.assertNotIn('callback_url', unsafe['expiry_case'])
+
+    def expiry_failure():
+      raise RuntimeError('expiry failed')
+
+    failed_checkpoints = []
+    with self.assertRaisesRegex(RuntimeError, 'expiry failed'):
+      run_acceptance_profile('issue6-single-node', expiry_failure, auth_flow,
+          checkpoint=lambda snapshot: failed_checkpoints.append(
+              sanitize_live_checkpoint(snapshot)))
+    self.assertEqual(1, len(failed_checkpoints))
+    self.assertEqual(202, failed_checkpoints[0]['wallet_login']['proof_post_http'])
+    self.assertEqual(['auth_flow'], failed_checkpoints[0]['issue6_single_node_case']['phase_order'])
+    self.assertFalse(failed_checkpoints[0]['issue6_single_node_case']['expiry_flow_complete'])
+
+  def test_keycloak_nonzero_run_recovers_verified_cid_before_credential_unlink(self):
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+    identifier = 'e' * 64
+    events = []
+    def fake_run(argv, **kwargs):
+      if argv[0] == 'ss':
+        return subprocess.CompletedProcess(argv, 0, '', '')
+      if argv[0:2] == ['podman', 'run']:
+        cidfile = Path(argv[argv.index('--cidfile') + 1])
+        events.append(('run', cidfile))
+        cidfile.write_text(identifier + '\n')
+        return subprocess.CompletedProcess(argv, 125, identifier + '\n', '')
+      if argv[0:2] == ['podman', 'inspect']:
+        events.append(('inspect', argv[-1]))
+        return subprocess.CompletedProcess(argv, 0, identifier + '\n', '')
+      raise AssertionError(argv)
+    with tempfile.TemporaryDirectory() as scratch:
+      (Path(scratch) / 'cids').mkdir()
+      credential = {}
+      owned = []
+      with patch.object(probe, 'SCRATCH', Path(scratch)), patch.object(probe, 'RUN_CID_DIR', Path(scratch) / 'cids'), patch.object(probe, 'run', side_effect=fake_run), \
+          patch.object(probe, 'unlink_with_retries', side_effect=lambda path: events.append(('unlink', path)) or True):
+        with self.assertRaisesRegex(RuntimeError, 'start disposable Keycloak'):
+          probe.start_keycloak('test', 'credential', Path(scratch) / 'wrapper', 1,
+              'bootstrap', 'image', ownership_callback=lambda path, cid: (events.append(('own', cid)), owned.append(path)),
+              credential_status=credential)
+      self.assertEqual(['run', 'inspect', 'own', 'unlink'], [event[0] for event in events])
+      self.assertEqual(identifier, events[1][1])
+      self.assertEqual([identifier], [identifier for _ in owned])
+      self.assertFalse(credential['credential_file_retained'])
+      self.assertTrue(owned[0].exists())
+
+  def test_keycloak_success_requires_run_cidfile_and_inspected_id_match(self):
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+    identifier = 'f' * 64
+    def fake_run(argv, **kwargs):
+      if argv[0] == 'ss':
+        return subprocess.CompletedProcess(argv, 0, '', '')
+      if argv[0:2] == ['podman', 'run']:
+        Path(argv[argv.index('--cidfile') + 1]).write_text(identifier + '\n')
+        return subprocess.CompletedProcess(argv, 0, 'a' * 64 + '\n', '')
+      if argv[0:2] == ['podman', 'inspect']:
+        return subprocess.CompletedProcess(argv, 0, identifier + '\n', '')
+      raise AssertionError(argv)
+    with tempfile.TemporaryDirectory() as scratch:
+      (Path(scratch) / 'cids').mkdir()
+      owned = []
+      with patch.object(probe, 'SCRATCH', Path(scratch)), patch.object(probe, 'RUN_CID_DIR', Path(scratch) / 'cids'), patch.object(probe, 'run', side_effect=fake_run), \
+          patch.object(probe, 'unlink_with_retries', return_value=True):
+        with self.assertRaisesRegex(RuntimeError, 'ownership verification'):
+          probe.start_keycloak('test', 'credential', Path(scratch) / 'wrapper', 1,
+              'bootstrap', 'image', ownership_callback=lambda path, cid: owned.append((path, cid)))
+      self.assertEqual([], owned)
+
+  def test_persistent_credential_unlink_stops_startup_after_ownership_is_registered(self):
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+    identifier = '9' * 64
+    events = []
+    env_paths = []
+    def fake_run(argv, **kwargs):
+      if argv[0] == 'ss':
+        return subprocess.CompletedProcess(argv, 0, '', '')
+      if argv[0:2] == ['podman', 'run']:
+        env_paths.append(Path(argv[argv.index('--env-file') + 1]))
+        Path(argv[argv.index('--cidfile') + 1]).write_text(identifier + '\n')
+        return subprocess.CompletedProcess(argv, 0, identifier + '\n', '')
+      if argv[0:2] == ['podman', 'inspect']:
+        return subprocess.CompletedProcess(argv, 0, identifier + '\n', '')
+      raise AssertionError(argv)
+    with tempfile.TemporaryDirectory() as scratch:
+      (Path(scratch) / 'cids').mkdir()
+      credential = {}
+      with patch.object(probe, 'SCRATCH', Path(scratch)), patch.object(probe, 'RUN_CID_DIR', Path(scratch) / 'cids'), patch.object(probe, 'run', side_effect=fake_run), \
+          patch.object(probe, 'unlink_with_retries', return_value=False):
+        with self.assertRaisesRegex(RuntimeError, 'protected credential file may remain'):
+          probe.start_keycloak('test', 'credential', Path(scratch) / 'wrapper', 1,
+              'bootstrap', 'image', ownership_callback=lambda path, cid: events.append(('owned', cid)),
+              credential_status=credential)
+      self.assertEqual([('owned', identifier)], events)
+      self.assertTrue(credential['credential_file_retained'])
+      self.assertEqual(1, len(env_paths))
+      self.assertTrue(env_paths[0].exists())
+      self.assertNotIn('never-print-this', repr(credential))
+
+  def test_keycloak_interrupt_is_preserved_after_cid_recovery(self):
+    import tempfile
+    import subprocess
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+    identifier = '8' * 64
+    observed = []
+    def fake_run(argv, **kwargs):
+      if argv[0] == 'ss':
+        return subprocess.CompletedProcess(argv, 0, '', '')
+      if argv[0:2] == ['podman', 'run']:
+        Path(argv[argv.index('--cidfile') + 1]).write_text(identifier + '\n')
+        raise KeyboardInterrupt()
+      if argv[0:2] == ['podman', 'inspect']:
+        return subprocess.CompletedProcess(argv, 0, identifier + '\n', '')
+      raise AssertionError(argv)
+    with tempfile.TemporaryDirectory() as scratch:
+      (Path(scratch) / 'cids').mkdir()
+      with patch.object(probe, 'SCRATCH', Path(scratch)), patch.object(probe, 'RUN_CID_DIR', Path(scratch) / 'cids'), patch.object(probe, 'run', side_effect=fake_run):
+        with self.assertRaises(KeyboardInterrupt):
+          probe.start_keycloak('test', 'credential', Path(scratch) / 'wrapper', 1,
+              'bootstrap', 'image', ownership_callback=lambda path, cid: observed.append((path, cid)))
+      self.assertEqual(identifier, observed[0][1])
+      self.assertTrue(observed[0][0].exists())
+
+  def test_keycloak_ownership_is_registered_when_podman_run_times_out(self):
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+    calls = []
+    identifier = 'd' * 64
+    def fake_run(argv, **kwargs):
+      if argv[0] == 'ss':
+        return subprocess.CompletedProcess(argv, 0, '', '')
+      if argv[0:2] == ['podman', 'run']:
+        Path(argv[argv.index('--cidfile') + 1]).write_text(identifier + '\n')
+        raise TimeoutError('podman launch timed out')
+      if argv[0:2] == ['podman', 'inspect']:
+        return subprocess.CompletedProcess(argv, 0, identifier + '\n', '')
+      raise AssertionError(argv)
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'cids'
+      cid_dir.mkdir()
+      observed = []
+      credential = {}
+      with patch.object(probe, 'SCRATCH', Path(scratch)), patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        with self.assertRaisesRegex(TimeoutError, 'timed out'):
+          probe.start_keycloak('test', 'credential', Path(scratch) / 'wrapper', 1,
+              'bootstrap', 'image', ownership_callback=lambda path, cid: observed.append((path, cid)),
+              credential_status=credential)
+      self.assertEqual([(observed[0][0], identifier)], observed)
+      self.assertTrue(observed[0][0].exists())
+      self.assertFalse(credential['credential_file_retained'])
+
+  def test_runtime_evidence_rejects_version_other_than_project_pin(self):
+    import wallet_login_live_e2e as probe
+    pinned = probe.pinned_keycloak_version()
+    matching = probe.sanitize_live_checkpoint({'resolver_runtime': {
+        'profile': 'issue6-single-node', 'keycloak_version': pinned}})
+    self.assertEqual(pinned, matching['resolver_runtime']['keycloak_version'])
+    wrong_version = '26.8.1' if pinned != '26.8.1' else '26.8.0'
+    evidence = probe.sanitize_live_checkpoint({'resolver_runtime': {
+        'profile': 'issue6-single-node', 'keycloak_version': wrong_version}})
+    self.assertNotIn('keycloak_version', evidence['resolver_runtime'])
+
+  def test_single_node_runtime_evidence_does_not_claim_unobserved_provider(self):
+    evidence = sanitize_live_checkpoint({'resolver_runtime': {
+        'profile': 'issue6-single-node', 'node_count': 1, 'keycloak_version': '26.8.0',
+        'database': 'dev-file', 'cache': 'local',
+        'single_use_object_provider': 'production', 'single_use_object_provider_evidence': 'not_observed',
+        'credential_file_retained': False,
+        'password': 'must-not-appear', 'container_name': 'untrusted'}})
+    self.assertNotIn('single_use_object_provider', evidence['resolver_runtime'])
+    self.assertEqual('not_observed', evidence['resolver_runtime']['single_use_object_provider_evidence'])
+    self.assertEqual({'profile': 'issue6-single-node', 'node_count': 1,
+        'keycloak_version': '26.8.0', 'database': 'dev-file', 'cache': 'local',
+        'single_use_object_provider_evidence': 'not_observed', 'credential_file_retained': False},
+        evidence['resolver_runtime'])
+
+  def test_owned_container_cleanup_requires_verified_full_id(self):
+    import subprocess
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+
+    with TemporaryDirectory() as scratch:
+      cidfile = Path(scratch) / 'cid'
+      cidfile.write_text('a' * 64 + '\n')
+      calls = []
+      def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == 'inspect' and len(calls) == 1:
+          return subprocess.CompletedProcess(argv, 0, ('a' * 64) + '\n', '')
+        if argv[1] == 'rm':
+          return subprocess.CompletedProcess(argv, 0, '', '')
+        return subprocess.CompletedProcess(argv, 125, '', 'Error: no such container ' + ('a' * 64))
+      with patch.object(probe, 'RUN_CID_DIR', Path(scratch)), patch.object(probe, 'run', side_effect=fake_run):
+        result = probe.remove_owned_container(cidfile)
+      self.assertEqual({'removed': True, 'retained_cid': False}, result)
+      self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], calls[0])
+      self.assertEqual(['podman', 'rm', '--force', 'a' * 64], calls[1])
+      self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], calls[2])
+      self.assertFalse(cidfile.exists())
+
+  def test_owned_container_cleanup_retains_unverified_cidfile(self):
+    import subprocess
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+
+    with TemporaryDirectory() as scratch:
+      cidfile = Path(scratch) / 'cid'
+      cidfile.write_text('b' * 64 + '\n')
+      with patch.object(probe, 'RUN_CID_DIR', Path(scratch)), patch.object(
+          probe, 'run', return_value=subprocess.CompletedProcess([], 0, 'c' * 64, '')):
+        result = probe.remove_owned_container(cidfile)
+      self.assertEqual({'removed': False, 'retained_cid': True}, result)
+      self.assertTrue(cidfile.exists())
 
   def test_expired_transaction_proof_does_not_reach_identity_resolution(self):
     test_source = Path(__file__).parents[1] / 'src/test/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandlerTest.java'
@@ -314,6 +725,93 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
       self.assertEqual(200, evidence['issue6_postconsume_receipt_recovery']['pkce_token_http'])
       self.assertNotIn(locator, rendered)
       self.assertNotIn(handle, rendered)
+
+class OwnedResourceCleanupFailureTest(unittest.TestCase):
+  def run_cleanup(self, cleanup_failures=(), primary_failure=None, cleanup_interrupt=None):
+    import tempfile
+    from pathlib import Path
+    import wallet_login_live_e2e as probe
+
+    cleanup_calls = []
+    output = io.StringIO()
+    def cleanup(name):
+      cleanup_calls.append(name)
+      if name == 'registry' and cleanup_interrupt is not None:
+        raise cleanup_interrupt
+      if name in cleanup_failures:
+        raise RuntimeError(f'sensitive cleanup detail for {name}')
+
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'cids'
+      cid_dir.mkdir()
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text('a' * 64)
+
+      def remove_owned(cid_path):
+        cleanup('keycloak')
+        Path(cid_path).unlink(missing_ok=True)
+        return {'removed': True, 'retained_cid': False}
+
+      with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(probe, 'RUN_CID_DIR', cid_dir))
+        stack.enter_context(patch.object(probe, 'stop_registry', side_effect=lambda *_: cleanup('registry')))
+        stack.enter_context(patch.object(probe, 'stop_resolver_tools', side_effect=lambda *_: cleanup('resolver')))
+        stack.enter_context(patch.object(probe, 'remove_owned_container', side_effect=remove_owned))
+        with contextlib.redirect_stdout(output):
+          try:
+            if primary_failure is not None:
+              try:
+                raise primary_failure
+              except BaseException:
+                probe.cleanup_after_failure('registry', 'resolver-tools')
+                raise
+            probe.finish_owned_cleanup('registry', 'resolver-tools')
+          except BaseException as error:
+            return error, cleanup_calls, output.getvalue()
+    return None, cleanup_calls, output.getvalue()
+
+  def test_cleanup_failure_after_success_fails_and_attempts_all_cleanup(self):
+    error, calls, output = self.run_cleanup(
+        cleanup_failures=('keycloak', 'registry', 'resolver'))
+    self.assertIsInstance(error, RuntimeError)
+    self.assertIn('cleanup_error_count=3', str(error))
+    self.assertCountEqual(['keycloak', 'registry', 'resolver'], calls)
+    self.assertIn('keycloak_cleanup_error', output)
+    self.assertIn('registry_log_stream_stop_error', output)
+    self.assertIn('resolver_tools_stop_error', output)
+    self.assertNotIn('sensitive cleanup detail', output)
+
+  def test_primary_failure_or_interruption_is_preserved_while_all_cleanup_is_attempted(self):
+    for primary in (RuntimeError('primary scenario failure'), KeyboardInterrupt()):
+      with self.subTest(primary=type(primary).__name__):
+        error, calls, output = self.run_cleanup(
+            cleanup_failures=('keycloak', 'registry', 'resolver'), primary_failure=primary)
+        self.assertIs(error, primary)
+        self.assertCountEqual(['keycloak', 'registry', 'resolver'], calls)
+        self.assertNotIn('sensitive cleanup detail', output)
+
+  def test_cleanup_interrupt_is_preserved_after_all_cleanup_attempts(self):
+    cleanup_interrupt = KeyboardInterrupt('sensitive interrupt detail')
+    error, calls, output = self.run_cleanup(cleanup_interrupt=cleanup_interrupt)
+    self.assertIs(error, cleanup_interrupt)
+    self.assertCountEqual(['keycloak', 'registry', 'resolver'], calls)
+    self.assertIn('registry_log_stream_stop_error', output)
+    self.assertNotIn('sensitive interrupt detail', output)
+
+    for primary in (RuntimeError('primary scenario failure'), KeyboardInterrupt('primary interrupt')):
+      with self.subTest(primary=type(primary).__name__):
+        cleanup_interrupt = SystemExit('sensitive cleanup exit detail')
+        error, calls, output = self.run_cleanup(
+            primary_failure=primary, cleanup_interrupt=cleanup_interrupt)
+        self.assertIs(error, primary)
+        self.assertCountEqual(['keycloak', 'registry', 'resolver'], calls)
+        self.assertNotIn('sensitive cleanup exit detail', output)
+
+  def test_success_without_cleanup_errors_remains_success(self):
+    error, calls, output = self.run_cleanup()
+    self.assertIsNone(error)
+    self.assertCountEqual(['keycloak', 'registry', 'resolver'], calls)
+    self.assertNotIn('cleanup_categories=', output)
 
 
 if __name__ == '__main__':

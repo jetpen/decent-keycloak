@@ -6,13 +6,74 @@ from pathlib import Path
 import unittest
 
 README = Path(__file__).parents[1] / "README.md"
+SECURITY_REVIEW = Path(__file__).parents[1] / "docs/security-review.md"
 
 class AcceptanceLedgerTest(unittest.TestCase):
+  def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
+    text = README.read_text()
+    self.assertIn("Issue #6 expiry-profile implementation chronology (2026-10-21)", text)
+    self.assertIn("WALLET_IT_PROFILE=expiry", text)
+    self.assertIn("configured real `SingleUseObjectProvider`", text)
+    self.assertIn("No containers or profiles were run for this change", text)
+    self.assertIn("Fresh combined-profile expiry execution, changed-signature live replay, and post-consume accepted-receipt failure/fresh-login recovery remain unqualified", text)
+    self.assertEqual(2, text.count("historical replay 409 changed JSON whitespace only"))
+    self.assertIn("This branch adds an offline changed-signature characterization", text)
+    self.assertIn("The changed-signature variant has not been live-run; the historical live 409 changed JSON whitespace only.", text)
+    self.assertIn("same-browser recovery login", text)
+    self.assertIn("documented Python suite ran 151 tests (134 other tests, 14 ledger, 3 workflow guard tests", text)
+
+  def test_issue_six_profile_sequences_auth_then_expiry_with_sanitized_checkpoint(self):
+    text = README.read_text()
+    security_review = SECURITY_REVIEW.read_text()
+    harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
+    regression = (README.parent / "scripts/test_wallet_login_transport_e2e.py").read_text()
+    self.assertIn("auth_flow` first", text)
+    self.assertIn("then `expiry_acceptance_flow`", text)
+    self.assertIn("same running Keycloak node", text)
+    self.assertIn("A sanitized checkpoint is written after the successful auth phase before expiry begins", text)
+    self.assertIn("auth-before-expiry ordering", text)
+    self.assertIn("issue6_single_node_case", harness)
+    self.assertIn("checkpoint=lambda snapshot", harness)
+    self.assertIn("test_single_node_profile_runs_auth_then_expiry_with_bounded_checkpoint", regression)
+    self.assertIn("301-second expiry/fresh-login flow on the same node", security_review)
+    self.assertIn("phase_order", regression)
+
+  def test_issue_six_ordinary_login_commit_then_throw_is_offline_only(self):
+    readme = README.read_text()
+    security_review = SECURITY_REVIEW.read_text()
+    self.assertIn("Issue #6 ordinary-login receipt commit-then-throw regression", readme)
+    self.assertIn("handler/store test", readme)
+    self.assertIn("runtime version must exactly match the `keycloak.version` property in `pom.xml`", readme)
+    self.assertIn("single_use_object_provider_evidence=not_observed", readme)
+    self.assertIn("effective SingleUseObjectProvider remains unqualified", readme)
+    self.assertIn("serverinfo.providers` is not evidence of the selected effective provider", security_review)
+    self.assertIn("not a real `SingleUseObjectProvider` fault, browser/OIDC Code+PKCE evidence, or a live provider result", readme)
+    self.assertIn("No live containers or profiles were run", readme)
+    self.assertIn("post-consume accepted-receipt failure and fresh-login recovery remain unqualified", readme)
+    self.assertIn("Final offline verification on this implementer snapshot: the exact CI Python acceptance command passed 223 tests", readme)
+    self.assertIn("MAVEN_SKIP_RC=1 TMPDIR=/home/ben/.hermes/cache/scratch mise exec java@21.0.2 -- mvn -o clean package", readme)
+    self.assertIn("first Maven attempt used `MAVEN_SKIP_RC=true` and failed", readme)
+    self.assertIn("production provider JAR contains no test classes", readme)
+    self.assertIn("mvn -o clean package` passed 190 tests across 14 suites with zero failures/errors/skips", readme)
+    self.assertIn("offline ordinary-LOGIN commit-then-throw handler/store regression", security_review)
+    self.assertIn("real single-node Keycloak `SingleUseObjectProvider` failure evidence remains unqualified", security_review)
+    self.assertIn("changed-signature replay has offline characterization only (the historical live 409 changed JSON whitespace only)", security_review)
+
+  def test_excluded_multi_node_topology_is_not_reported_as_an_open_acceptance_gate(self):
+    readme = README.read_text()
+    security_review = SECURITY_REVIEW.read_text()
+    self.assertNotIn("two-node replay", readme)
+    self.assertNotIn("multi-node shared-store replay", readme)
+    self.assertNotIn("two-node shared-store consume/status/callback one-winner proof", security_review)
+    self.assertIn("multi-node behavior is explicitly out of scope", readme)
+    self.assertIn("Multi-node behavior is explicitly out of scope for current acceptance.", security_review)
+
   def test_acceptance_ledger_reports_current_verification_layers_and_remaining_gates(self):
     text = README.read_text()
     self.assertIn("The checks failed against the synthetic merge revision", text)
     self.assertIn("The failure-specific probe also assumed the Hermes scratch directory exists", text)
-    self.assertIn("146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests", text)
+    self.assertIn("147 tests (133 other tests, 11 ledger, 3 workflow guard tests", text)
+    self.assertIn("Current cleanup-interrupt candidate offline checks:** Python 168 tests (150 other tests, 15 ledger, 3 workflow guard tests", text)
     self.assertIn("missing Registry configuration returns unavailable (503), not absence (401)", text)
     self.assertIn("a Registry miss accompanied by a dial warning is unavailable", text)
     self.assertIn("Current isolated offline branch: Java 21 Maven 179 tests and Python acceptance 185 tests pass", text)

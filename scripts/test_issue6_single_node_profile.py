@@ -226,13 +226,23 @@ class Issue6SingleNodeProfileTest(unittest.TestCase):
         stack.enter_context(patch.object(probe, 'configure_realm'))
         stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
         stack.enter_context(patch.object(probe, 'provision_identity_attribute'))
-        auth_flow = stack.enter_context(patch.object(probe, 'auth_flow', return_value={
-            'proof_post_http': 202, 'changed_retry_http': 409,
-            'callback_replay_http': 302, 'callback_replay_redirect_uri_matches': True,
-            'callback_replay_state_preserved': True, 'callback_replay_error_returned': True,
-            'callback_replay_code_returned': False, 'pkce_token_http': 200,
-        }))
-        cleanup = stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=0))
+        events = []
+        def run_auth(*_args, **_kwargs):
+          events.append('auth_flow')
+          return {
+              'proof_post_http': 202, 'changed_retry_http': 409,
+              'callback_replay_http': 302, 'callback_replay_redirect_uri_matches': True,
+              'callback_replay_state_preserved': True, 'callback_replay_error_returned': True,
+              'callback_replay_code_returned': False, 'pkce_token_http': 200,
+          }
+        auth_flow = stack.enter_context(patch.object(probe, 'auth_flow', side_effect=run_auth))
+        expiry_flow = stack.enter_context(patch.object(probe, 'expiry_acceptance_flow',
+            side_effect=lambda *_args, **_kwargs: events.append('expiry_flow') or {
+                'stage': 'complete', 'profile': 'expiry', 'lifetime_seconds': 300,
+                'wait_seconds': 301, 'proof_http': 404, 'status_http': 404,
+                'fresh_login_transaction_available': True}))
+        stack.enter_context(patch.object(probe, 'capture_live_resolver_diagnostics', return_value=[]))
+        cleanup = stack.enter_context(patch.object(probe, 'finish_owned_cleanup', return_value=0))
 
         probe.run_issue6_single_node_profile()
 
@@ -240,6 +250,8 @@ class Issue6SingleNodeProfileTest(unittest.TestCase):
       start_registry.assert_called_once()
       start_keycloak.assert_called_once()
       auth_flow.assert_called_once()
+      expiry_flow.assert_called_once()
+      self.assertEqual(['auth_flow', 'expiry_flow'], events)
       cleanup.assert_called_once_with(registry_node, 'resolver-tools-id')
 
   def test_ci_and_documented_unittest_commands_include_profile_module(self):

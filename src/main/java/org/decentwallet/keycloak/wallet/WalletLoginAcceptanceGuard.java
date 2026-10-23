@@ -25,6 +25,11 @@ final class WalletLoginAcceptanceGuard {
     publications.remove(receiptKey, current);
   }
 
+  void release(String receiptKey) {
+    publications.computeIfPresent(receiptKey, (key, current) ->
+        current.state() == State.PUBLISHING ? null : current);
+  }
+
   void markFailed(String receiptKey, Instant now) {
     publications.computeIfPresent(receiptKey, (key, current) ->
         now.isBefore(current.expiresAt()) ? new Publication(State.FAILED, current.expiresAt()) : null);

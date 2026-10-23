@@ -727,7 +727,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       def fake_run(args, **_kwargs):
         calls.append(args)
         if args[:3] == ['podman', 'inspect', '--format']:
-          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) == 1:
             return SimpleNamespace(returncode=0, stdout=container_id + '\n')
           return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + container_id)
         return SimpleNamespace(returncode=0, stdout='')
@@ -794,9 +794,12 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     import wallet_login_live_e2e as probe
 
     main_source = inspect.getsource(probe.main)
-    self.assertIn('cleanup_errors = cleanup_owned_resources(registry, resolver_tools)', main_source)
-    self.assertIn('if cleanup_errors:', main_source)
-    self.assertIn('owned container cleanup incomplete', main_source)
+    cleanup_source = inspect.getsource(probe.finish_owned_cleanup)
+    failure_cleanup_source = inspect.getsource(probe.cleanup_after_failure)
+    self.assertIn('finish_owned_cleanup(registry, resolver_tools)', main_source)
+    self.assertIn('owned container cleanup incomplete', cleanup_source)
+    self.assertIn('interruption_collector', inspect.getsource(probe.cleanup_owned_resources))
+    self.assertIn('cleanup_owned_resources(registry_node, resolver_tools, cleanup_interruptions)', failure_cleanup_source)
 
   def test_cleanup_reports_sanitized_resource_categories_without_container_ids(self):
     from contextlib import redirect_stdout

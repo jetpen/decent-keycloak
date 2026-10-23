@@ -988,6 +988,7 @@ final class WalletLoginTransportHandlerTest {
     var recovered = handler.submitProof(fresh.handle(), WALLET_ORIGIN, "cross-site", "application/json",
         fresh.csrfToken(), freshProof, IDP_ORIGIN);
     assertEquals(202, recovered.status());
+    assertEquals(Map.of("status", "pending"), recovered.body());
     assertTrue(store.callbackGateAvailable(fresh.handle(), freshBinding));
   }
 
@@ -1114,6 +1115,34 @@ final class WalletLoginTransportHandlerTest {
     assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
     assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
     assertEquals(404, status.status());
+  }
+
+  @Test
+  void publicationExceptionsBeforeOrAfterMutationReturnUnavailableAndNeverExposeAcceptedState() throws Exception {
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    for (String prefix : java.util.List.of("decent-wallet-login-v1:callback:", "decent-wallet-login-v1:accepted:")) {
+      for (boolean persistBeforeThrow : new boolean[] {false, true}) {
+        var provider = new ThrowingPublicationStore(prefix, persistBeforeThrow);
+        var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+        var issued = store.issue(BINDING);
+        byte[] proof = signedProof(issued.challenge(), "mailto:alice@example.org", keyPair);
+        var handler = new WalletLoginTransportHandler(store,
+            exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+            WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+
+        var response = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
+            issued.csrfToken(), proof, IDP_ORIGIN);
+        var status = handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+            issued.csrfToken(), IDP_ORIGIN, BINDING);
+
+        assertEquals(503, response.status(), prefix + " persistBeforeThrow=" + persistBeforeThrow);
+        assertEquals(404, status.status(), prefix + " persistBeforeThrow=" + persistBeforeThrow);
+        assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+        assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+        assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+        assertTrue(store.load(issued.handle()).isEmpty());
+      }
+    }
   }
 
   @Test
@@ -1873,6 +1902,26 @@ final class WalletLoginTransportHandlerTest {
   private static final class FailingCallbackGateStore extends MemoryStore {
     @Override public boolean replace(String key, Map<String, String> notes) {
       if (key.startsWith("decent-wallet-login-v1:callback:")) return false;
+      return super.replace(key, notes);
+    }
+  }
+
+  private static final class ThrowingPublicationStore extends MemoryStore {
+    private final String failingPrefix;
+    private final boolean persistBeforeThrow;
+    private boolean thrown;
+
+    ThrowingPublicationStore(String failingPrefix, boolean persistBeforeThrow) {
+      this.failingPrefix = failingPrefix;
+      this.persistBeforeThrow = persistBeforeThrow;
+    }
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      if (!thrown && key.startsWith(failingPrefix)) {
+        thrown = true;
+        if (persistBeforeThrow) super.replace(key, notes);
+        throw new IllegalStateException("injected provider publication exception");
+      }
       return super.replace(key, notes);
     }
   }
