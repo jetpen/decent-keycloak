@@ -58,7 +58,12 @@ class AcceptanceLedgerTest(unittest.TestCase):
 
   def test_current_branch_issue4_not_found_attempt_remains_unqualified(self):
     text = README.read_text()
+    self.assertIn("Python 189 tests pass on this worktree.", text)
     self.assertIn("Current #4 `issue4-not-found` run: image ID `a74499a0980391206b961260fe04e9e02b931d8c4fe36b61195318820d7874fe`", text)
+    self.assertIn("Repeat #4 `issue4-not-found` attempt (report saved 2026-10-22 CDT / 2026-10-23 UTC; same immutable image/harness pair)", text)
+    self.assertIn("CLI exited 1 as `unavailable` with `dial_warning`, `registry_miss` and terminal `not found`; provider returned HTTP 503/unavailable", text)
+    self.assertIn("The harness reported cleanup `inconclusive`; post-run Podman events and exact full-ID inspections confirmed all three run-owned containers absent", text)
+    self.assertIn("The offline cleanup readback correction is unit-tested but has not been live-rerun.", text)
     self.assertIn("digest `sha256:76d8083b7f2af1587d737ad82add075cf718f8814af891e06acf3a053c95512e`", text)
     self.assertIn("harness SHA `ccfda7f7d1ad4c7d634902ac1e067e409ce4411f50082e17385d589a85345b14`", text)
     self.assertIn("repeated `dial_warning` made resolution `unavailable`; provider returned 503/unavailable", text)
