@@ -816,10 +816,14 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('port=fresh_readback_port()', helper)
     self.assertNotIn('port=0,', helper)
 
-  def test_rotation_helper_runs_in_the_pinned_runtime_image(self):
+  def test_rotation_helper_is_packaged_and_registry_cli_smoke_runs_in_runtime_stage(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
+    builder_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[0]
+    runtime_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
+        'FROM keycloak-with-resolver AS runtime', 1)[0]
     self.assertIn('COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py', dockerfile)
-    self.assertIn('decent-registry --help >/dev/null', dockerfile)
+    self.assertNotIn('decent-registry --help', builder_stage)
+    self.assertIn("from decent_registry.cli import main; main()' --help", runtime_stage)
     self.assertIn('cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py', dockerfile)
 
   def test_stale_key_rotation_uses_packaged_tools_and_confirms_exact_successor_key(self):

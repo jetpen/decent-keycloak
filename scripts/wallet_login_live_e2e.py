@@ -3254,6 +3254,19 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status}
 
 
+def issue4_missing_identity_is_qualified(evidence):
+  """Require a clean exact Registry miss and the provider's terminal denial."""
+  if not isinstance(evidence, dict):
+    return False
+  return (evidence.get('cli_resolution') == 'not_found'
+      and evidence.get('cli_output_categories') == ['registry_miss', 'not_found']
+      and evidence.get('direct_provider_http') == 401
+      and evidence.get('provider_resolution_outcome') == 'provider_denied_unclassified'
+      and evidence.get('status_pending') is True
+      and evidence.get('redirects_safe') is True
+      and evidence.get('no_acceptance_or_callback') is True)
+
+
 def classify_provider_identity_outcome(provider_http):
   """Classify only the provider request status; a separate CLI miss is not authority."""
   if provider_http == 503:
@@ -3274,17 +3287,35 @@ def _no_new_redirects(client, previous_count):
       and len(redirects) == previous_count)
 
 
-def _response_has_acceptance_evidence(headers, raw_body):
-  if not isinstance(headers, dict) or any(str(name).lower() == 'location' for name in headers):
-    return True
+def _response_acceptance_category(headers, raw_body, terminal_http_status=None):
+  try:
+    header_items = list(headers.items())
+  except (AttributeError, TypeError, ValueError):
+    return 'invalid_headers'
+  for name, value in header_items:
+    if str(name).lower() != 'location':
+      continue
+    location = urllib.parse.urlsplit(str(value))
+    query = urllib.parse.parse_qs(location.query)
+    redirect_path = urllib.parse.urlsplit(REDIRECT).path
+    if location.path == redirect_path or 'code' in query or ('state' in query and 'error' in query):
+      return 'callback_location'
   if raw_body in (None, b'', ''):
-    return False
+    return 'empty_body'
   try:
     body = json.loads(raw_body)
   except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-    return True
-  return (_contains_key(body, 'code') or _contains_key(body, 'callback')
-      or _has_accepted_result(body))
+    return ('terminal_denial_body' if terminal_http_status in {401, 503}
+        else 'opaque_body')
+  if (_contains_key(body, 'code') or _contains_key(body, 'callback')
+      or _has_accepted_result(body)):
+    return 'structured_acceptance'
+  return 'structured_no_acceptance'
+
+
+def _response_has_acceptance_evidence(headers, raw_body, terminal_http_status=None):
+  return _response_acceptance_category(headers, raw_body, terminal_http_status) in {
+      'callback_location', 'structured_acceptance', 'opaque_body', 'invalid_headers'}
 
 
 def missing_identity_flow(temp, resolver_port, bootstrap, image):
@@ -3379,11 +3410,21 @@ def missing_identity_flow(temp, resolver_port, bootstrap, image):
   status_pending = status_payload == {'status': 'pending'}
   redirects_safe = (challenge_redirects_safe and proof_redirects_safe
       and status_redirects_safe)
+  provider_acceptance_category = _response_acceptance_category(
+      provider_headers, provider_body, terminal_http_status=provider_http)
+  status_acceptance_category = _response_acceptance_category(
+      status_response_headers, status_raw)
+  provider_acceptance = _response_has_acceptance_evidence(
+      provider_headers, provider_body, terminal_http_status=provider_http)
+  status_acceptance = _response_has_acceptance_evidence(status_response_headers, status_raw)
   no_acceptance_or_callback = (status_pending and redirects_safe
-      and not _response_has_acceptance_evidence(provider_headers, provider_body)
-      and not _response_has_acceptance_evidence(status_response_headers, status_raw))
+      and not provider_acceptance and not status_acceptance)
   require(no_acceptance_or_callback,
-      'unpublished Identity produced no accepted receipt, callback, or code')
+      'unpublished Identity produced no accepted receipt, callback, or code '
+      + '(pending=' + str(status_pending).lower()
+      + ', redirects_safe=' + str(redirects_safe).lower()
+      + ', provider_evidence=' + provider_acceptance_category
+      + ', status_evidence=' + status_acceptance_category + ')')
   return {'cli_resolution': resolution_category, 'cli_exit': registry_lookup.returncode,
       'cli_output_categories': result_categories, 'cli_output_shape': safe_lines,
       'cli_lookup_ms': lookup_ms, 'provider_resolution_outcome': provider_resolution_outcome,
@@ -3396,8 +3437,8 @@ def missing_identity_flow(temp, resolver_port, bootstrap, image):
 def main():
   global IMAGE, RUN_CID_DIR
   profile = os.environ.get('WALLET_IT_PROFILE', 'default')
-  if profile not in {'default', 'expiry'}:
-    raise ValueError('WALLET_IT_PROFILE must be default or expiry')
+  if profile not in {'default', 'expiry', 'issue4-not-found'}:
+    raise ValueError('WALLET_IT_PROFILE must be default, expiry, or issue4-not-found')
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
   runtime_provenance['image_digest'] = image_digest
@@ -3450,6 +3491,28 @@ def main():
         runtime_provenance.update(keycloak_runtime_provenance(
             client, token, client.wallet_container_id))
         checkpoint()
+        if profile == 'issue4-not-found':
+          require(runtime_provenance['keycloak_version'] == '26.8.0'
+              and runtime_provenance['keycloak_nodes'] == 'one',
+              'pinned single-node Keycloak runtime facts verified',
+              runtime_provenance['keycloak_version'])
+          configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
+          enable_keycloak_login_events(client, token)
+          result['missing_identity_case'] = missing_identity_flow(
+              temp, resolver_port, bootstrap, IMAGE)
+          checkpoint()
+          require(issue4_missing_identity_is_qualified(result['missing_identity_case']),
+              'Issue #4 clean provider-level terminal not_found qualification')
+          runtime_provenance['diagnostic_categories'] = capture_live_resolver_diagnostics(
+              container, result, checkpoint)
+          print('issue4-evidence=', json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+          cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+          registry = None
+          resolver_tools = None
+          if cleanup_errors:
+            raise RuntimeError(
+                f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}')
+          return
         require(runtime_provenance['runtime_qualification_status'] == 'runtime_facts_verified',
             'effective Keycloak runtime provenance verified',
             runtime_provenance['runtime_qualification_status'])

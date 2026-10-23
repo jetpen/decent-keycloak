@@ -54,8 +54,7 @@ exec /opt/decent-resolver/venv/bin/python -c 'from decent_registry.cli import ma
 EOF
 RUN --network=none chmod 0755 /opt/decent-resolver/bin/decent-identity /opt/decent-resolver/bin/decent-registry \
  && cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py \
- && python3.11 -m compileall -q /opt/decent-resolver/identity-src/src /opt/decent-resolver/registry-src/src \
- && /opt/decent-resolver/bin/decent-registry --help >/dev/null
+ && python3.11 -m compileall -q /opt/decent-resolver/identity-src/src /opt/decent-resolver/registry-src/src
 
 FROM quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad AS keycloak-with-resolver
 USER 0

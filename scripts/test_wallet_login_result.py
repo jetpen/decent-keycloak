@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
 
 os.environ.setdefault('WALLET_IT_NATIVE_LIBS', '/unused-test-library-path')
@@ -337,14 +338,61 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       self.assertIn(expected, body)
 
   def test_missing_identity_acceptance_evidence_fails_closed(self):
-    self.assertFalse(live._response_has_acceptance_evidence({}, b''))
+    response_headers = Message()
+    response_headers['Content-Type'] = 'application/json'
+    self.assertFalse(live._response_has_acceptance_evidence(
+        response_headers, b'{"status":"pending"}'))
+    self.assertEqual('structured_no_acceptance', live._response_acceptance_category(
+        response_headers, b'{"status":"pending"}'))
     self.assertFalse(live._response_has_acceptance_evidence({}, b'{"status":"pending"}'))
     self.assertTrue(live._response_has_acceptance_evidence(
         {'Location': '/callback?code=redacted'}, b''))
+    self.assertEqual('callback_location', live._response_acceptance_category(
+        {'Location': '/callback?code=redacted'}, b''))
+    self.assertEqual('structured_no_acceptance', live._response_acceptance_category(
+        {'Location': '/auth/realms/wallet-login/transactions/opaque/status'},
+        b'{"status":"pending"}'))
+    self.assertFalse(live._response_has_acceptance_evidence(
+        {'Location': '/auth/realms/wallet-login/transactions/opaque/status'},
+        b'{"status":"pending"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'{"code":"redacted"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'{"callback_url":"redacted"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'{"accepted_receipt":"redacted"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'unstructured response'))
+    self.assertFalse(live._response_has_acceptance_evidence(
+        {}, b'provider unavailable', terminal_http_status=503))
+    self.assertFalse(live._response_has_acceptance_evidence(
+        {}, b'provider denied', terminal_http_status=401))
+    self.assertTrue(live._response_has_acceptance_evidence(
+        {}, b'{"code":"redacted"}', terminal_http_status=401))
+
+  def test_issue4_live_profile_requires_clean_provider_not_found(self):
+    source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
+    main = source[source.index('def main():'):]
+    self.assertIn("'issue4-not-found'", main)
+    self.assertIn('issue4_missing_identity_is_qualified', main)
+
+  def test_issue4_qualification_requires_exact_clean_miss_and_provider_denial(self):
+    accepted = {
+        'cli_resolution': 'not_found',
+        'cli_output_categories': ['registry_miss', 'not_found'],
+        'direct_provider_http': 401,
+        'provider_resolution_outcome': 'provider_denied_unclassified',
+        'status_pending': True,
+        'redirects_safe': True,
+        'no_acceptance_or_callback': True,
+    }
+    self.assertTrue(live.issue4_missing_identity_is_qualified(accepted))
+    for change in (
+        {'cli_resolution': 'unavailable'},
+        {'cli_output_categories': ['dial_warning', 'registry_miss', 'not_found']},
+        {'direct_provider_http': 503},
+        {'status_pending': False},
+        {'redirects_safe': False},
+        {'no_acceptance_or_callback': False},
+    ):
+      with self.subTest(change=change):
+        self.assertFalse(live.issue4_missing_identity_is_qualified({**accepted, **change}))
 
   def test_live_e2e_probe_reports_registry_and_account_misses_distinctly(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
@@ -355,7 +403,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertIn("'identity_id': missing_id, 'signature': b64url(signature.stdout)", body)
     self.assertIn("'direct_provider_http': provider_http", body)
     self.assertIn('provider_resolution_outcome = classify_provider_identity_outcome(provider_http)', body)
-    self.assertIn('_response_has_acceptance_evidence(provider_headers, provider_body)', body)
+    self.assertIn('provider_headers, provider_body, terminal_http_status=provider_http)', body)
+    self.assertIn("', status_evidence=' + status_acceptance_category", body)
     self.assertIn("return 'provider_denied_unclassified'", source)
 
   def test_partial_failure_evidence_includes_only_bounded_resolver_categories(self):
