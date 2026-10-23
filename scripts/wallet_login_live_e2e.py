@@ -362,7 +362,7 @@ def sanitize_live_checkpoint(candidate):
   }
   resolver_diagnostic_reasons = {
       'registry_miss', 'dial_warning', 'peer_handshake', 'peer_error',
-      'history_unavailable', 'traceback', 'process_start', 'nonzero_exit',
+      'history_unavailable', 'dht_lookup_unavailable', 'traceback', 'process_start', 'nonzero_exit',
       'unknown', 'success', 'timeout', 'interrupted', 'termination_interrupted',
       'output_overflow',
   }
@@ -3266,7 +3266,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status}
 
 
-def issue4_missing_identity_is_qualified(evidence):
+def provider_missing_identity_is_qualified(evidence):
   """Require a clean exact Registry miss and the provider's terminal denial."""
   if not isinstance(evidence, dict):
     return False
@@ -3449,8 +3449,8 @@ def missing_identity_flow(temp, resolver_port, bootstrap, image):
 def main():
   global IMAGE, RUN_CID_DIR
   profile = os.environ.get('WALLET_IT_PROFILE', 'default')
-  if profile not in {'default', 'expiry', 'issue4-not-found'}:
-    raise ValueError('WALLET_IT_PROFILE must be default, expiry, or issue4-not-found')
+  if profile not in {'default', 'expiry', 'provider-not-found-diagnostic'}:
+    raise ValueError('WALLET_IT_PROFILE must be default, expiry, or provider-not-found-diagnostic')
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
   runtime_provenance['image_digest'] = image_digest
@@ -3503,7 +3503,7 @@ def main():
         runtime_provenance.update(keycloak_runtime_provenance(
             client, token, client.wallet_container_id))
         checkpoint()
-        if profile == 'issue4-not-found':
+        if profile == 'provider-not-found-diagnostic':
           require(runtime_provenance['keycloak_version'] == '26.8.0'
               and runtime_provenance['keycloak_nodes'] == 'one',
               'pinned single-node Keycloak runtime facts verified',
@@ -3513,11 +3513,11 @@ def main():
           result['missing_identity_case'] = missing_identity_flow(
               temp, resolver_port, bootstrap, IMAGE)
           checkpoint()
-          require(issue4_missing_identity_is_qualified(result['missing_identity_case']),
-              'Issue #4 clean provider-level terminal not_found qualification')
+          require(provider_missing_identity_is_qualified(result['missing_identity_case']),
+              'additional provider-level missing-Identity terminal not_found diagnostic qualification')
           runtime_provenance['diagnostic_categories'] = capture_live_resolver_diagnostics(
               container, result, checkpoint)
-          print('issue4-evidence=', json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+          print('provider-not-found-diagnostic-evidence=', json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
           cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
           registry = None
           resolver_tools = None

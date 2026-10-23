@@ -15,9 +15,9 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("146 tests (141 non-ledger, 11 ledger, 2 workflow guard tests", text)
     self.assertIn("missing Registry configuration returns unavailable (503), not absence (401)", text)
     self.assertIn("a Registry miss accompanied by a dial warning is unavailable", text)
-    self.assertIn("Current isolated offline branch: Java 21 Maven 179 tests and Python acceptance 184 tests pass", text)
-    self.assertIn("pass 11 peer-outcome and 5 Registry propagation cases", text)
-    self.assertIn("CI runs the image-build/runtime-version check; provider-level live qualification remains outstanding.", text)
+    self.assertIn("Current isolated offline branch: Java 21 Maven 179 tests and Python acceptance 185 tests pass", text)
+    self.assertIn("pass 11 peer-outcome and 7 Registry propagation cases", text)
+    self.assertIn("CI runs the image-build/runtime-version check; exact-image direct resolver qualification is recorded below.", text)
     self.assertEqual(2, text.count("| Slice | Status | Verified so far | Still open |"))
     self.assertNotIn("uncommitted/unmerged", text)
 
@@ -39,9 +39,9 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("downloaded hash-locked dependency artifacts", text)
     self.assertIn("That historical no-cache image build downloaded hash-locked dependency artifacts and was not network-isolated", text)
 
-  def test_latest_offline_build_and_live_probe_keep_missing_id_gate_open(self):
+  def test_exact_image_resolver_qualification_is_recorded(self):
     text = README.read_text()
-    self.assertIn("Latest #4 live probe on offline-built runtime from staging fingerprint `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`", text)
+    self.assertIn("Prior provider-level loopback probe on offline-built runtime from staging fingerprint `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`", text)
     self.assertIn("wheelhouse `container/resolver-wheelhouse.tar.gz` (67 files, 32,102,893 bytes", text)
     self.assertIn("SHA-256 `3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587`", text)
     self.assertIn("The no-cache build used `--pull=never --network=none` and succeeded", text)
@@ -49,19 +49,20 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("runner SHA `606e86f9335ef568c0dbec91008c7a987151d8dc6d41fcaabd238af84d260e8e`", text)
     self.assertIn("On this `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` snapshot, the documented Python suite passed 150 tests", text)
     self.assertIn("the full Python suite passed 151 tests on the documentation/test-only follow-up", text)
-    self.assertIn("A separate stopped-Registry lookup classified `unavailable`", text)
-    self.assertIn("Missing Identity produced Registry miss + terminal `not found` with repeated `dial_warning`, so classifier returned `unavailable`", text)
-    self.assertIn("latest issue4-not-found run is recorded below", text)
-    self.assertIn("clean provider-level terminal `not_found` for a missing Identity without disqualifying dial-warning diagnostics", text)
+    self.assertIn("Current #4 direct exact-image resolver qualification (isolated runs): qualification source fingerprint `7e2ff4291bf1e8e0a59deba92f6739d98c6e9f3b01201342ff74de639db4a2fc`; image ID `3a1eabb3cebadc77baf2bcbc0fac55b7bd5b5e3d60afb080a5a2b683214ec487`; digest `sha256:b9a45b0214a80008549bdefb001c2b9ab2c41c80d24feb909e6736e7ea8b7fb3`; production harness SHA `a24a1634b1b346ef9323415577cb799298433d1878c180f5db577db98f10ceb6`; exact resolver runner SHA `15eabbae4f1b25ca2035fed524d0e45f01980b071d7f9d0534c221afdc85d0c3`; fresh-Registry miss runner SHA `f28bfd1138dcbfcb20ded9c4dd8998bfb87db6bb51d912266a6b9aecf55a1099`.", text)
+    self.assertIn("Results: `resolved` exact Identity ID/current owner key; `not_found` exact requested key with `get_value` and `remote_identity` each 1/1 clean-empty; `unavailable` from a stopped Registry.", text)
+    self.assertIn("The three outcomes were established across isolated runs, not one combined run.", text)
+    self.assertIn("The combined attempt's missing query after resolved-record traffic returned `unavailable` with one incomplete `get_value` referral; it is retained as a separate diagnostic.", text)
     self.assertIn("Multi-node/cross-node qualification is not an acceptance requirement under parent Issue #1.", text)
     self.assertNotIn("multi-node shared-store replay", text)
     self.assertNotIn("has not yet been qualified across nodes", text)
     self.assertIn("no actionable standards/security findings", text)
     self.assertNotIn("network-isolated image build remains unshown", text)
 
-  def test_current_branch_issue4_not_found_attempt_remains_unqualified(self):
+  def test_prior_provider_level_issue4_not_found_attempt_remains_unqualified(self):
     text = README.read_text()
-    self.assertIn("Current #4 `issue4-not-found` run: image ID `a74499a0980391206b961260fe04e9e02b931d8c4fe36b61195318820d7874fe`", text)
+    self.assertIn("The legacy selector `issue4-not-found` is now named `provider-not-found-diagnostic`: it starts a Keycloak HTTP flow separate from Issue #4’s direct resolver gate and was not run for this resolver-only qualification.", text)
+    self.assertIn("Prior provider-level `issue4-not-found` diagnostic probe: image ID `a74499a0980391206b961260fe04e9e02b931d8c4fe36b61195318820d7874fe`", text)
     self.assertIn("digest `sha256:76d8083b7f2af1587d737ad82add075cf718f8814af891e06acf3a053c95512e`", text)
     self.assertIn("harness SHA `ccfda7f7d1ad4c7d634902ac1e067e409ce4411f50082e17385d589a85345b14`", text)
     self.assertIn("repeated `dial_warning` made resolution `unavailable`; provider returned 503/unavailable", text)

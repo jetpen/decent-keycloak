@@ -16,6 +16,12 @@ import wallet_login_live_e2e as live  # noqa: E402
 
 class IdentityLookupClassificationTest(unittest.TestCase):
 
+  def test_checkpoint_preserves_dht_lookup_unavailable_resolver_diagnostic(self):
+    candidate = {'resolver_runtime': {
+        'diagnostic_categories': ['ok:dht_lookup_unavailable']}}
+
+    self.assertEqual(candidate, sanitize_live_checkpoint(candidate))
+
   def _run_missing_identity_probe(self, redirect_during=None):
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -366,13 +372,16 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertTrue(live._response_has_acceptance_evidence(
         {}, b'{"code":"redacted"}', terminal_http_status=401))
 
-  def test_issue4_live_profile_requires_clean_provider_not_found(self):
+  def test_provider_not_found_diagnostic_profile_is_explicitly_separate(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
     main = source[source.index('def main():'):]
-    self.assertIn("'issue4-not-found'", main)
-    self.assertIn('issue4_missing_identity_is_qualified', main)
+    self.assertIn("'provider-not-found-diagnostic'", main)
+    self.assertNotIn("'issue4-not-found'", main)
+    self.assertIn('provider_missing_identity_is_qualified', main)
+    self.assertNotIn('issue4_missing_identity_is_qualified', main)
+    self.assertNotIn('Issue #4 clean provider-level terminal', main)
 
-  def test_issue4_qualification_requires_exact_clean_miss_and_provider_denial(self):
+  def test_provider_not_found_diagnostic_requires_exact_clean_miss_and_denial(self):
     accepted = {
         'cli_resolution': 'not_found',
         'cli_output_categories': ['registry_miss', 'not_found'],
@@ -382,7 +391,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'redirects_safe': True,
         'no_acceptance_or_callback': True,
     }
-    self.assertTrue(live.issue4_missing_identity_is_qualified(accepted))
+    self.assertTrue(live.provider_missing_identity_is_qualified(accepted))
     for change in (
         {'cli_resolution': 'unavailable'},
         {'cli_output_categories': ['dial_warning', 'registry_miss', 'not_found']},
@@ -392,7 +401,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         {'no_acceptance_or_callback': False},
     ):
       with self.subTest(change=change):
-        self.assertFalse(live.issue4_missing_identity_is_qualified({**accepted, **change}))
+        self.assertFalse(live.provider_missing_identity_is_qualified({**accepted, **change}))
 
   def test_live_e2e_probe_reports_registry_and_account_misses_distinctly(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
