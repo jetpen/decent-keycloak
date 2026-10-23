@@ -36,6 +36,8 @@ def checked_download(url: str, expected_sha256: str, destination: Path) -> None:
 
 
 def extract_pinned_archive(archive: Path, destination: Path, expected_commit: str) -> None:
+    if destination.is_symlink():
+        raise RuntimeError("source extraction destination must not be a symlink")
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as bundle:
         members = bundle.getmembers()
@@ -76,6 +78,8 @@ def validate_repo_owned_lock() -> dict:
             raise RuntimeError("source revision is not a full immutable commit")
         if not source["url"].startswith("https://github.com/"):
             raise RuntimeError("source archive must use HTTPS GitHub URL")
+    from verify_resolver_runtime_inputs import verify_wheelhouse_archive
+    verify_wheelhouse_archive(LOCK_PATH.parent, LOCK_PATH)
     return lock
 
 

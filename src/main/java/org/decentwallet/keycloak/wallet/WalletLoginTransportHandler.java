@@ -98,8 +98,16 @@ public final class WalletLoginTransportHandler {
       String fetchMode, String fetchDest, String contentType, String csrfToken,
       byte[] body, String idpOrigin, WalletLoginTransactionStore.Intent expectedIntent) {
     var pending = transactions.load(handle);
-    if (pending.isEmpty()) return submitAcceptedRetry(handle, requestOrigin, fetchSite,
-        fetchMode, fetchDest, contentType, csrfToken, body, idpOrigin);
+    if (pending.isEmpty()) {
+      HttpResult retry = submitAcceptedRetry(handle, requestOrigin, fetchSite,
+          fetchMode, fetchDest, contentType, csrfToken, body, idpOrigin);
+      if (retry.status() != 202) {
+        String requestId = requestCorrelationId(handle);
+        LOG.debugf("Wallet transaction proof rejected (request=%s, reason=transaction_unavailable, provider=%s)",
+            requestId, transactionStore.singleUseObjectProviderId().id());
+      }
+      return retry;
+    }
     if (expectedIntent != null && pending.get().intent() != expectedIntent) return HttpResult.empty(403);
     WalletLoginTransactionStore.Binding binding = pending.get().binding();
     if (!sameOrigin(idpOrigin, binding.canonicalOrigin())
@@ -180,8 +188,15 @@ public final class WalletLoginTransportHandler {
       return HttpResult.empty(503);
     }
 
-    Optional<WalletLoginTransactionStore.PendingTransaction> consumed = transactions.consume(
-        handle, binding, pending.get().challenge(), pending.get().csrfToken());
+    final Optional<WalletLoginTransactionStore.PendingTransaction> consumed;
+    try {
+      consumed = transactions.consume(handle, binding, pending.get().challenge(), pending.get().csrfToken());
+    } catch (RuntimeException unavailable) {
+      // Consume may have removed the pending key before the provider reported failure.
+      // Never publish acceptance or retry the old transaction; require a fresh explicit signup.
+      LOG.warnf("Wallet pending transaction unavailable (request=%s, reason=consume-unavailable)", requestId);
+      return HttpResult.empty(503);
+    }
     if (consumed.isEmpty()) return HttpResult.empty(409);
     String digest = hex(sha256(body));
     try {

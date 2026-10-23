@@ -40,6 +40,26 @@ public final class WalletLoginTransactionStore {
   private static final String NOTE_RECEIPT_EXPIRES = "receipt_expires_at";
   private static final String HANDLE_PREFIX = "decent-wallet-login-v1:transaction:";
 
+  public enum SingleUseObjectProviderId {
+    INFINISPAN("infinispan"), JPA("jpa"), REMOTE("remote"), UNKNOWN("unknown");
+    private final String id;
+    SingleUseObjectProviderId(String id) { this.id = id; }
+    public String id() { return id; }
+  }
+
+  private static final Map<String, SingleUseObjectProviderId> PROVIDER_CLASSES = Map.of(
+      "org.keycloak.models.sessions.infinispan.InfinispanSingleUseObjectProvider", SingleUseObjectProviderId.INFINISPAN,
+      "org.keycloak.singleobject.jpa.JpaSingleUseObjectProvider", SingleUseObjectProviderId.JPA,
+      "org.keycloak.models.sessions.infinispan.remote.RemoteInfinispanSingleUseObjectProvider", SingleUseObjectProviderId.REMOTE);
+
+  public static SingleUseObjectProviderId providerIdForClassName(String className) {
+    return PROVIDER_CLASSES.getOrDefault(className, SingleUseObjectProviderId.UNKNOWN);
+  }
+
+  public SingleUseObjectProviderId singleUseObjectProviderId() {
+    return providerIdForClassName(singleUseObjects.getClass().getName());
+  }
+
   private final SingleUseObjectProvider singleUseObjects;
   private final SecureRandom random;
   private final Clock clock;

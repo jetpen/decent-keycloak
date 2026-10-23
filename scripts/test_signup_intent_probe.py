@@ -21,6 +21,8 @@ class SignupIntentProbeTest(unittest.TestCase):
     import tempfile
 
     with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / "run-owned-cids"
+      cid_dir.mkdir(mode=0o700)
       observed = {}
       def fake_run(argv, **kwargs):
         if argv[0] == "ss":
@@ -30,7 +32,9 @@ class SignupIntentProbeTest(unittest.TestCase):
         observed["argv"] = argv
         return subprocess.CompletedProcess(argv, 125, "", "")
 
-      with patch.object(probe, "SCRATCH", Path(scratch)), patch.object(probe, "run", side_effect=fake_run), \
+      with patch.object(probe, "SCRATCH", Path(scratch)), \
+           patch.object(probe, "RUN_CID_DIR", cid_dir), \
+           patch.object(probe, "run", side_effect=fake_run), \
            patch.object(probe, "Client", side_effect=AssertionError("discovery must not run after failed launch")):
         with self.assertRaisesRegex(RuntimeError, "start disposable Keycloak"):
           probe.start_keycloak("test", "fixture-only-value", Path(scratch) / "wrapper", 1234, "bootstrap", "sha256:" + "a" * 64)

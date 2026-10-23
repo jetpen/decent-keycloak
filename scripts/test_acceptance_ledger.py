@@ -18,9 +18,9 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertEqual(2, text.count("| Slice | Status | Verified so far | Still open |"))
     self.assertNotIn("uncommitted/unmerged", text)
 
-  def test_latest_image_from_current_worktree_records_fail_closed_gate(self):
+  def test_previous_current_worktree_image_records_fail_closed_gate(self):
     text = README.read_text()
-    self.assertIn("Latest #4 run from the current worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
+    self.assertIn("Previous #4 run from the current worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
     self.assertIn("image ID `92cc5d4c06fd4a65dd1e2fbbb5472f70fd901201536b88019706bff48c14ce13`", text)
     self.assertIn("digest `sha256:b4120b6aa22de7bf036250a9f66b701245e6f4fd8082cbeaf71f96d832cfd58b`", text)
     self.assertIn("harness SHA `e220a7920c211b5d995a0b389b4665107565bf8c40da0b43d8cc4c9d2afd8d61`", text)
@@ -29,12 +29,32 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("Harness exited 1 at the successor-read gate", text)
     self.assertIn("no stale/current-key proofs or provider `not_found` case ran", text)
     self.assertIn("Prior #4 run (image predates d700)", text)
-    self.assertIn("latest no-cache image was built from the current #4 worktree", text)
+    self.assertIn("A prior pre-wheelhouse no-cache image was built from the #4 worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
     self.assertIn("provider JAR inside that image has SHA-256 `4a2d1364180350fffc671a7f61812ecbea5e68f04c90df95f95c0b669d4fbbcd`", text)
     self.assertIn("current Maven target JAR SHA-256 is `c0f84827366911b7714f8590c2055c956fdd47d87cbcb01462f88ee8f5ac05c5`", text)
     self.assertIn("all 46 ZIP entry names and uncompressed contents match", text)
     self.assertIn("downloaded hash-locked dependency artifacts", text)
-    self.assertIn("network-isolated image build remains unshown", text)
+    self.assertIn("That historical no-cache image build downloaded hash-locked dependency artifacts and was not network-isolated", text)
+
+  def test_latest_offline_build_and_live_probe_keep_missing_id_gate_open(self):
+    text = README.read_text()
+    self.assertIn("Latest #4 live probe on offline-built runtime from staging fingerprint `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`", text)
+    self.assertIn("wheelhouse `container/resolver-wheelhouse.tar.gz` (67 files, 32,102,893 bytes", text)
+    self.assertIn("SHA-256 `3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587`", text)
+    self.assertIn("The no-cache build used `--pull=never --network=none` and succeeded", text)
+    self.assertIn("runtime image ID `b142c93da454437ef8e74dc5ab57e8b5149c632ebb1ba73c412c95247d489157`", text)
+    self.assertIn("runner SHA `606e86f9335ef568c0dbec91008c7a987151d8dc6d41fcaabd238af84d260e8e`", text)
+    self.assertIn("On this `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` snapshot, the documented Python suite passed 150 tests", text)
+    self.assertIn("the full Python suite passed 151 tests on the documentation/test-only follow-up", text)
+    self.assertIn("A separate stopped-Registry lookup classified `unavailable`", text)
+    self.assertIn("Missing Identity produced Registry miss + terminal `not found` with repeated `dial_warning`, so classifier returned `unavailable`", text)
+    self.assertIn("Later snapshot `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` passed a no-cache `--network=none` build and partial live qualification", text)
+    self.assertIn("clean provider-level terminal `not_found` for a missing Identity without disqualifying dial-warning diagnostics", text)
+    self.assertIn("Multi-node/cross-node qualification is not an acceptance requirement under parent Issue #1.", text)
+    self.assertNotIn("multi-node shared-store replay", text)
+    self.assertNotIn("has not yet been qualified across nodes", text)
+    self.assertIn("no actionable standards/security findings", text)
+    self.assertNotIn("network-isolated image build remains unshown", text)
 
   def test_separate_registry_matrix_run_is_not_conflated_with_issue_four(self):
     text = README.read_text()
@@ -99,7 +119,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
 
   def test_registry_listener_is_loopback_only(self):
     harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
-    start = harness.split("def start_registry(temp, image):", 1)[1].split("def start_resolver_tools(", 1)[0]
+    start = harness.split("def start_registry(temp, image, run_seconds=300):", 1)[1].split("def start_resolver_tools(", 1)[0]
     self.assertIn("host: 127.0.0.1", start)
     self.assertNotIn("host: 0.0.0.0", start)
 

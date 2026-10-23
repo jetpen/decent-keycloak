@@ -14,6 +14,13 @@ import java.time.Clock;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.erdtman.jcs.JsonCanonicalizer;
 import org.junit.jupiter.api.Test;
 import org.keycloak.models.SingleUseObjectProvider;
@@ -23,6 +30,45 @@ final class WalletLoginTransportHandlerTest {
   private static final String WALLET_ORIGIN = "https://wallet.example";
   private static final WalletLoginTransactionStore.Binding BINDING = new WalletLoginTransactionStore.Binding(
       "realm-id", "client-id", "root-session-id", "tab-id", "https://site.example/callback", IDP_ORIGIN);
+
+  private static WalletLoginAccountResolver retainedExactIdentityResolver(
+      String identity, AtomicInteger provisionCalls, Runnable afterProvision) {
+    var provisionedIdentity = new AtomicReference<String>();
+    return new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+        return exactIdentityId.equals(provisionedIdentity.get());
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return exactIdentityId.equals(provisionedIdentity.get());
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        assertEquals(identity, exactIdentityId);
+        provisionCalls.incrementAndGet();
+        provisionedIdentity.set(exactIdentityId);
+        afterProvision.run();
+        var user = mock(org.keycloak.models.UserModel.class);
+        when(user.isEnabled()).thenReturn(true);
+        return user;
+      }
+    };
+  }
+
+  private static WalletLoginTransactionStore.IssuedTransaction assertFreshSignupRecovers(
+      WalletLoginTransactionStore store, WalletLoginTransportHandler handler,
+      WalletLoginAccountResolver accounts, String identity, KeyPair keyPair,
+      WalletLoginTransactionStore.Binding retryBinding, AtomicInteger provisionCalls) throws Exception {
+    var retry = store.issue(retryBinding, WalletLoginTransactionStore.Intent.SIGNUP);
+    byte[] retryProof = signedProof(retry.challenge(), identity, keyPair);
+    assertEquals(202, handler.submitProof(retry.handle(), null, null, null, null,
+        "application/json", null, retryProof, IDP_ORIGIN).status());
+    assertEquals(1, provisionCalls.get());
+    assertTrue(accounts.hasUniqueEnabledUser(identity));
+    assertTrue(store.getAccepted(retry.handle(), retryBinding).isPresent());
+    assertTrue(store.callbackGateAvailable(retry.handle(), retryBinding));
+    assertEquals(Map.of("status", "accepted"), handler.getStatus(retry.handle(), null, "same-origin",
+        "cors", "empty", retry.csrfToken(), IDP_ORIGIN, retryBinding).body());
+    return retry;
+  }
 
   @Test
   void emptyJsonApiResponsesDeclareMediaTypeForKeycloakFilters() {
@@ -337,20 +383,9 @@ final class WalletLoginTransportHandlerTest {
     var issued = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC())
         .issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
     byte[] proof = signedProof(issued.challenge(), "mailto:race@example.org", keyPair);
-    var provisionCalls = new java.util.concurrent.atomic.AtomicInteger();
-    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
-      private volatile boolean provisioned;
-      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return provisioned; }
-      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) { return provisioned; }
-      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) throws Exception {
-        provisionCalls.incrementAndGet();
-        provisioned = true;
-        provider.remove(transactionKey(issued.handle()));
-        var user = org.mockito.Mockito.mock(org.keycloak.models.UserModel.class);
-        org.mockito.Mockito.when(user.isEnabled()).thenReturn(true);
-        return user;
-      }
-    };
+    var provisionCalls = new AtomicInteger();
+    var accounts = retainedExactIdentityResolver("mailto:race@example.org", provisionCalls,
+        () -> provider.remove(transactionKey(issued.handle())));
     var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
     var handler = new WalletLoginTransportHandler(store, exact ->
         new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
@@ -366,6 +401,206 @@ final class WalletLoginTransportHandlerTest {
     assertTrue(provider.entries.keySet().stream().noneMatch(key -> key.startsWith("decent-wallet-login-v1:callback:")));
     assertFalse(store.getAccepted(issued.handle(), BINDING).isPresent());
     assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.load(issued.handle()).isEmpty());
+
+    var retryBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "fresh-root-session", "fresh-tab", "https://site.example/callback", IDP_ORIGIN);
+    var retry = assertFreshSignupRecovers(store, handler, accounts, "mailto:race@example.org",
+        keyPair, retryBinding, provisionCalls);
+    assertEquals(404, handler.getStatus(issued.handle(), null, "same-origin",
+        "cors", "empty", issued.csrfToken(), IDP_ORIGIN, BINDING).status());
+    assertFalse(store.getAccepted(issued.handle(), BINDING).isPresent());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  // Single-process handler concurrency only; the in-memory provider is not a Keycloak store.
+  @Test
+  void concurrentSignupSubmissionsForOneHandleAllowOnlyTheAdmittedHandlerToProvision() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    String identity = "mailto:concurrent-handler@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var resolverEntered = new CountDownLatch(1);
+    var resolverMayReturn = new CountDownLatch(1);
+    var provisionCalls = new AtomicInteger();
+    var provisioned = new AtomicBoolean();
+    var account = mock(org.keycloak.models.UserModel.class);
+    when(account.isEnabled()).thenReturn(true);
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+        return identity.equals(exactIdentityId) && provisioned.get();
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return identity.equals(exactIdentityId) && provisioned.get();
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        assertEquals(identity, exactIdentityId);
+        provisionCalls.incrementAndGet();
+        provisioned.set(true);
+        return account;
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store, exact -> {
+      resolverEntered.countDown();
+      assertTrue(resolverMayReturn.await(5, TimeUnit.SECONDS),
+          "first handler remains in identity resolution while the duplicate is submitted");
+      return new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair));
+    }, WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try {
+      var first = executor.submit(() -> handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN));
+      assertTrue(resolverEntered.await(5, TimeUnit.SECONDS), "first handler must own the identity lookup slot");
+      var concurrent = handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN);
+      assertEquals(429, concurrent.status(), "same-handle concurrent handler is denied during the lookup window");
+      resolverMayReturn.countDown();
+      var accepted = first.get(5, TimeUnit.SECONDS);
+
+      assertEquals(202, accepted.status());
+      assertEquals(1, provisionCalls.get());
+      assertTrue(provisioned.get());
+      assertTrue(store.load(issued.handle()).isEmpty(), "pending transaction is consumed once");
+      assertTrue(store.getAccepted(issued.handle(), BINDING).isPresent());
+      assertTrue(store.callbackGateAvailable(issued.handle(), BINDING));
+      assertEquals(1, provider.entries.keySet().stream()
+          .filter(key -> key.startsWith("decent-wallet-login-v1:accepted:")).count());
+      assertEquals(1, provider.entries.keySet().stream()
+          .filter(key -> key.startsWith("decent-wallet-login-v1:callback:")).count());
+
+      var acceptedRetry = handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN);
+      assertEquals(202, acceptedRetry.status());
+      assertEquals(Map.of("status", "accepted"), acceptedRetry.body());
+      assertEquals(1, provisionCalls.get(), "accepted retry must not provision another account");
+    } finally {
+      resolverMayReturn.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "handler executor must terminate within the bound");
+    }
+  }
+
+  @Test
+  void consumeStoreExceptionAfterRemovalReturnsUnavailableAndAllowsFreshSignupRecovery() throws Exception {
+    class ThrowAfterConsumeStore extends MemoryStore {
+      private boolean throwAfterNextConsume;
+      @Override public Map<String, String> remove(String key) {
+        if (throwAfterNextConsume && key.startsWith("decent-wallet-login-v1:transaction:")) {
+          throwAfterNextConsume = false;
+          super.remove(key);
+          throw new IllegalStateException("injected consume storage failure");
+        }
+        return super.remove(key);
+      }
+    }
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var provider = new ThrowAfterConsumeStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    String identity = "mailto:consume-store-recovery@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var provisionCalls = new AtomicInteger();
+    var accounts = retainedExactIdentityResolver(identity, provisionCalls,
+        () -> provider.throwAfterNextConsume = true);
+    var handler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, accounts, true);
+
+    var logMessages = new java.util.ArrayList<String>();
+    var logCapture = new java.util.logging.Handler() {
+      @Override public void publish(java.util.logging.LogRecord record) { logMessages.add(record.getMessage()); }
+      @Override public void flush() {}
+      @Override public void close() {}
+    };
+    var logger = java.util.logging.LogManager.getLogManager().getLogger(
+        WalletLoginTransportHandler.class.getName());
+    var oldLevel = logger.getLevel();
+    try {
+      logger.addHandler(logCapture);
+      logger.setLevel(java.util.logging.Level.ALL);
+      var result = assertDoesNotThrow(() -> handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN));
+
+      assertEquals(503, result.status());
+      assertEquals(1, provisionCalls.get());
+      assertTrue(accounts.hasUniqueEnabledUser(identity));
+      assertTrue(store.load(issued.handle()).isEmpty());
+      assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+      assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+      assertEquals(404, handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+          issued.csrfToken(), IDP_ORIGIN, BINDING).status());
+      String expectedRequestId = java.util.HexFormat.of().formatHex(
+          java.security.MessageDigest.getInstance("SHA-256").digest(
+              issued.handle().getBytes(StandardCharsets.US_ASCII)), 0, 16);
+      var failureSignals = logMessages.stream()
+          .filter(message -> message.startsWith("Wallet pending transaction unavailable ")).toList();
+      assertEquals(java.util.List.of("Wallet pending transaction unavailable (request=" + expectedRequestId
+          + ", reason=consume-unavailable)"), failureSignals);
+      assertTrue(logMessages.stream().noneMatch(message -> message.contains(identity)
+          || message.contains(issued.handle()) || message.contains("injected consume storage failure")),
+          logMessages.toString());
+    } finally {
+      logger.removeHandler(logCapture);
+      logger.setLevel(oldLevel);
+    }
+
+    var retryBinding = new WalletLoginTransactionStore.Binding(BINDING.realmId(), BINDING.clientId(),
+        "consume-retry-session", "consume-retry-tab", BINDING.redirectUri(), BINDING.canonicalOrigin());
+    var retry = assertFreshSignupRecovers(store, handler, accounts, identity, keyPair,
+        retryBinding, provisionCalls);
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  @Test
+  void expiredOrMissingTransactionEmitsCorrelatedDenialButAcceptedRetryDoesNot() throws Exception {
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    byte[] proof = signedProof(issued.challenge(), "mailto:alice@example.org", keyPair);
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+    var logger = java.util.logging.Logger.getLogger(WalletLoginTransportHandler.class.getName());
+    var captured = new java.util.ArrayList<String>();
+    var capture = new java.util.logging.Handler() {
+      @Override public void publish(java.util.logging.LogRecord record) {
+        if (record != null) captured.add(record.getMessage());
+      }
+      @Override public void flush() {}
+      @Override public void close() {}
+    };
+    var previousLevel = logger.getLevel();
+    logger.setLevel(java.util.logging.Level.ALL);
+    logger.addHandler(capture);
+    try {
+      var accepted = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site",
+          "application/json", issued.csrfToken(), proof, IDP_ORIGIN);
+      assertEquals(202, accepted.status());
+      assertEquals(Map.of("status", "pending"), accepted.body());
+
+      var unavailable = handler.submitProof("missing-transaction", WALLET_ORIGIN, "cross-site",
+          "application/json", issued.csrfToken(), proof, IDP_ORIGIN);
+      assertEquals(404, unavailable.status());
+      String requestId = WalletLoginTransportHandler.requestCorrelationId("missing-transaction");
+      assertTrue(captured.stream().anyMatch(message -> message.contains(
+          "Wallet transaction proof rejected (request=" + requestId
+              + ", reason=transaction_unavailable, provider=unknown)")),
+          () -> "log capture did not observe the expected denial marker: " + captured);
+      captured.clear();
+      var retry = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site",
+          "application/json", issued.csrfToken(), proof, IDP_ORIGIN);
+
+      assertEquals(202, retry.status());
+      assertEquals(Map.of("status", "accepted"), retry.body());
+      assertFalse(captured.stream().anyMatch(message -> message.contains("reason=transaction_unavailable")),
+          () -> "accepted retry emitted denial log: " + captured);
+    } finally {
+      logger.removeHandler(capture);
+      logger.setLevel(previousLevel);
+    }
   }
 
   @Test
@@ -375,19 +610,8 @@ final class WalletLoginTransportHandlerTest {
     var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
     var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
     byte[] proof = signedProof(issued.challenge(), "mailto:receipt-failure@example.org", keyPair);
-    var provisionCalls = new java.util.concurrent.atomic.AtomicInteger();
-    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
-      private volatile boolean provisioned;
-      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return provisioned; }
-      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) { return provisioned; }
-      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
-        provisionCalls.incrementAndGet();
-        provisioned = true;
-        var user = org.mockito.Mockito.mock(org.keycloak.models.UserModel.class);
-        org.mockito.Mockito.when(user.isEnabled()).thenReturn(true);
-        return user;
-      }
-    };
+    var provisionCalls = new AtomicInteger();
+    var accounts = retainedExactIdentityResolver("mailto:receipt-failure@example.org", provisionCalls, () -> {});
     var handler = new WalletLoginTransportHandler(store, exact ->
         new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
         IDP_ORIGIN, accounts, true);
@@ -396,11 +620,21 @@ final class WalletLoginTransportHandlerTest {
         "application/json", null, proof, IDP_ORIGIN);
 
     assertEquals(503, result.status());
+    assertEquals(1, provider.receiptPublicationFailures);
     assertEquals(1, provisionCalls.get());
     assertTrue(store.load(issued.handle()).isEmpty());
     assertFalse(store.getAccepted(issued.handle(), BINDING).isPresent());
     assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
     assertTrue(accounts.hasUniqueEnabledUser("mailto:receipt-failure@example.org"));
+
+    var retryBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "receipt-retry-session", "receipt-retry-tab", "https://site.example/callback", IDP_ORIGIN);
+    var retry = assertFreshSignupRecovers(store, handler, accounts, "mailto:receipt-failure@example.org",
+        keyPair, retryBinding, provisionCalls);
+    assertEquals(404, handler.getStatus(issued.handle(), null, "same-origin",
+        "cors", "empty", issued.csrfToken(), IDP_ORIGIN, BINDING).status());
+    assertFalse(store.getAccepted(issued.handle(), BINDING).isPresent());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
   }
   @Test
   void signupProofCanBeResumedOnlyByTheOriginalKeycloakActionUrl() throws Exception {
@@ -911,6 +1145,63 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void signupPostCreateReadbackCandidateCapReturnsUnavailableAndKeepsCreatedUser() throws Exception {
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:postcreate-cap@example.org";
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var realm = org.mockito.Mockito.mock(org.keycloak.models.RealmModel.class);
+    var users = org.mockito.Mockito.mock(org.keycloak.models.UserProvider.class);
+    var created = org.mockito.Mockito.mock(org.keycloak.models.UserModel.class);
+    var mismatches = java.util.stream.IntStream.range(0, 65).mapToObj(index -> {
+      var user = org.mockito.Mockito.mock(org.keycloak.models.UserModel.class);
+      org.mockito.Mockito.when(user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE))
+          .thenReturn("mailto:mismatch-" + index + "@example.org");
+      return user;
+    }).toList();
+    var consumed = new java.util.concurrent.atomic.AtomicInteger();
+    org.mockito.Mockito.when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identity))
+        .thenReturn(java.util.stream.Stream.empty(), java.util.stream.Stream.empty(), java.util.stream.Stream.empty(),
+            java.util.stream.Stream.concat(java.util.stream.Stream.of(created), mismatches.stream())
+                .peek(user -> consumed.incrementAndGet()));
+    org.mockito.Mockito.when(users.addUser(realm, null, "wallet-" + java.util.HexFormat.of().formatHex(
+        java.security.MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8))),
+        true, true)).thenReturn(created);
+    org.mockito.Mockito.when(created.getId()).thenReturn("created-account-id");
+    org.mockito.Mockito.when(created.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)).thenReturn(identity);
+    org.mockito.Mockito.when(created.isEnabled()).thenReturn(true);
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueEnabledMapping(users, realm, exactIdentityId);
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, exactIdentityId);
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.ensureEnabledUser(users, realm, exactIdentityId, true);
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+    var result = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+
+    assertEquals(503, result.status());
+    assertTrue(result.body().isEmpty());
+    assertEquals(65, consumed.get());
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.times(4)).searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identity);
+    org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).removeUser(realm, created);
+    assertTrue(store.load(issued.handle()).isPresent());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  @Test
   void signupProvisioningNonSuccessDoesNotConsumeOrAcceptTransaction() throws Exception {
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
@@ -1320,9 +1611,15 @@ final class WalletLoginTransportHandlerTest {
   }
 
   private static final class FailingAcceptedReceiptStore extends MemoryStore {
-    @Override public boolean putIfAbsent(String key, long lifespanSeconds) {
-      if (key.startsWith("decent-wallet-login-v1:accepted:")) return false;
-      return super.putIfAbsent(key, lifespanSeconds);
+    private boolean failReceiptPublication = true;
+    private int receiptPublicationFailures;
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      if (failReceiptPublication && key.startsWith("decent-wallet-login-v1:accepted:")) {
+        failReceiptPublication = false;
+        receiptPublicationFailures++;
+        return false;
+      }
+      return super.replace(key, notes);
     }
   }
 

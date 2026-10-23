@@ -24,6 +24,15 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertEqual(hashlib.sha256((ROOT / 'container/resolver-requirements.lock.txt').read_bytes()).hexdigest(),
         provenance.get('runtime_lock_sha256'))
 
+  def test_runtime_lock_pins_wheelhouse_archive_and_exact_size(self):
+    lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
+    wheelhouse = lock.get('wheelhouse')
+    self.assertIsInstance(wheelhouse, dict)
+    self.assertEqual(67, wheelhouse.get('file_count'))
+    archive = ROOT / 'container' / wheelhouse.get('archive', '')
+    self.assertTrue(archive.is_file())
+    self.assertEqual(wheelhouse.get('archive_sha256'), hashlib.sha256(archive.read_bytes()).hexdigest())
+
   def test_live_harness_checkpoints_evidence_before_failure(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
     self.assertIn("evidence_path = Path(temp_dir) / 'live-evidence.json'", harness)
@@ -210,7 +219,9 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
             'cli_resolution': 'not_found', 'cli_exit': 1,
             'cli_output_categories': ['registry_miss', 'not_found'],
             'cli_output_shape': ['private-id@example.invalid'],
-            'cli_lookup_ms': 120, 'provider_http': 401, 'provider_lookup_ms': 135,
+            'cli_lookup_ms': 120, 'direct_provider_http': 401,
+            'direct_provider_lookup_ms': 135, 'status_http': 200,
+            'status_pending': True, 'redirects_safe': False,
             'no_acceptance_or_callback': True,
         },
         'negative_case': {'no_acceptance_or_callback': True,
@@ -250,8 +261,8 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         projected['rotated_identity_case']['resolver_samples'][0])
     self.assertEqual('complete', projected['rotated_identity_case']['stage'])
     self.assertEqual({'cli_resolution', 'cli_exit', 'cli_output_categories', 'cli_lookup_ms',
-        'provider_http', 'provider_lookup_ms', 'no_acceptance_or_callback'},
-        set(projected['missing_identity_case']))
+        'direct_provider_http', 'direct_provider_lookup_ms', 'status_http', 'status_pending',
+        'redirects_safe', 'no_acceptance_or_callback'}, set(projected['missing_identity_case']))
     self.assertEqual(['registry_miss', 'not_found'],
         projected['missing_identity_case']['cli_output_categories'])
     self.assertEqual({'no_acceptance_or_callback', 'invalid_proof_throttle'},
@@ -536,20 +547,47 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
     original_lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
+    original_lock.pop('wheelhouse', None)
 
     with tempfile.TemporaryDirectory() as directory:
       work = Path(directory)
+      archives = work / 'archives'
+      archives.mkdir()
+      manifest_directory = work / 'manifest'
+      manifest_directory.mkdir()
       for name in ('identity', 'registry'):
         source = ROOT / 'container/source-archives' / f'{name}.tar.gz'
-        (work / f'{name}.tar.gz').write_bytes(source.read_bytes())
-      manifest = work / 'resolver-runtime.lock.json'
+        (archives / f'{name}.tar.gz').write_bytes(source.read_bytes())
+      manifest = manifest_directory / 'resolver-runtime.lock.json'
       manifest.write_text(json.dumps(original_lock))
-      verifier.verify_source_archives(work, manifest)
+      verifier.verify_source_archives(archives, manifest)
 
-      changed_archive = work / 'identity.tar.gz'
+      import io
+      import tarfile
+      wheelhouse_archive = manifest_directory / 'wheelhouse.tar.gz'
+      payload = b'pinned-wheel'
+      info = tarfile.TarInfo('wheelhouse/example.whl')
+      info.size = len(payload)
+      info.mode = 0o644
+      info.mtime = 0
+      with tarfile.open(wheelhouse_archive, 'w:gz') as bundle:
+        bundle.addfile(info, io.BytesIO(payload))
+      lock_with_wheelhouse = json.loads(manifest.read_text())
+      lock_with_wheelhouse['wheelhouse'] = {
+          'archive': 'wheelhouse.tar.gz',
+          'archive_sha256': hashlib.sha256(wheelhouse_archive.read_bytes()).hexdigest(),
+          'file_count': 1,
+      }
+      manifest.write_text(json.dumps(lock_with_wheelhouse))
+      verifier.verify_source_archives(archives, manifest)
+      wheelhouse_archive.write_bytes(wheelhouse_archive.read_bytes() + b'altered')
+      with self.assertRaisesRegex(RuntimeError, 'wheelhouse archive checksum mismatch'):
+        verifier.verify_source_archives(archives, manifest)
+
+      changed_archive = archives / 'identity.tar.gz'
       changed_archive.write_bytes(changed_archive.read_bytes() + b'changed')
       with self.assertRaisesRegex(RuntimeError, 'checksum'):
-        verifier.verify_source_archives(work, manifest)
+        verifier.verify_source_archives(archives, manifest)
       source = ROOT / 'container/source-archives/identity.tar.gz'
       changed_archive.write_bytes(source.read_bytes())
 
@@ -557,7 +595,71 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       altered_lock['sources']['identity']['commit'] = 'f' * 40
       manifest.write_text(json.dumps(altered_lock))
       with self.assertRaisesRegex(RuntimeError, 'commit'):
-        verifier.verify_source_archives(work, manifest)
+        verifier.verify_source_archives(archives, manifest)
+
+  def test_source_archive_extraction_rejects_symlink_destination(self):
+    import importlib.util
+    import io
+    import tarfile
+    import tempfile
+
+    path = ROOT / 'container/build_resolver_runtime.py'
+    spec = importlib.util.spec_from_file_location('build_resolver_runtime_symlink_test', path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+
+    with tempfile.TemporaryDirectory() as directory:
+      work = Path(directory)
+      outside = work / 'outside'
+      outside.mkdir()
+      destination = work / 'source-destination'
+      destination.symlink_to(outside, target_is_directory=True)
+      archive = work / 'source.tar.gz'
+      with tarfile.open(archive, 'w:gz') as bundle:
+        payload = b'archive payload'
+        info = tarfile.TarInfo('repo-abc123/payload.txt')
+        info.size = len(payload)
+        info.mode = 0o644
+        bundle.addfile(info, io.BytesIO(payload))
+
+      with self.assertRaisesRegex(RuntimeError, 'destination must not be a symlink'):
+        builder.extract_pinned_archive(archive, destination, 'abc123')
+
+      self.assertFalse((outside / 'payload.txt').exists())
+
+  def test_wheelhouse_verifier_rejects_duplicate_normalized_member_paths(self):
+    import importlib.util
+    import io
+    import tarfile
+    import tempfile
+
+    path = ROOT / 'container/verify_resolver_runtime_inputs.py'
+    spec = importlib.util.spec_from_file_location('verify_resolver_runtime_inputs_duplicates', path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    with tempfile.TemporaryDirectory() as directory:
+      work = Path(directory)
+      archive = work / 'wheelhouse.tar.gz'
+      with tarfile.open(archive, 'w:gz') as bundle:
+        for name, payload in (('./wheelhouse/example.whl', b'first'),
+            ('wheelhouse/example.whl', b'second')):
+          info = tarfile.TarInfo(name)
+          info.size = len(payload)
+          info.mode = 0o644
+          info.mtime = 0
+          bundle.addfile(info, io.BytesIO(payload))
+      manifest = work / 'resolver-runtime.lock.json'
+      manifest.write_text(json.dumps({'wheelhouse': {
+          'archive': archive.name,
+          'archive_sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+          'file_count': 2}}))
+      with self.assertRaisesRegex(RuntimeError, 'duplicate normalized path'):
+        verifier.verify_wheelhouse_archive(work, manifest)
 
   def test_build_downloads_no_unpinned_sources(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
@@ -579,6 +681,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1]
     self.assertIn('COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/', runtime_stage)
     self.assertIn('RUN /opt/keycloak/bin/kc.sh build', runtime_stage)
+    self.assertIn('--spi-single-use-object--provider=infinispan', runtime_stage)
 
   def test_resolver_image_tag_is_resolved_once_to_an_immutable_id_before_containers_start(self):
     sys.path.insert(0, str(ROOT / 'scripts'))
@@ -598,11 +701,11 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         '--format', '{{.Id}}|{{.Digest}}'], inspect.call_args.args[0])
     main = harness.__file__ and (ROOT / 'scripts/wallet_login_live_e2e.py').read_text().split('def main():', 1)[1]
     self.assertLess(main.index('IMAGE, image_digest = resolve_immutable_image(IMAGE)'),
-        main.index('start_resolver_tools(temp, IMAGE)'))
+        main.index('start_resolver_tools(temp, IMAGE,'))
 
   def test_resolver_tools_container_mounts_only_the_run_temporary_directory(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
-    start = harness.split('def start_resolver_tools(temp, image):', 1)[1].split('def run_image_resolver(', 1)[0]
+    start = harness.split('def start_resolver_tools(temp, image, lifetime=300):', 1)[1].split('def run_image_resolver(', 1)[0]
     self.assertIn("temp = Path(temp)", start)
     self.assertIn("f'{temp}:{temp}:rw'", start)
     self.assertNotIn("f'{SCRATCH}:{SCRATCH}:rw'", start)
@@ -724,7 +827,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
 
   def test_registry_node_mounts_its_ephemeral_datastore(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
-    registry_start = harness.split('def start_registry(temp, image):', 1)[1].split('def start_resolver_tools(', 1)[0]
+    registry_start = harness.split('def start_registry(temp, image, run_seconds=300):', 1)[1].split('def start_resolver_tools(', 1)[0]
     self.assertIn("datastore = temp / 'registry-lmdb'", registry_start)
     self.assertIn('datastore.mkdir(', registry_start)
     self.assertIn("host: 127.0.0.1", registry_start)
@@ -767,6 +870,25 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertFalse(packaged_resolver_readback(output, 0, 'alice@example.org', 'cd' * 32))
     self.assertFalse(packaged_resolver_readback(output, 0, 'alice@example.net', 'ab' * 32))
     self.assertFalse(packaged_resolver_readback('not found', 1, 'alice@example.org', 'ab' * 32))
+
+  def test_runtime_build_installs_hash_locked_dependencies_offline_from_wheelhouse(self):
+    dockerfile = (ROOT / 'container/Dockerfile').read_text()
+    self.assertIn('COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz', dockerfile)
+    self.assertIn('--no-index', dockerfile)
+    self.assertIn('--find-links=/resolver-build/wheelhouse', dockerfile)
+    self.assertIn('--require-hashes', dockerfile)
+
+  def test_network_isolated_build_provides_local_resolver_config_for_registry_help(self):
+    dockerfile = (ROOT / 'container/Dockerfile').read_text()
+    self.assertIn("printf 'nameserver 127.0.0.1\\n' > /etc/resolv.conf", dockerfile)
+    runtime_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
+        'FROM keycloak-with-resolver AS runtime', 1)[0]
+    self.assertIn('if [ ! -e /etc/resolv.conf ]', runtime_stage)
+    self.assertIn('rm -f /etc/resolv.conf', runtime_stage)
+    self.assertLess(runtime_stage.index('if [ ! -e /etc/resolv.conf ]'),
+        runtime_stage.index("from decent_registry.cli import main; main()' --help"))
+    self.assertGreater(runtime_stage.index('rm -f /etc/resolv.conf'),
+        runtime_stage.index("from decent_registry.cli import main; main()' --help"))
 
   def test_live_harness_uses_the_pinned_image_for_registry_node_and_seed_resolver(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()

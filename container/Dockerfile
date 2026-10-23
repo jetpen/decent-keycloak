@@ -6,6 +6,7 @@ COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py
 COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./
 COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py
 COPY container/resolver-runtime.lock.json container/registry-lock-constraints.txt container/resolver-requirements.in container/resolver-requirements.lock.txt container/resolver-build-requirements.lock.txt ./
+COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
 COPY container/gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel.rpm
 COPY container/cpio-2.13-16.el9.x86_64.rpm ./cpio.rpm
 RUN printf '%s  %s\n' "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff" resolver-requirements.lock.txt | sha256sum --check \
@@ -26,12 +27,13 @@ RUN mkdir -p /tmp/gmp-root /opt/decent-resolver/lib /usr/lib64 \
  && ln -s /opt/decent-resolver/lib/libgmp.so.10.4.0 /usr/lib64/libgmp.so
 
 RUN python3.11 verify_resolver_runtime_inputs.py --archives . --manifest resolver-runtime.lock.json \
- && mkdir -p /opt/decent-resolver/identity-src /opt/decent-resolver/registry-src \
+ && mkdir -p /resolver-build/wheelhouse /opt/decent-resolver/identity-src /opt/decent-resolver/registry-src \
+ && tar -xzf resolver-wheelhouse.tar.gz -C /resolver-build/wheelhouse \
  && tar -xzf identity.tar.gz --strip-components=1 -C /opt/decent-resolver/identity-src \
  && tar -xzf registry.tar.gz --strip-components=1 -C /opt/decent-resolver/registry-src
 RUN python3.11 -m venv --copies /opt/decent-resolver/venv \
- && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --require-hashes -r resolver-build-requirements.lock.txt \
- && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-build-isolation --require-hashes -r resolver-requirements.lock.txt
+ && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --require-hashes -r resolver-build-requirements.lock.txt \
+ && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --no-build-isolation --require-hashes -r resolver-requirements.lock.txt
 RUN mkdir -p /opt/decent-resolver/bin \
  && cat > /opt/decent-resolver/bin/decent-identity <<'EOF'
 #!/bin/sh
@@ -50,6 +52,7 @@ unset PYTHONHOME
 export LD_LIBRARY_PATH=/opt/decent-resolver/lib
 exec /opt/decent-resolver/venv/bin/python -c 'from decent_registry.cli import main; main()' "$@"
 EOF
+RUN printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
 RUN chmod 0755 /opt/decent-resolver/bin/decent-identity /opt/decent-resolver/bin/decent-registry \
  && cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py \
  && python3.11 -m compileall -q /opt/decent-resolver/identity-src/src /opt/decent-resolver/registry-src/src \
@@ -65,16 +68,23 @@ COPY --from=resolver-builder /usr/lib64/libcrypto.so.3 /usr/lib64/libcrypto.so.3
 COPY --from=resolver-builder /usr/bin/python3.11 /usr/bin/python3.11
 COPY --from=resolver-builder /opt/decent-resolver/lib/libgmp.so.10.4.0 /usr/lib64/libgmp.so.10.4.0
 COPY --from=resolver-builder /usr/include/gmp.h /usr/include/gmp.h
-RUN ln -sf libpython3.11.so.1.0 /usr/lib64/libpython3.11.so \
+RUN if [ ! -e /etc/resolv.conf ]; then \
+      printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf; \
+      created_resolv_conf=1; \
+    else \
+      created_resolv_conf=0; \
+    fi \
+ && ln -sf libpython3.11.so.1.0 /usr/lib64/libpython3.11.so \
  && ln -sf libgmp.so.10.4.0 /usr/lib64/libgmp.so.10 \
  && chmod 0755 /usr/lib64/libgmp.so.10.4.0 \
  && python3.11 -c 'import ssl, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 13)' \
  && /opt/decent-resolver/bin/decent-identity --help >/dev/null \
- && PYTHONPATH=/opt/decent-resolver/registry-src/src:/opt/decent-resolver/venv/lib64/python3.11/site-packages:/opt/decent-resolver/venv/lib/python3.11/site-packages LD_LIBRARY_PATH=/opt/decent-resolver/lib python3.11 -c 'from decent_registry.cli import main; main()' --help >/dev/null
+ && PYTHONPATH=/opt/decent-resolver/registry-src/src:/opt/decent-resolver/venv/lib64/python3.11/site-packages:/opt/decent-resolver/venv/lib/python3.11/site-packages LD_LIBRARY_PATH=/opt/decent-resolver/lib python3.11 -c 'from decent_registry.cli import main; main()' --help >/dev/null \
+ && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi
 USER 1000
 
 FROM keycloak-with-resolver AS runtime
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
-RUN /opt/keycloak/bin/kc.sh build
+RUN /opt/keycloak/bin/kc.sh build --spi-single-use-object--provider=infinispan

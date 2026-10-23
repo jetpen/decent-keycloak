@@ -17,6 +17,13 @@
     "lock_sha256": "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff",
     "registry_constraints_sha256": "70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539"
   },
+  "wheelhouse": {
+    "archive": "resolver-wheelhouse.tar.gz",
+    "archive_sha256": "3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587",
+    "file_count": 67,
+    "python_version": "3.11.13",
+    "platform": "x86_64-linux-gnu"
+  },
   "gmp": {
     "version": "6.2.0-13.el9",
     "devel_rpm_url": "https://dl.rockylinux.org/pub/rocky/9/devel/x86_64/os/Packages/g/gmp-devel-6.2.0-13.el9.x86_64.rpm",

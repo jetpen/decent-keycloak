@@ -17,6 +17,21 @@ final class WalletLoginTransactionStoreTest {
       "realm-id", "client-id", "root-session-id", "tab-id", "https://site.example/callback", "https://idp.example");
 
   @Test
+  void mapsOnlyExactBuiltInSingleUseProviderImplementations() {
+    assertEquals(WalletLoginTransactionStore.SingleUseObjectProviderId.INFINISPAN,
+        WalletLoginTransactionStore.providerIdForClassName(
+            "org.keycloak.models.sessions.infinispan.InfinispanSingleUseObjectProvider"));
+    assertEquals(WalletLoginTransactionStore.SingleUseObjectProviderId.JPA,
+        WalletLoginTransactionStore.providerIdForClassName(
+            "org.keycloak.singleobject.jpa.JpaSingleUseObjectProvider"));
+    assertEquals(WalletLoginTransactionStore.SingleUseObjectProviderId.REMOTE,
+        WalletLoginTransactionStore.providerIdForClassName(
+            "org.keycloak.models.sessions.infinispan.remote.RemoteInfinispanSingleUseObjectProvider"));
+    assertEquals(WalletLoginTransactionStore.SingleUseObjectProviderId.UNKNOWN,
+        WalletLoginTransactionStore.providerIdForClassName("example.SecretProvider"));
+  }
+
+  @Test
   void issuesBoundChallengeAndLoadsItByOpaqueHandle() {
     var provider = new MemorySingleUseStore();
     var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
