@@ -117,6 +117,7 @@ jobs:
         run: |
           image=decent-keycloak-wallet-provider:acceptance
           docker buildx build --platform linux/amd64 --pull --no-cache --load \
+            --network=none \
             --file container/Dockerfile --target runtime --tag "$image" .
           version_output=$(docker run --rm --entrypoint /opt/keycloak/bin/kc.sh "$image" --version)
           printf '%s\n' "$version_output"

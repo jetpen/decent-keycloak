@@ -21,6 +21,23 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     build = workflow.split("      - name: Build and check the immutable-base provider image\n", 1)[1]
     self.assertIn("--file container/Dockerfile", build)
 
+  def test_provider_image_build_is_network_isolated(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+    build = workflow.split("      - name: Build and check the immutable-base provider image\n", 1)[1]
+    command = build.split("docker buildx build", 1)[1].split("version_output", 1)[0]
+
+    self.assertIn("--network=none", command)
+
+  def test_documented_local_image_builds_are_network_isolated(self):
+    readme = (ROOT / "README.md").read_text()
+    local_checks = readme.split("## Local checks", 1)[1].split(
+        "### Disposable local integration probe", 1)[0]
+    build_commands = [line for line in local_checks.splitlines()
+        if line.lstrip().startswith("podman build ")]
+
+    self.assertEqual(2, len(build_commands))
+    self.assertTrue(all("--network=none" in command for command in build_commands))
+
   def test_acceptance_job_and_documented_commands_have_same_unique_modules(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     readme = (ROOT / "README.md").read_text()
