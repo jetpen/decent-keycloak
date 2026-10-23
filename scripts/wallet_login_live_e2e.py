@@ -22,6 +22,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 SCRATCH = os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch'))
 RESOLVER_WRAPPER = '/opt/decent-resolver/bin/decent-identity'
 REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID = 'infinispan'
+ISSUE6_POSTCONSUME_TEST_PROVIDER_ID = 'issue6-postconsume-receipt-failure'
 EXPIRY_WAIT_MARGIN_SECONDS = 5
 EXPIRY_CONTAINER_LIFETIME_SECONDS = 1200
 
@@ -54,6 +55,12 @@ def runtime_baseline_is_verified(facts):
       and facts.get('keycloak_nodes') == 'one'
       and facts.get('database_mode_effective') == facts.get('database_mode_configured')
       and facts.get('cache_mode_effective') == facts.get('cache_mode_configured'))
+
+
+def issue6_postconsume_provider_is_registered(facts):
+  provider_ids = facts.get('single_use_object_provider_ids')
+  return (isinstance(provider_ids, list)
+      and ISSUE6_POSTCONSUME_TEST_PROVIDER_ID in provider_ids)
 
 
 def runtime_qualification_is_verified(facts):
@@ -107,7 +114,7 @@ def keycloak_runtime_provenance(client, token, keycloak_container_id=None):
         facts['keycloak_nodes'] = 'one'
         try:
           shown = run(['podman', 'exec', keycloak_container_id,
-              '/opt/keycloak/bin/kc.sh', 'show-config', '--all'], timeout=8)
+              '/opt/keycloak/bin/kc.sh', 'show-config'], timeout=8)
         except subprocess.TimeoutExpired:
           facts['keycloak_config_read_status'] = 'show_config_timeout'
         except OSError:
@@ -302,7 +309,8 @@ def sanitize_live_checkpoint(candidate):
       'resolver_runtime', 'wallet_login', 'browser_preflight', 'negative_case',
       'unmapped_account_case', 'disabled_account_case', 'signup_case', 'rotation_case',
       'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case', 'expiry_case',
-      'issue6_single_node',
+      'issue6_single_node', 'issue6_postconsume_receipt_failure_case',
+      'issue6_postconsume_receipt_recovery',
   }
   signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
@@ -326,7 +334,11 @@ def sanitize_live_checkpoint(candidate):
       'proof_denied', 'status_denied', 'no_accepted_receipt', 'no_callback',
       'no_authorization_code', 'request_correlated_denial', 'response_body_safe',
       'location_safe', 'redirects_safe', 'fresh_locator_distinct',
-      'fresh_login_transaction_available',
+      'fresh_login_transaction_available', 'proof_body_empty',
+      'proof_location_present', 'proof_redirect_followed', 'status_body_empty',
+      'status_location_present', 'status_redirect_followed', 'callback_exposed',
+      'oidc_code_exposed', 'fault_signal_correlated', 'delegate_commit_then_throw',
+      'retry_redirect_followed', 'callback_replay_denied',
   }
   http_fields = {
       'proof_post_http', 'status_poll_http', 'pkce_token_http', 'current_key_proof_http', 'stale_key_proof_http',
@@ -341,7 +353,8 @@ def sanitize_live_checkpoint(candidate):
       'status_http', 'login_page_http', 'challenge_get_http',
       'fresh_login_http', 'fresh_challenge_http', 'initial_status_http',
       'identical_retry_http', 'changed_retry_http', 'callback_http',
-      'callback_replay_http', 'status_after_callback_http',
+      'callback_replay_http', 'status_after_callback_http', 'proof_http',
+      'retry_http', 'status_http', 'fresh_login_http',
   }
   time_fields = {'cli_lookup_ms', 'provider_lookup_ms', 'direct_provider_lookup_ms'}
   digest_fields = {'identity_commit', 'registry_commit'}
@@ -358,7 +371,8 @@ def sanitize_live_checkpoint(candidate):
           'provider_denied_unclassified', 'registry_unavailable', 'provider_registry_inconsistent',
           'account_mapping_unavailable', 'provider_unavailable'},
       'runtime_qualification_status': {'runtime_facts_verified', 'open_runtime_facts_unavailable'},
-      'single_use_object_provider_path': {'infinispan', 'jpa', 'remote', 'unavailable'},
+      'single_use_object_provider_path': {'infinispan', 'jpa', 'remote', 'unavailable',
+          'issue6-postconsume-receipt-failure'},
       'keycloak_config_read_status': {
           'container_id_unverified', 'container_inspect_timeout', 'container_inspect_error',
           'show_config_timeout', 'show_config_error', 'show_config_nonzero',
@@ -500,6 +514,33 @@ def sanitize_live_checkpoint(candidate):
       safe = {'stage': stage}
       safe.update({field: item for field, item in value.items()
           if field in issue6_fields and safe_scalar(field, item)})
+      if safe:
+        projected[key] = safe
+      continue
+    if key in {'issue6_postconsume_receipt_failure_case',
+        'issue6_postconsume_receipt_recovery'} and isinstance(value, dict):
+      if key == 'issue6_postconsume_receipt_failure_case':
+        safe_fields = {'stage', 'proof_http', 'retry_http', 'status_http',
+            'proof_body_empty', 'proof_location_present', 'proof_redirect_followed',
+            'status_body_empty', 'status_location_present', 'status_redirect_followed',
+            'callback_exposed', 'oidc_code_exposed', 'fault_signal_correlated',
+            'delegate_commit_then_throw', 'retry_redirect_followed', 'fault_signal_count'}
+      else:
+        safe_fields = {'fresh_login_http', 'fresh_login_transaction_available',
+            'callback_http', 'callback_code', 'callback_replay_denied', 'pkce_token_http'}
+      safe = {}
+      stage = value.get('stage')
+      if key == 'issue6_postconsume_receipt_failure_case' and stage in {
+          'preflight', 'runtime_setup', 'failed_then_denied', 'complete'}:
+        safe['stage'] = stage
+      for field in safe_fields - {'stage'}:
+        item = value.get(field)
+        if field in bool_fields and type(item) is bool:
+          safe[field] = item
+        elif field in http_fields and type(item) is int and 100 <= item <= 599:
+          safe[field] = item
+        elif field == 'fault_signal_count' and type(item) is int and 0 <= item <= 10:
+          safe[field] = item
       if safe:
         projected[key] = safe
       continue
@@ -1937,7 +1978,7 @@ def verify_id_token(client, token, temp):
   return json.loads(decode(payload_segment))
 
 
-def auth_flow(client, key, identifier, container, image):
+def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
   verifier = b64url(secrets.token_bytes(32))
   challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
@@ -1962,6 +2003,8 @@ def auth_flow(client, key, identifier, container, image):
         'response_has_auth_error': 'authentication' in text.lower() and 'error' in text.lower(),
     }))
     require(False, 'provider-owned HTTPS QR locator')
+  if prior_locator is not None:
+    require(locator != prior_locator, 'fresh login creates a distinct transaction locator')
   handle = locator.rsplit('/', 1)[1]
   csrf_match = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', text)
   status_match = re.search(r'const statusUrl = "([^"]+)";', text)
@@ -2146,7 +2189,8 @@ def auth_flow(client, key, identifier, container, image):
   require(CLIENT in (aud if isinstance(aud, list) else [aud]), 'ID token audience')
   require(claims.get('nonce') == nonce, 'OIDC nonce binding')
   require(claims.get('sub') and claims.get('sub') != identifier, 'opaque local Keycloak subject')
-  return {
+  auth_result = {
+      'login_page_http': status,
       'proof_post_http': submitted, 'initial_status_http': polled,
       'initial_status_accepted': initial_status_accepted,
       'identical_retry_http': retried, 'changed_retry_http': changed,
@@ -2163,6 +2207,9 @@ def auth_flow(client, key, identifier, container, image):
       'status_after_callback_safe': status_after_callback_safe,
       'pkce_token_http': token_status,
   }
+  if prior_locator is not None:
+    auth_result['fresh_locator_distinct'] = locator != prior_locator
+  return auth_result
 
 
 def require_transport_security_headers(headers, stage, *, expect_no_store=True):
@@ -3708,6 +3755,115 @@ def run_issue6_auth_flow(result, attempt, auth_flow_runner, checkpoint):
   return auth_result
 
 
+def postconsume_receipt_failure_flow(key, identifier, container, *, browser_state,
+    client_factory=None, signer=None):
+  """Trigger the test-image decorator once and verify fail-closed browser state."""
+  browser = (client_factory or Client)()
+  browser_state['browser'] = browser
+  query = urllib.parse.urlencode({
+      'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
+      'scope': 'openid', 'state': b64url(secrets.token_bytes(24)),
+      'nonce': b64url(secrets.token_bytes(24)),
+      'code_challenge': b64url(hashlib.sha256(secrets.token_bytes(32)).digest()),
+      'code_challenge_method': 'S256',
+  })
+  login_status, _, page = browser.request('GET',
+      f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
+  require(login_status == 200, 'post-consume failure profile login page', login_status)
+  text = page.decode('utf-8', errors='strict')
+  parser = LoginPageParser()
+  parser.feed(text)
+  locator = ''.join(parser.locator_parts).strip()
+  require(locator.startswith(
+      f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/decent-wallet-login/v1/transactions/'),
+      'post-consume failure profile transaction locator')
+  browser_state['initial_locator'] = locator
+  browser_state['locators'] = [locator]
+  csrf = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', text)
+  status_match = re.search(r'const statusUrl = "([^"]+)";', text)
+  require(csrf is not None and status_match is not None,
+      'post-consume failure profile status binding')
+  if csrf is None or status_match is None:
+    raise RuntimeError('post-consume failure profile status binding unavailable')
+  wallet = (client_factory or Client)()
+  challenge_status, _, challenge_raw = wallet.request('GET', locator)
+  require(challenge_status == 200, 'post-consume failure challenge GET', challenge_status)
+  envelope = json.loads(challenge_raw)
+  signed = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
+      'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'),
+      sort_keys=True).encode('utf-8')
+  if signer is None:
+    public = subprocess.run(['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+    require(public.returncode == 0 and len(public.stdout) >= 32,
+        'post-consume failure proof public key')
+    with tempfile.TemporaryDirectory(prefix='wallet-receipt-signing-', dir=key.parent) as signing_dir:
+      payload = write_private_signing_input(signing_dir, 'proof', signed)
+      try:
+        signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin',
+            '-inkey', str(key), '-in', str(payload)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10, check=False)
+      finally:
+        payload.unlink(missing_ok=True)
+    require(signature.returncode == 0 and len(signature.stdout) == 64,
+        'post-consume failure valid Ed25519 proof')
+    signature_value = b64url(signature.stdout)
+  else:
+    signature_value = signer(envelope, identifier)
+  proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
+      'identity_id': identifier, 'signature': signature_value},
+      ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+  from datetime import datetime, timezone
+  log_cursor = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+  redirects_before = len(wallet.redirects)
+  proof_status, proof_headers, proof_body = wallet.request('POST', locator, proof,
+      {'Content-Type': 'application/json'})
+  proof_location = proof_headers.get('Location')
+  proof_redirected = len(wallet.redirects) != redirects_before
+  require(proof_status == 503 and not proof_body and proof_location is None
+      and not proof_redirected, 'accepted receipt failure is empty 503 without redirect', proof_status)
+  retry_redirects_before = len(wallet.redirects)
+  retry_status, retry_headers, retry_body = wallet.request('POST', locator, proof,
+      {'Content-Type': 'application/json'})
+  retry_redirected = len(wallet.redirects) != retry_redirects_before
+  require(retry_status == 404 and not retry_body and retry_headers.get('Location') is None
+      and not retry_redirected, 'identical retry is unavailable after consumed transaction', retry_status)
+  status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
+  status_redirects_before = len(browser.redirects)
+  status_status, status_response_headers, status_body = browser.request(
+      'GET', status_match.group(1), headers=status_headers)
+  status_redirected = len(browser.redirects) != status_redirects_before
+  require(status_status == 404 and not status_body
+      and status_response_headers.get('Location') is None and not status_redirected,
+      'initiating browser has no accepted receipt or callback', status_status)
+  require(b'callback' not in status_body.lower() and b'code' not in status_body.lower(),
+      'failure status reveals neither callback nor code')
+
+  logs = run(['podman', 'logs', '--since', log_cursor, '--timestamps', container], timeout=15)
+  require(logs.returncode == 0, 'per-run Keycloak failure log cursor')
+  request_id = hashlib.sha256(locator.rsplit('/', 1)[1].encode('ascii')).hexdigest()[:32]
+  handler_marker = (f'Wallet accepted receipt publication unavailable (request={request_id}, '
+      'cause=post_consume_receipt_failure)')
+  log_text = logs.stdout + logs.stderr
+  handler_count = log_text.count(handler_marker)
+  decorator_count = log_text.count(
+      'ISSUE6_TEST_FAULT: accepted receipt delegate write committed; test decorator threw')
+  require(handler_count == 1 and decorator_count == 1,
+      'one request-correlated production failure and one decorator commit-then-throw signal')
+  return {'stage': 'failed_then_denied', 'proof_http': proof_status,
+      'proof_body_empty': not proof_body, 'proof_location_present': proof_location is not None,
+      'proof_redirect_followed': proof_redirected, 'retry_redirect_followed': retry_redirected,
+      'retry_http': retry_status, 'status_http': status_status,
+      'status_body_empty': not status_body,
+      'status_location_present': status_response_headers.get('Location') is not None,
+      'status_redirect_followed': status_redirected, 'callback_exposed': False,
+      'oidc_code_exposed': False, 'fault_signal_correlated': handler_count == 1,
+      'fault_signal_count': handler_count,
+      'delegate_commit_then_throw': decorator_count == 1}
+
+
 def run_issue6_single_node_profile():
   """Run only the bounded one-node replay/callback qualification flow."""
   global IMAGE, RUN_CID_DIR
@@ -3793,13 +3949,120 @@ def run_issue6_single_node_profile():
     print('issue6_single_node_evidence=' + json.dumps(evidence, sort_keys=True))
 
 
+def run_issue6_postconsume_receipt_failure_profile():
+  """Run a test-image-only one-node receipt failure and fresh-login recovery."""
+  global IMAGE, RUN_CID_DIR
+  test_image = os.environ.get('WALLET_IT_TEST_IMAGE')
+  if not test_image:
+    raise RuntimeError('WALLET_IT_TEST_IMAGE must name the isolated Issue #6 test image')
+  IMAGE, image_digest = resolve_immutable_image(test_image)
+  runtime_provenance = _prepare_resolver_runtime()
+  runtime_provenance['image_digest'] = image_digest
+  run_id = uuid.uuid4().hex
+  RUN_CID_DIR = Path(SCRATCH) / ('wallet-login-cids-' + run_id)
+  RUN_CID_DIR.mkdir(mode=0o700, parents=True, exist_ok=False)
+  container = 'issue6-postconsume-test-' + run_id
+  password = secrets.token_urlsafe(32)
+  registry = None
+  resolver_tools = None
+  result = {'resolver_runtime': runtime_provenance,
+      'issue6_postconsume_receipt_failure_case': {'stage': 'preflight'}}
+  evidence = None
+  try:
+    with tempfile.TemporaryDirectory(prefix='issue6-postconsume-', dir=SCRATCH) as temp_dir:
+      evidence_path = Path(temp_dir) / 'live-evidence.json'
+
+      def checkpoint():
+        evidence_path.write_text(json.dumps(sanitize_live_checkpoint(result), sort_keys=True),
+            encoding='utf-8')
+
+      def mark_stage(stage):
+        result['issue6_postconsume_receipt_failure_case'] = {'stage': stage}
+        checkpoint()
+
+      def partial_evidence():
+        return sanitize_live_checkpoint(result)
+
+      checkpoint()
+      with report_partial_evidence_on_failure(evidence_path, partial_evidence):
+        resolver_tools = start_resolver_tools(Path(temp_dir), IMAGE)
+        os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        mark_stage('runtime_setup')
+        registry_node, bootstrap, _ = start_registry(Path(temp_dir), IMAGE)
+        registry = registry_node
+        resolver_port = free_port()
+        key, wrapper, identifier = write_identity(
+            Path(temp_dir), bootstrap, IMAGE, label='issue6-postconsume-wallet-login')
+        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE)
+        if not isinstance(client.wallet_container_id, str):
+          raise RuntimeError('Keycloak container ID is unavailable')
+        token = admin_token(client, password)
+        runtime_provenance.update(keycloak_runtime_provenance(
+            client, token, client.wallet_container_id))
+        result['resolver_runtime'] = runtime_provenance
+        checkpoint()
+        if not runtime_baseline_is_verified(runtime_provenance):
+          raise RuntimeError('Keycloak one-node runtime baseline is not verified')
+        if not issue6_postconsume_provider_is_registered(runtime_provenance):
+          raise RuntimeError('Issue #6 test decorator is not registered by Keycloak runtime')
+        selected_provider = runtime_provenance.get('single_use_object_provider_path')
+        if selected_provider not in {
+            'issue6-postconsume-receipt-failure', 'unavailable'}:
+          raise RuntimeError('Issue #6 test decorator is not selected by Keycloak runtime config')
+        configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
+        enable_keycloak_login_events(client, token)
+        provision_identity_attribute(client, token, 'wallet-owner', identifier)
+        mark_stage('runtime_setup')
+
+        browser_state = {}
+        failure_case = postconsume_receipt_failure_flow(
+            key, identifier, client.wallet_container_id, browser_state=browser_state)
+        result['issue6_postconsume_receipt_failure_case'] = failure_case
+        checkpoint()
+        recovery = auth_flow(browser_state['browser'], key, identifier,
+            client.wallet_container_id, IMAGE, prior_locator=browser_state['initial_locator'])
+        recovery_case = {
+            'fresh_login_http': recovery['login_page_http'],
+            'fresh_login_transaction_available': (
+                recovery['fresh_locator_distinct'] and recovery['initial_status_accepted']),
+            'callback_http': recovery['callback_http'],
+            'callback_code': recovery['callback_code_returned'],
+            'callback_replay_denied': (recovery['callback_replay_error_returned']
+                and not recovery['callback_replay_code_returned']),
+            'pkce_token_http': recovery['pkce_token_http'],
+        }
+        require(recovery_case['fresh_login_transaction_available'],
+            'fresh login after failed receipt obtains a distinct accepted transaction')
+        require(recovery_case['callback_replay_denied'],
+            'fresh login callback replay is denied without returning another code')
+        result['issue6_postconsume_receipt_recovery'] = recovery_case
+        checkpoint()
+        evidence = sanitize_live_checkpoint(result)
+  except BaseException as failure:
+    cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+    if cleanup_errors:
+      raise RuntimeError(
+          f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}') from failure
+    raise
+  else:
+    cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+    if cleanup_errors:
+      raise RuntimeError(
+          f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}')
+    print('issue6_postconsume_receipt_failure_evidence=' + json.dumps(evidence, sort_keys=True))
+
+
 def main():
   global IMAGE, RUN_CID_DIR
   profile = os.environ.get('WALLET_IT_PROFILE', 'default')
   if profile == 'issue6-single-node':
     return run_issue6_single_node_profile()
+  if profile == 'issue6-postconsume-receipt-failure':
+    return run_issue6_postconsume_receipt_failure_profile()
   if profile not in {'default', 'expiry', 'provider-not-found-diagnostic'}:
-    raise ValueError('WALLET_IT_PROFILE must be default, expiry, provider-not-found-diagnostic, or issue6-single-node')
+    raise ValueError(
+        'WALLET_IT_PROFILE must be default, expiry, provider-not-found-diagnostic, '
+        'issue6-single-node, or issue6-postconsume-receipt-failure')
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
   runtime_provenance['image_digest'] = image_digest

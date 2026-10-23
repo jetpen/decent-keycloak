@@ -911,24 +911,24 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     with patch.object(probe, 'run', side_effect=[
         SimpleNamespace(returncode=0, stdout='a' * 64 + '\n'),
         SimpleNamespace(returncode=0, stdout=(
-            'kc.db = dev-file (PersistedConfigSource)\n'
-            'kc.cache = local (SysPropConfigSource)\n'
-            'kc.spi-single-use-object--provider = infinispan (PersistedConfigSource)\n'))]) as mocked_run:
+            'kc.db = dev-file (Persisted)\n'
+            'kc.cache = local (Persisted)\n'
+            'kc.spi-single-use-object--provider = ******* (Persisted)\n'))]) as mocked_run:
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
     self.assertEqual(2, mocked_run.call_count)
     self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], mocked_run.call_args_list[0].args[0])
-    self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config', '--all'],
+    self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config'],
         mocked_run.call_args_list[1].args[0])
     self.assertEqual('26.8.0', facts['keycloak_version'])
     self.assertEqual('one', facts['keycloak_nodes'])
     self.assertEqual('dev-file', facts['database_mode_effective'])
     self.assertEqual('local', facts['cache_mode_effective'])
     self.assertEqual(['infinispan', 'jpa'], facts['single_use_object_provider_ids'])
-    self.assertEqual('infinispan', facts['single_use_object_provider_path'])
-    self.assertEqual('show_config_fields_complete', facts['keycloak_config_read_status'])
-    self.assertEqual(['cache_mode_effective', 'database_mode_effective',
-        'single_use_object_provider_path'], facts['keycloak_config_fields_present'])
-    self.assertEqual('runtime_facts_verified', facts['runtime_qualification_status'])
+    self.assertEqual('unavailable', facts['single_use_object_provider_path'])
+    self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
+    self.assertEqual(['cache_mode_effective', 'database_mode_effective'],
+        facts['keycloak_config_fields_present'])
+    self.assertEqual('open_runtime_facts_unavailable', facts['runtime_qualification_status'])
     rendered = json.dumps(probe.sanitize_live_checkpoint({'resolver_runtime': facts}))
     self.assertNotIn('opaque-token', rendered)
     self.assertNotIn('PersistedConfigSource', rendered)
