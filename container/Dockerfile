@@ -89,7 +89,7 @@ FROM keycloak-with-resolver AS runtime
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
-RUN --network=none /opt/keycloak/bin/kc.sh build --spi-single-use-object--provider=infinispan
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --spi-single-use-object--provider=infinispan
 
 # The fault injector exists only in this separately built test target.
 FROM runtime AS issue7-user-readback-test-runtime
@@ -97,3 +97,11 @@ USER 0
 COPY target/issue7-user-readback-provider.jar /opt/keycloak/providers/
 USER 1000
 RUN --network=none /opt/keycloak/bin/kc.sh build --spi-user--provider-default=issue7-user-readback-fault
+
+# The Issue #6 receipt fault decorator is available only in this isolated test image.
+FROM keycloak-with-resolver AS issue6-postconsume-test-runtime
+COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
+COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
+COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
+COPY target/issue6-postconsume-receipt-failure-provider.jar /opt/keycloak/providers/
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --spi-single-use-object--provider=issue6-postconsume-receipt-failure

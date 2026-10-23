@@ -724,7 +724,10 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1]
     self.assertIn('COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/', runtime_stage)
     self.assertIn('RUN --network=none /opt/keycloak/bin/kc.sh build', runtime_stage)
+    self.assertIn('--db=dev-file', runtime_stage)
     self.assertIn('--spi-single-use-object--provider=infinispan', runtime_stage)
+    startup = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text().split('def start_keycloak(', 1)[1].split('def admin_token', 1)[0]
+    self.assertIn("'--cache=local'", startup)
 
   def test_resolver_image_tag_is_resolved_once_to_an_immutable_id_before_containers_start(self):
     sys.path.insert(0, str(ROOT / 'scripts'))
