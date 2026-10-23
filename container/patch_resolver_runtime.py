@@ -236,59 +236,56 @@ def patch_registry(path: Path) -> None:
             report_lookup_summary("remote_identity", counts)
             raise DHTLookupUnavailable("remote_identity", counts)
 
-        envelope = None
         try:
-            async with Libp2pKadDHT(
-                listen="/ip4/127.0.0.1/tcp/0",
-                durable_store=None,
-                dht_mode=DHTMode.CLIENT,
-            ) as remote_dht:
-                kad_key = remote_dht._kad_key(
-                    canonical_object_key_hex, kind="identity"
-                )
-                local_host = getattr(self, "_host", None)
-                local_peer_id = None if local_host is None else local_host.get_id()
-                for peer in bootstrap_peers:
-                    try:
-                        peer_info = info_from_p2p_addr(Multiaddr(peer))
-                    except Exception:
-                        counts.attempts += 1
-                        counts.failed += 1
-                        continue
-                    if local_peer_id is not None and peer_info.peer_id == local_peer_id:
-                        continue
-                    counts.attempts += 1
-                    try:
-                        await remote_dht.bootstrap(peer)
-                        record = await remote_dht.dht.value_store._get_from_peer(
-                            peer_info.peer_id,
-                            kad_key.encode("utf-8"),
-                            return_record=True,
-                        )
-                    except Exception:
-                        counts.failed += 1
-                        continue
-                    if isinstance(record, PeerValueAbsent):
-                        counts.empty += 1
-                        continue
-                    if isinstance(record, PeerValueIncomplete):
-                        counts.incomplete += 1
-                        continue
-                    if isinstance(record, PeerValueUnavailable) or record is None:
-                        counts.failed += 1
-                        continue
-                    candidate = getattr(record, "value", None)
-                    if not isinstance(candidate, (bytes, bytearray)):
-                        counts.failed += 1
-                        continue
-                    envelope = bytes(candidate)
-                    break
-        except DHTLookupUnavailable:
-            raise
+            kad_key = self._kad_key(
+                canonical_object_key_hex, kind="identity"
+            ).encode("utf-8")
+            local_host = getattr(self, "_host", None)
+            local_peer_id = None if local_host is None else local_host.get_id()
         except Exception:
             counts.failed += 1
             report_lookup_summary("remote_identity", counts)
             raise DHTLookupUnavailable("remote_identity", counts) from None
+
+        envelope = None
+        for peer in bootstrap_peers:
+            try:
+                peer_info = info_from_p2p_addr(Multiaddr(peer))
+            except Exception:
+                counts.attempts += 1
+                counts.failed += 1
+                continue
+            if local_peer_id is not None and peer_info.peer_id == local_peer_id:
+                continue
+            counts.attempts += 1
+            try:
+                # Reuse the active client host for a direct GET_VALUE. This
+                # bypasses KadDHT.get_value's cache/repair path without creating
+                # a second peer identity that the Registry can refer back to.
+                await self.bootstrap(peer)
+                record = await self.dht.value_store._get_from_peer(
+                    peer_info.peer_id,
+                    kad_key,
+                    return_record=True,
+                )
+            except Exception:
+                counts.failed += 1
+                continue
+            if isinstance(record, PeerValueAbsent):
+                counts.empty += 1
+                continue
+            if isinstance(record, PeerValueIncomplete):
+                counts.incomplete += 1
+                continue
+            if isinstance(record, PeerValueUnavailable) or record is None:
+                counts.failed += 1
+                continue
+            candidate = getattr(record, "value", None)
+            if not isinstance(candidate, (bytes, bytearray)):
+                counts.failed += 1
+                continue
+            envelope = bytes(candidate)
+            break
 
         if envelope is not None:
             return envelope

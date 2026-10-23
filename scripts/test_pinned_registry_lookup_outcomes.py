@@ -18,6 +18,7 @@ from decent_registry.dht.libp2p_dht import Libp2pKadDHT
 from libp2p.kad_dht.pinned_lookup_outcomes import (
     DHTLookupUnavailable,
     PeerValueAbsent,
+    PeerValueIncomplete,
     PeerValueUnavailable,
 )
 
@@ -56,10 +57,21 @@ class RegistryLookupOutcomeTest(unittest.TestCase):
             async def _read(self, _peer_id, _key, return_record=False):
                 return result
 
+        async def direct_read(_peer_id, _key, return_record=False):
+            return result
+
+        async def bootstrap(_peer):
+            pass
+
         holder = SimpleNamespace(
             _remote_identity_reader=None,
             _bootstrap_peers=peers,
             _host=None,
+            _kad_key=lambda _object_key, *, kind: f"/decent-registry/{kind}/key",
+            dht=SimpleNamespace(value_store=SimpleNamespace(
+                _get_from_peer=direct_read
+            )),
+            bootstrap=bootstrap,
         )
         return holder, RemoteDht
 
@@ -79,25 +91,52 @@ class RegistryLookupOutcomeTest(unittest.TestCase):
                 "ab" * 32,
             )
 
+    def test_remote_direct_read_reuses_primary_host_for_direct_query(self):
+        calls = []
+        bootstrap_calls = []
+        holder, remote_dht = self._holder(PeerValueAbsent())
+
+        async def direct_read(peer_id, key, return_record=False):
+            calls.append((peer_id, key, return_record))
+            return PeerValueAbsent()
+
+        async def bootstrap(peer):
+            bootstrap_calls.append(peer)
+
+        object_key = "ab" * 32
+        expected_key = f"/decent-registry/identity/{object_key}".encode()
+        holder._kad_key = lambda value, *, kind: f"/decent-registry/{kind}/{value}"
+        holder.dht = SimpleNamespace(
+            value_store=SimpleNamespace(_get_from_peer=direct_read),
+        )
+        holder.bootstrap = bootstrap
+
+        result = self._read_remote(holder, remote_dht)
+
+        self.assertIsNone(result)
+        self.assertEqual(bootstrap_calls, ["peer-address"])
+        self.assertEqual(calls, [("peer-id", expected_key, True)])
+
     def test_remote_direct_read_returns_none_only_for_valid_empty_reply(self):
         holder, remote_dht = self._holder(PeerValueAbsent())
         self.assertIsNone(self._read_remote(holder, remote_dht))
+
+    def test_remote_direct_read_incomplete_referral_is_unavailable(self):
+        holder, remote_dht = self._holder(PeerValueIncomplete())
+        with self.assertRaises(DHTLookupUnavailable):
+            self._read_remote(holder, remote_dht)
 
     def test_remote_direct_read_mixed_with_unavailable_peer_fails_closed(self):
         # Two peers use distinct typed results, so the adapter cannot treat a
         # partial query failure as global absence.
         outcomes = iter((PeerValueAbsent(), PeerValueUnavailable()))
         holder, remote_dht = self._holder(None, peers=("peer-one", "peer-two"))
-        class MixedRemoteDht(remote_dht):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.dht.value_store._get_from_peer = self._read_mixed
+        async def read_peer(_peer_id, _key, return_record=False):
+            return next(outcomes)
 
-            async def _read_mixed(self, _peer_id, _key, return_record=False):
-                return next(outcomes)
-
+        holder.dht.value_store._get_from_peer = read_peer
         with self.assertRaises(DHTLookupUnavailable):
-            self._read_remote(holder, MixedRemoteDht)
+            self._read_remote(holder, remote_dht)
 
     def test_no_bootstrap_peers_is_unavailable_not_absence(self):
         holder, remote_dht = self._holder(PeerValueAbsent(), peers=())

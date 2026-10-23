@@ -39,8 +39,6 @@ RUN --network=none python3.11 -m venv --copies /opt/decent-resolver/venv \
 RUN --network=none /opt/decent-resolver/venv/bin/python patch_resolver_runtime.py \
  --site-packages "/opt/decent-resolver/venv/lib64/python3.11/site-packages" \
  --registry-file /opt/decent-resolver/registry-src/src/decent_registry/dht/libp2p_dht.py \
- && /opt/decent-resolver/venv/bin/python scripts/test_pinned_dht_peer_outcomes.py \
- && RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src /opt/decent-resolver/venv/bin/python scripts/test_pinned_registry_lookup_outcomes.py \
  && /opt/decent-resolver/venv/bin/python -m compileall -q /opt/decent-resolver/venv/lib64/python3.11/site-packages/libp2p/kad_dht /opt/decent-resolver/registry-src/src
 RUN --network=none mkdir -p /opt/decent-resolver/bin \
  && cat > /opt/decent-resolver/bin/decent-identity <<'EOF'
@@ -63,6 +61,17 @@ EOF
 RUN --network=none chmod 0755 /opt/decent-resolver/bin/decent-identity /opt/decent-resolver/bin/decent-registry \
  && cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py \
  && python3.11 -m compileall -q /opt/decent-resolver/identity-src/src /opt/decent-resolver/registry-src/src
+RUN --network=none if [ ! -e /etc/resolv.conf ]; then \
+      printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf; \
+      created_resolv_conf=1; \
+    else \
+      created_resolv_conf=0; \
+    fi \
+ && LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_dht_peer_outcomes.py \
+ && RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_registry_lookup_outcomes.py \
+ && /opt/decent-resolver/bin/decent-identity --help >/dev/null \
+ && /opt/decent-resolver/bin/decent-registry --help >/dev/null \
+ && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi
 
 FROM quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad AS keycloak-with-resolver
 USER 0
@@ -74,19 +83,6 @@ COPY --from=resolver-builder /usr/lib64/libcrypto.so.3 /usr/lib64/libcrypto.so.3
 COPY --from=resolver-builder /usr/bin/python3.11 /usr/bin/python3.11
 COPY --from=resolver-builder /opt/decent-resolver/lib/libgmp.so.10.4.0 /usr/lib64/libgmp.so.10.4.0
 COPY --from=resolver-builder /usr/include/gmp.h /usr/include/gmp.h
-RUN --network=none if [ ! -e /etc/resolv.conf ]; then \
-      printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf; \
-      created_resolv_conf=1; \
-    else \
-      created_resolv_conf=0; \
-    fi \
- && ln -sf libpython3.11.so.1.0 /usr/lib64/libpython3.11.so \
- && ln -sf libgmp.so.10.4.0 /usr/lib64/libgmp.so.10 \
- && chmod 0755 /usr/lib64/libgmp.so.10.4.0 \
- && python3.11 -c 'import ssl, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 13)' \
- && /opt/decent-resolver/bin/decent-identity --help >/dev/null \
- && PYTHONPATH=/opt/decent-resolver/registry-src/src:/opt/decent-resolver/venv/lib64/python3.11/site-packages:/opt/decent-resolver/venv/lib/python3.11/site-packages LD_LIBRARY_PATH=/opt/decent-resolver/lib python3.11 -c 'from decent_registry.cli import main; main()' --help >/dev/null \
- && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi
 USER 1000
 
 FROM keycloak-with-resolver AS runtime
