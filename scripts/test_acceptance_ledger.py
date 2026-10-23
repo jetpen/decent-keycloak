@@ -48,13 +48,24 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("the full Python suite passed 151 tests on the documentation/test-only follow-up", text)
     self.assertIn("A separate stopped-Registry lookup classified `unavailable`", text)
     self.assertIn("Missing Identity produced Registry miss + terminal `not found` with repeated `dial_warning`, so classifier returned `unavailable`", text)
-    self.assertIn("Later snapshot `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` passed a no-cache `--network=none` build and partial live qualification", text)
+    self.assertIn("latest issue4-not-found run is recorded below", text)
     self.assertIn("clean provider-level terminal `not_found` for a missing Identity without disqualifying dial-warning diagnostics", text)
     self.assertIn("Multi-node/cross-node qualification is not an acceptance requirement under parent Issue #1.", text)
     self.assertNotIn("multi-node shared-store replay", text)
     self.assertNotIn("has not yet been qualified across nodes", text)
     self.assertIn("no actionable standards/security findings", text)
     self.assertNotIn("network-isolated image build remains unshown", text)
+
+  def test_current_branch_issue4_not_found_attempt_remains_unqualified(self):
+    text = README.read_text()
+    self.assertIn("Current #4 `issue4-not-found` run: image ID `a74499a0980391206b961260fe04e9e02b931d8c4fe36b61195318820d7874fe`", text)
+    self.assertIn("digest `sha256:76d8083b7f2af1587d737ad82add075cf718f8814af891e06acf3a053c95512e`", text)
+    self.assertIn("harness SHA `ccfda7f7d1ad4c7d634902ac1e067e409ce4411f50082e17385d589a85345b14`", text)
+    self.assertIn("repeated `dial_warning` made resolution `unavailable`; provider returned 503/unavailable", text)
+    self.assertIn("Status stayed 200/pending, redirects were safe, and no acceptance/callback evidence was present", text)
+    self.assertIn("Eight fresh-client reads for an exact missing ID: one returned `not_found`", text)
+    self.assertIn("seven returned `unavailable` with dial warnings", text)
+    self.assertIn("Does not qualify clean CLI or provider `not_found`", text)
 
   def test_separate_registry_matrix_run_is_not_conflated_with_issue_four(self):
     text = README.read_text()
