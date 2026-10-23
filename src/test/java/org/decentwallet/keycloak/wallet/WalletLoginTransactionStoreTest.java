@@ -180,6 +180,95 @@ final class WalletLoginTransactionStoreTest {
   }
 
   @Test
+  void callbackGatePublicationFailureAfterConsumeFailsClosedWithoutReceipt() {
+    var provider = new FailingPublicationStore("decent-wallet-login-v1:callback:");
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    assertTrue(store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).isPresent());
+
+    assertThrows(IllegalStateException.class, () -> store.markAccepted(issued.handle(), BINDING,
+        "digest", "mailto:alice@example.org", "AA", issued.csrfToken()));
+
+    assertTrue(store.peekAccepted(issued.handle()).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.load(issued.handle()).isEmpty(), "consumed pending transaction is not restored");
+  }
+
+  @Test
+  void receiptPublicationFailureAfterConsumeRemovesCallbackGateAndFailsClosed() {
+    var provider = new FailingPublicationStore("decent-wallet-login-v1:accepted:");
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    assertTrue(store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).isPresent());
+
+    assertThrows(IllegalStateException.class, () -> store.markAccepted(issued.handle(), BINDING,
+        "digest", "mailto:alice@example.org", "AA", issued.csrfToken()));
+
+    assertTrue(store.peekAccepted(issued.handle()).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(store.load(issued.handle()).isEmpty(), "consumed pending transaction is not restored");
+  }
+
+  @Test
+  void duplicateAcceptancePreservesTheExistingReceiptAndCallbackGate() {
+    var provider = new MemorySingleUseStore();
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC(),
+        new WalletLoginAcceptanceGuard());
+    var issued = store.issue(BINDING);
+    assertTrue(store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).isPresent());
+    store.markAccepted(issued.handle(), BINDING, "original-digest", "mailto:alice@example.org", "AA",
+        issued.csrfToken());
+    assertEquals("original-digest", store.getAccepted(issued.handle(), BINDING).orElseThrow().proofDigest());
+
+    assertThrows(IllegalStateException.class, () -> store.markAccepted(issued.handle(), BINDING,
+        "duplicate-digest", "mailto:alice@example.org", "AA", issued.csrfToken()));
+
+    assertEquals("original-digest", store.getAccepted(issued.handle(), BINDING).orElseThrow().proofDigest());
+    assertTrue(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertEquals("original-digest", store.takeAccepted(issued.handle(), BINDING).orElseThrow().proofDigest());
+  }
+
+  @Test
+  void receiptCollisionPreservesTheExistingReceipt() {
+    var provider = new MemorySingleUseStore();
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC(),
+        new WalletLoginAcceptanceGuard());
+    var issued = store.issue(BINDING);
+    assertTrue(store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).isPresent());
+    store.markAccepted(issued.handle(), BINDING, "original-digest", "mailto:alice@example.org", "AA",
+        issued.csrfToken());
+    String callbackKey = provider.keyStartingWith("decent-wallet-login-v1:callback:");
+    provider.remove(callbackKey);
+
+    assertThrows(IllegalStateException.class, () -> store.markAccepted(issued.handle(), BINDING,
+        "duplicate-digest", "mailto:alice@example.org", "AA", issued.csrfToken()));
+
+    assertEquals("original-digest", store.getAccepted(issued.handle(), BINDING).orElseThrow().proofDigest());
+  }
+
+  @Test
+  void receiptCollisionCleanupFailureQuarantinesExistingReceipt() {
+    var provider = new FailingCallbackCleanupStore();
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC(),
+        new WalletLoginAcceptanceGuard());
+    var issued = store.issue(BINDING);
+    assertTrue(store.consume(issued.handle(), BINDING, issued.challenge(), issued.csrfToken()).isPresent());
+    store.markAccepted(issued.handle(), BINDING, "original-digest", "mailto:alice@example.org", "AA",
+        issued.csrfToken());
+    String callbackKey = provider.keyStartingWith("decent-wallet-login-v1:callback:");
+    provider.remove(callbackKey);
+    provider.failCallbackRemoval = true;
+
+    assertThrows(IllegalStateException.class, () -> store.markAccepted(issued.handle(), BINDING,
+        "duplicate-digest", "mailto:alice@example.org", "AA", issued.csrfToken()));
+
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty(),
+        "an existing receipt stays unavailable while owned callback-gate cleanup is uncertain");
+    assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+    assertTrue(provider.hasKey(callbackKey), "failed cleanup leaves provider state ambiguous");
+  }
+
+  @Test
   void callbackGateIsPublishedBeforeAcceptedStatusBecomesVisible() {
     var provider = new MemorySingleUseStore();
     var store = new WalletLoginTransactionStore(provider, new SecureRandom(), Clock.systemUTC());
@@ -232,6 +321,30 @@ final class WalletLoginTransactionStoreTest {
     assertTrue(provider.entries.isEmpty());
   }
 
+  private static final class FailingCallbackCleanupStore extends MemorySingleUseStore {
+    private boolean failCallbackRemoval;
+
+    @Override public Map<String, String> remove(String key) {
+      if (failCallbackRemoval && key.startsWith("decent-wallet-login-v1:callback:")) {
+        throw new IllegalStateException("callback gate cleanup failed");
+      }
+      return super.remove(key);
+    }
+  }
+
+  private static final class FailingPublicationStore extends MemorySingleUseStore {
+    private final String failingPrefix;
+
+    FailingPublicationStore(String failingPrefix) {
+      this.failingPrefix = failingPrefix;
+    }
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      if (key.startsWith(failingPrefix)) return false;
+      return super.replace(key, notes);
+    }
+  }
+
   private static final class BarrierOnAcceptedReceiptReads extends MemorySingleUseStore {
     private final java.util.concurrent.CountDownLatch readers = new java.util.concurrent.CountDownLatch(2);
 
@@ -262,6 +375,12 @@ final class WalletLoginTransactionStoreTest {
       return lifespans.entrySet().stream().filter(entry -> entry.getKey().startsWith(prefix))
           .map(Map.Entry::getValue).findFirst().orElse(-1L);
     }
+
+    String keyStartingWith(String prefix) {
+      return entries.keySet().stream().filter(key -> key.startsWith(prefix)).findFirst().orElseThrow();
+    }
+
+    boolean hasKey(String key) { return entries.containsKey(key); }
 
     @Override public void put(String key, long lifespanSeconds, Map<String, String> notes) {
       lastPutLifespan.set(lifespanSeconds);

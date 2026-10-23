@@ -51,7 +51,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
   def test_live_harness_checkpoints_evidence_before_failure(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
     self.assertIn("evidence_path = Path(temp_dir) / 'live-evidence.json'", harness)
-    self.assertIn('def checkpoint():', harness)
+    self.assertIn('def checkpoint(snapshot=None):', harness)
     self.assertIn("except Exception as failure:", harness)
     self.assertIn("print('partial_evidence='", harness)
     self.assertIn("checkpoint()", harness)

@@ -201,11 +201,16 @@ public final class WalletLoginTransactionStore {
     if (!acceptanceGuard.begin(receiptKey, expiresAt, clock.instant())) {
       throw new IllegalStateException("wallet acceptance publication is already in progress or terminal");
     }
+    boolean callbackOwned = false;
+    boolean receiptOwned = false;
+    boolean publicationCollision = false;
     try {
       // Publish the callback gate before the visible accepted receipt.
       if (!singleUseObjects.putIfAbsent(callbackKey, TRANSACTION_LIFESPAN_SECONDS)) {
+        publicationCollision = true;
         throw new IllegalStateException("wallet callback gate already exists");
       }
+      callbackOwned = true;
       if (!singleUseObjects.replace(callbackKey, Map.of(NOTE_STATUS, "pending"))) {
         throw new IllegalStateException("wallet callback gate publication failed");
       }
@@ -214,27 +219,39 @@ public final class WalletLoginTransactionStore {
       // only that capability may create the accepted receipt. A duplicate caller
       // never invokes this method after losing consume().
       if (!singleUseObjects.putIfAbsent(receiptKey, TRANSACTION_LIFESPAN_SECONDS)) {
+        publicationCollision = true;
         throw new IllegalStateException("wallet transaction receipt already exists");
       }
+      receiptOwned = true;
       if (!singleUseObjects.replace(receiptKey, receipt)) {
         throw new IllegalStateException("wallet transaction receipt publication failed");
       }
       acceptanceGuard.markPublished(receiptKey, clock.instant());
     } catch (RuntimeException failure) {
-      // A provider exception may follow a committed write. Quarantine this handle
-      // locally, then compensate both records without masking the original error.
-      acceptanceGuard.markFailed(receiptKey, clock.instant());
-      removeQuietly(receiptKey);
-      removeQuietly(callbackKey);
+      if (publicationCollision) {
+        // A false putIfAbsent is a known collision, not an ambiguous write. Keep
+        // the existing receipt/gate intact and release this attempt's read gate.
+        boolean cleanupSucceeded = !callbackOwned || removeQuietly(callbackKey);
+        if (cleanupSucceeded) acceptanceGuard.release(receiptKey);
+        else acceptanceGuard.markFailed(receiptKey, clock.instant());
+      } else {
+        // Exceptions may follow committed writes. Quarantine this handle, then
+        // compensate only records created by this attempt.
+        acceptanceGuard.markFailed(receiptKey, clock.instant());
+        if (receiptOwned) removeQuietly(receiptKey);
+        if (callbackOwned) removeQuietly(callbackKey);
+      }
       throw failure;
     }
   }
 
-  private void removeQuietly(String key) {
+  private boolean removeQuietly(String key) {
     try {
       singleUseObjects.remove(key);
+      return true;
     } catch (RuntimeException ignored) {
-      // The process-local quarantine keeps ambiguous state unavailable until expiry.
+      // The caller keeps this handle quarantined when compensation is uncertain.
+      return false;
     }
   }
 
