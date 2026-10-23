@@ -173,11 +173,13 @@ For the standalone local Registry rotation/readback probe, use the invocation do
 After `mvn -q -o clean package`, build both the resolver inputs and the full provider/runtime image from this worktree without using cached layers:
 
 ```bash
-podman build --no-cache --pull=never --target resolver-builder -f container/Dockerfile \
+podman build --no-cache --pull=never --target resolver-builder -f container/Dockerfile --network=none \
   -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-resolver-check .
-podman build --no-cache --pull=never --target runtime -f container/Dockerfile \
+podman build --no-cache --pull=never --target runtime -f container/Dockerfile --network=none \
   -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-current-check .
 ```
+
+`--network=none` disables networking for Dockerfile `RUN` instructions; it does not block BuildKit from pulling base images when `--pull` is used. These local commands use `--pull=never`, so the pinned base images must already be present in the local image store.
 
 A successful Maven or image build is not live wallet-login qualification. Read Surefire XML totals from the current build and use the immutable image ID/digest in the live probe.
 
