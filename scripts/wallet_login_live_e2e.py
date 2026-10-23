@@ -302,6 +302,7 @@ def sanitize_live_checkpoint(candidate):
       'resolver_runtime', 'wallet_login', 'browser_preflight', 'negative_case',
       'unmapped_account_case', 'disabled_account_case', 'signup_case', 'rotation_case',
       'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case', 'expiry_case',
+      'issue6_single_node',
   }
   signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
@@ -314,6 +315,11 @@ def sanitize_live_checkpoint(candidate):
       'changed_retry_denied', 'alien_status_denied', 'state_preserved', 'error_returned',
       'challenge_get', 'wrong_origin_denied', 'credentialed',
       'authorization_code_returned', 'callback_replay', 'credentialed',
+      'callback_replay_redirect_uri_matches', 'callback_redirect_uri_matches',
+      'initial_status_accepted', 'callback_state_preserved', 'callback_error_returned',
+      'callback_code_returned', 'callback_replay_state_preserved',
+      'callback_replay_error_returned', 'callback_replay_code_returned',
+      'status_after_callback_safe',
       'wrong_origin_denied', 'signature_rejected_by_verifier', 'no_acceptance_or_callback',
       'registry_unavailable', 'local_account_mapping_decision_observed',
       'stale_transaction_remains_pending', 'current_transaction_accepted', 'status_pending',
@@ -333,7 +339,9 @@ def sanitize_live_checkpoint(candidate):
       'extra_header_http', 'wrong_origin_http', 'redirect_http',
       'challenge_post', 'get_http', 'post_http', 'four_malformed_proofs_http',
       'status_http', 'login_page_http', 'challenge_get_http',
-      'fresh_login_http', 'fresh_challenge_http',
+      'fresh_login_http', 'fresh_challenge_http', 'initial_status_http',
+      'identical_retry_http', 'changed_retry_http', 'callback_http',
+      'callback_replay_http', 'status_after_callback_http',
   }
   time_fields = {'cli_lookup_ms', 'provider_lookup_ms', 'direct_provider_lookup_ms'}
   digest_fields = {'identity_commit', 'registry_commit'}
@@ -355,6 +363,8 @@ def sanitize_live_checkpoint(candidate):
           'container_id_unverified', 'container_inspect_timeout', 'container_inspect_error',
           'show_config_timeout', 'show_config_error', 'show_config_nonzero',
           'show_config_fields_complete', 'show_config_fields_missing'},
+      'failure_gate': {'proof_post', 'proof_status', 'identical_retry', 'changed_retry',
+          'callback', 'callback_replay', 'status_after_callback', 'pkce'},
   }
 
   runtime_string_fields = {
@@ -402,6 +412,8 @@ def sanitize_live_checkpoint(candidate):
       return (isinstance(value, list) and len(value) <= 4
           and all(item in allowed_config_fields for item in value)
           and value == sorted(set(value)))
+    if field == 'node_count':
+      return type(value) is int and value == 1
     if field in bool_fields:
       return type(value) is bool
     if field in http_fields:
@@ -463,6 +475,31 @@ def sanitize_live_checkpoint(candidate):
       safe = {'stage': stage}
       safe.update({field: item for field, item in value.items()
           if field in fields and safe_scalar(field, item)})
+      if safe:
+        projected[key] = safe
+      continue
+    if key == 'issue6_single_node' and isinstance(value, dict):
+      issue6_stages = {
+          'preflight', 'resolver_setup', 'registry_setup', 'identity_setup',
+          'keycloak_setup', 'realm_setup', 'auth_flow', 'auth_flow_failed', 'complete'}
+      stage = value.get('stage')
+      if stage not in issue6_stages:
+        continue
+      issue6_fields = {
+          'node_count', 'keycloak_version', 'keycloak_nodes',
+          'database_mode_configured', 'database_mode_effective',
+          'cache_mode_configured', 'cache_mode_effective',
+          'single_use_object_provider_path', 'proof_post_http', 'initial_status_http',
+          'initial_status_accepted', 'identical_retry_http', 'changed_retry_http',
+          'callback_http', 'callback_redirect_uri_matches', 'callback_state_preserved',
+          'callback_code_returned', 'callback_error_returned', 'callback_replay_http',
+          'callback_replay_redirect_uri_matches', 'callback_replay_state_preserved',
+          'callback_replay_error_returned', 'callback_replay_code_returned',
+          'status_after_callback_http', 'status_after_callback_safe', 'pkce_token_http',
+          'failure_gate'}
+      safe = {'stage': stage}
+      safe.update({field: item for field, item in value.items()
+          if field in issue6_fields and safe_scalar(field, item)})
       if safe:
         projected[key] = safe
       continue
@@ -1150,9 +1187,13 @@ class BareLocalClient(Client):
       return error.code, error.headers, error.read()
 
 
-def require(condition, stage, code=None):
+def require(condition, stage, code=None, *, failure_gate=None):
   if not condition:
-    raise RuntimeError(f'acceptance probe failed at {stage}' + (f' (HTTP {code})' if code else ''))
+    message = f'acceptance probe failed at {stage}' + (f' (HTTP {code})' if code else '')
+    active = _ACTIVE_AUTH_FLOW_ATTEMPT
+    if active is not None:
+      raise active.failure(message, gate=failure_gate)
+    raise RuntimeError(message)
 
 
 def start_registry(temp, image, run_seconds=300):
@@ -1979,23 +2020,53 @@ def auth_flow(client, key, identifier, container, image):
       ensure_ascii=False, separators=(',', ':')).encode('utf-8')
   submitted, proof_headers, accepted = wallet.request('POST', locator, proof, {'Content-Type': 'application/json'})
   require_transport_security_headers(proof_headers, 'native proof security headers')
+  record_auth_flow_outcome('proof_post_http', submitted)
   require(submitted == 202 and json.loads(accepted).get('status') == 'pending',
-      'valid wallet proof POST', submitted)
+      'valid wallet proof POST', submitted, failure_gate='proof_post')
   diagnostic = run(['podman', 'logs', '--tail', '80', container], timeout=15)
   print('diagnostic-log-lines:', len(diagnostic.stdout.splitlines()))
   for line in diagnostic.stdout.splitlines():
     if '[WALLET-RESOLVER-DIAG]' in line:
       print('resolver-diagnostic:', 'Identity resolver failure')
   retried, _, retry_raw = wallet.request('POST', locator, proof, {'Content-Type': 'application/json'})
-  require(retried == 202 and json.loads(retry_raw).get('status') == 'accepted', 'identical native proof retry')
+  record_auth_flow_outcome('identical_retry_http', retried)
+  require(retried == 202 and json.loads(retry_raw).get('status') == 'accepted',
+      'identical native proof retry', retried, failure_gate='identical_retry')
   accepted_by_browser, _, browser_retry_body = client.request('POST', locator, proof,
       {'Content-Type': 'application/json', 'X-Decent-CSRF': browser_csrf,
        'Origin': WALLET_ORIGIN, 'Sec-Fetch-Site': 'cross-site',
        'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty'})
   require(accepted_by_browser == 202 and json.loads(browser_retry_body).get('status') == 'accepted',
       'identical browser proof retry preserves the initiating session')
-  changed, _, _ = wallet.request('POST', locator, proof + b' ', {'Content-Type': 'application/json'})
-  require(changed == 409, 'changed proof replay denied')
+  changed_key = key.parent / ('issue6-changed-proof-' + uuid.uuid4().hex + '.pem')
+  try:
+    changed_key_fd = os.open(changed_key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(changed_key_fd)
+    changed_key_result = subprocess.run(
+        ['openssl', 'genpkey', '-algorithm', 'Ed25519', '-out', str(changed_key)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+    require(changed_key_result.returncode == 0, 'generate alternate Ed25519 replay key',
+        failure_gate='changed_retry')
+    with tempfile.TemporaryDirectory(prefix='issue6-replay-signing-', dir=key.parent) as signing_dir:
+      payload = write_private_signing_input(signing_dir, 'changed-proof', signed)
+      try:
+        changed_signature = subprocess.run(
+            ['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(changed_key), '-in', str(payload)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+      finally:
+        payload.unlink(missing_ok=True)
+    require(changed_signature.returncode == 0 and len(changed_signature.stdout) == 64,
+        'alternate Ed25519 signature over identical canonical proof payload',
+        failure_gate='changed_retry')
+    changed_proof = changed_signed_proof(proof, changed_signature.stdout)
+    require(json.loads(changed_proof).get('signature') != json.loads(proof).get('signature'),
+        'changed proof has distinct signature bytes', failure_gate='changed_retry')
+    changed, _, _ = wallet.request('POST', locator, changed_proof, {'Content-Type': 'application/json'})
+  finally:
+    changed_key.unlink(missing_ok=True)
+  record_auth_flow_outcome('changed_retry_http', changed)
+  require(changed == 409, 'changed-signature proof replay denied', changed,
+      failure_gate='changed_retry')
   oversized_status, oversized_headers, _ = wallet.request('POST', locator,
       b' ' * 8193, {'Content-Type': 'application/json'})
   require_transport_security_headers(oversized_headers, 'oversized native proof security headers')
@@ -2006,41 +2077,65 @@ def auth_flow(client, key, identifier, container, image):
   require(alien_poll == 404, 'wallet cannot poll initiating browser status')
   polled, status_headers_out, status_raw = client.request('GET', status_url, headers=poll_headers)
   require_transport_security_headers(status_headers_out, 'valid accepted status security headers')
-  require(polled == 200, 'initiating-browser status poll', polled)
+  record_auth_flow_outcome('initial_status_http', polled)
+  initial_status_accepted = accepted_status_payload(polled, status_raw)
+  record_auth_flow_outcome('initial_status_accepted', initial_status_accepted)
+  require(initial_status_accepted, 'initiating browser observes accepted receipt and callback',
+      polled, failure_gate='proof_status')
   status_obj = json.loads(status_raw)
-  require(status_obj.get('status') == 'accepted', 'accepted receipt')
   callback = status_obj.get('callback')
   require(callback and callback.startswith(f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/'),
       'same-issuer callback')
   callback_status, response_headers, callback_body = client.request('GET', callback)
   location = response_headers.get('Location', '')
-  require(urllib.parse.parse_qs(urllib.parse.urlsplit(location).query).get('state') == [state], 'OIDC redirect state binding')
-  code = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query).get('code', [None])[0]
-  require(code is not None, 'Keycloak callback authorization code')
+  callback_outcome = callback_redirect_outcome(location, state, REDIRECT)
+  callback_target_matches = callback_outcome['redirect_uri_matches']
+  callback_state_matches = callback_outcome['state_preserved']
+  callback_code_returned = callback_outcome['single_authorization_code_returned']
+  callback_error_returned = callback_outcome['error_parameter_present']
+  callback_parts = urllib.parse.urlsplit(location)
+  callback_query = urllib.parse.parse_qs(callback_parts.query, keep_blank_values=True)
+  code_values = callback_query.get('code', [])
+  code = code_values[0] if callback_code_returned else None
+  record_auth_flow_outcome('callback_http', callback_status)
+  record_auth_flow_outcome('callback_redirect_uri_matches', callback_target_matches)
+  record_auth_flow_outcome('callback_state_preserved', callback_state_matches)
+  record_auth_flow_outcome('callback_code_returned', callback_code_returned)
+  record_auth_flow_outcome('callback_error_returned', callback_error_returned)
+  require(callback_status in {302, 303} and callback_target_matches and callback_state_matches
+      and not callback_error_returned,
+      'OIDC callback uses registered redirect URI and preserves state', callback_status,
+      failure_gate='callback')
+  require(code is not None, 'Keycloak callback returns exactly one authorization code', callback_status,
+      failure_gate='callback')
   repeated_status, repeated_headers, _ = client.request('GET', callback)
   repeated_location = repeated_headers.get('Location', '')
-  repeated_location_parts = urllib.parse.urlsplit(repeated_location)
-  repeated_query = urllib.parse.parse_qs(repeated_location_parts.query)
-  repeated_code = repeated_query.get('code', [None])[0]
-  require(repeated_status == 302, 'consumed callback replay redirects without authenticating')
-  require(repeated_location_parts.path == '/callback'
-      and repeated_query.get('state') == [state]
-      and repeated_query.get('error') is not None
-      and repeated_code is None,
-      'consumed callback replay preserves OIDC state but returns error instead of code')
-  callback_replay = {'redirect_http': repeated_status, 'state_preserved': True,
-      'error_returned': True, 'authorization_code_returned': False}
+  callback_replay = callback_replay_outcome(repeated_status, repeated_location, state, REDIRECT)
+  record_auth_flow_outcome('callback_replay_http', repeated_status)
+  record_auth_flow_outcome('callback_replay_redirect_uri_matches', callback_replay['redirect_uri_matches'])
+  record_auth_flow_outcome('callback_replay_state_preserved', callback_replay['state_preserved'])
+  record_auth_flow_outcome('callback_replay_error_returned', callback_replay['error_returned'])
+  record_auth_flow_outcome('callback_replay_code_returned', callback_replay['authorization_code_returned'])
+  require(repeated_status == 302 and callback_replay['redirect_uri_matches']
+      and callback_replay['state_preserved'] and callback_replay['error_returned']
+      and not callback_replay['authorization_code_returned'],
+      'consumed callback replay preserves registered redirect/state and returns error without code',
+      repeated_status, failure_gate='callback_replay')
   status_after_callback, _, status_after_callback_raw = client.request(
       'GET', status_url, headers=poll_headers)
-  require(status_after_callback == 404, 'consumed callback is no longer advertised by browser status')
-  require(b'callback' not in status_after_callback_raw.lower(),
-      'post-callback status discloses no callback URL')
+  status_after_callback_safe = status_after_callback == 404 and b'callback' not in status_after_callback_raw.lower()
+  record_auth_flow_outcome('status_after_callback_http', status_after_callback)
+  record_auth_flow_outcome('status_after_callback_safe', status_after_callback_safe)
+  require(status_after_callback_safe,
+      'consumed callback is no longer advertised by browser status',
+      status_after_callback, failure_gate='status_after_callback')
   form = urllib.parse.urlencode({'grant_type': 'authorization_code', 'client_id': CLIENT,
       'code': code, 'redirect_uri': REDIRECT, 'code_verifier': verifier}).encode()
   token_status, _, token_raw = client.request('POST',
       f'/auth/realms/{REALM}/protocol/openid-connect/token', form,
       {'Content-Type': 'application/x-www-form-urlencoded'})
-  require(token_status == 200, 'OIDC Code+PKCE token exchange', token_status)
+  record_auth_flow_outcome('pkce_token_http', token_status)
+  require(token_status == 200, 'OIDC Code+PKCE token exchange', token_status, failure_gate='pkce')
   id_token = json.loads(token_raw)['id_token']
   pieces = id_token.split('.')
   require(len(pieces) == 3, 'ID token shape')
@@ -2051,11 +2146,23 @@ def auth_flow(client, key, identifier, container, image):
   require(CLIENT in (aud if isinstance(aud, list) else [aud]), 'ID token audience')
   require(claims.get('nonce') == nonce, 'OIDC nonce binding')
   require(claims.get('sub') and claims.get('sub') != identifier, 'opaque local Keycloak subject')
-  return {'wallet_locator': True, 'challenge_get': True, 'proof_post_http': submitted,
-      'status_poll_http': polled, 'callback_code': True, 'callback_replay': callback_replay,
+  return {
+      'proof_post_http': submitted, 'initial_status_http': polled,
+      'initial_status_accepted': initial_status_accepted,
+      'identical_retry_http': retried, 'changed_retry_http': changed,
+      'callback_http': callback_status,
+      'callback_redirect_uri_matches': callback_target_matches,
+      'callback_state_preserved': callback_state_matches,
+      'callback_code_returned': bool(code),
+      'callback_replay_http': callback_replay['redirect_http'],
+      'callback_replay_redirect_uri_matches': callback_replay['redirect_uri_matches'],
+      'callback_replay_state_preserved': callback_replay['state_preserved'],
+      'callback_replay_error_returned': callback_replay['error_returned'],
+      'callback_replay_code_returned': callback_replay['authorization_code_returned'],
+      'status_after_callback_http': status_after_callback,
+      'status_after_callback_safe': status_after_callback_safe,
       'pkce_token_http': token_status,
-      'id_token_claims_checked': True, 'jwks_signature_verified': True,
-      'identical_retry_accepted': True, 'changed_retry_denied': True, 'alien_status_denied': True}
+  }
 
 
 def require_transport_security_headers(headers, stage, *, expect_no_store=True):
@@ -3446,11 +3553,253 @@ def missing_identity_flow(temp, resolver_port, bootstrap, image):
       'no_acceptance_or_callback': no_acceptance_or_callback}
 
 
+class AuthFlowFailure(RuntimeError):
+  """A failure with only allowlisted HTTP/boolean outcomes."""
+
+  def __init__(self, outcomes):
+    super().__init__('wallet auth flow failed')
+    self.outcomes = dict(outcomes)
+
+
+class AuthFlowAttempt:
+  def __init__(self):
+    self.outcomes = {}
+
+  def record(self, name, value):
+    if name.endswith('_http') and type(value) is int and 100 <= value <= 599:
+      self.outcomes[name] = value
+    elif name in {
+        'initial_status_accepted', 'callback_state_preserved',
+        'callback_error_returned', 'callback_code_returned',
+        'callback_redirect_uri_matches', 'callback_replay_state_preserved',
+        'callback_replay_error_returned', 'callback_replay_code_returned',
+        'callback_replay_redirect_uri_matches', 'status_after_callback_safe',
+    } and type(value) is bool:
+      self.outcomes[name] = value
+    return value
+
+  def failure(self, message=None, *, gate=None):
+    del message
+    outcomes = dict(self.outcomes)
+    if gate in {
+        'proof_status', 'proof_post', 'identical_retry', 'changed_retry',
+        'callback', 'callback_replay', 'status_after_callback', 'pkce',
+    }:
+      outcomes['failure_gate'] = gate
+    return AuthFlowFailure(outcomes)
+
+
+_ACTIVE_AUTH_FLOW_ATTEMPT = None
+
+
+def record_auth_flow_outcome(name, value):
+  if _ACTIVE_AUTH_FLOW_ATTEMPT is not None:
+    _ACTIVE_AUTH_FLOW_ATTEMPT.record(name, value)
+  return value
+
+
+def capture_auth_flow_outcomes(operation, attempt=None):
+  global _ACTIVE_AUTH_FLOW_ATTEMPT
+  attempt = attempt or AuthFlowAttempt()
+  previous = _ACTIVE_AUTH_FLOW_ATTEMPT
+  _ACTIVE_AUTH_FLOW_ATTEMPT = attempt
+  try:
+    return operation()
+  except AuthFlowFailure:
+    raise
+  except Exception:
+    raise attempt.failure() from None
+  finally:
+    _ACTIVE_AUTH_FLOW_ATTEMPT = previous
+
+
+def changed_signed_proof(proof, signature_bytes):
+  if not isinstance(proof, bytes) or not isinstance(signature_bytes, bytes) or len(signature_bytes) != 64:
+    raise ValueError('proof and 64-byte signature are required')
+  try:
+    parsed = json.loads(proof.decode('utf-8'))
+  except (UnicodeDecodeError, json.JSONDecodeError):
+    raise ValueError('proof is not valid UTF-8 JSON') from None
+  if not isinstance(parsed, dict) or not isinstance(parsed.get('signature'), str):
+    raise ValueError('proof has no signature field')
+  parsed['signature'] = b64url(signature_bytes)
+  return json.dumps(parsed, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+
+def accepted_status_payload(status_code, raw_body):
+  if status_code != 200:
+    return False
+  try:
+    payload = json.loads(raw_body)
+  except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+    return False
+  return isinstance(payload, dict) and payload.get('status') == 'accepted' \
+      and isinstance(payload.get('callback'), str) and bool(payload['callback'])
+
+
+def callback_redirect_outcome(location, expected_state, redirect_uri):
+  try:
+    actual = urllib.parse.urlsplit(location)
+    expected = urllib.parse.urlsplit(redirect_uri)
+    query = urllib.parse.parse_qs(actual.query, keep_blank_values=True)
+    expected_query = urllib.parse.parse_qs(expected.query, keep_blank_values=True)
+  except (TypeError, ValueError):
+    actual = urllib.parse.urlsplit('')
+    expected = urllib.parse.urlsplit('https://invalid.invalid/')
+    query = {}
+    expected_query = {}
+  dynamic = {'code', 'state', 'error', 'iss', 'session_state'}
+  actual_static_query = {key: value for key, value in query.items() if key not in dynamic}
+  redirect_matches = (
+      actual.scheme == expected.scheme and actual.netloc == expected.netloc
+      and actual.path == expected.path and actual.fragment == expected.fragment
+      and actual.username is None and actual.password is None
+      and expected.username is None and expected.password is None
+      and actual_static_query == {key: value for key, value in expected_query.items() if key not in dynamic})
+  state_values = query.get('state', [])
+  code_values = query.get('code', [])
+  error_values = query.get('error', [])
+  return {
+      'redirect_uri_matches': redirect_matches,
+      'state_preserved': redirect_matches and state_values == [expected_state],
+      'authorization_code_returned': 'code' in query,
+      'single_authorization_code_returned': len(code_values) == 1 and bool(code_values[0]),
+      'error_parameter_present': 'error' in query,
+      'error_returned': len(error_values) == 1 and bool(error_values[0]),
+  }
+
+
+def callback_replay_outcome(status_code, location, expected_state, redirect_uri):
+  outcome = callback_redirect_outcome(location, expected_state, redirect_uri)
+  return {
+      'redirect_http': status_code,
+      'redirect_uri_matches': outcome['redirect_uri_matches'],
+      'state_preserved': outcome['state_preserved'],
+      'error_returned': outcome['error_returned'],
+      'authorization_code_returned': outcome['authorization_code_returned'],
+  }
+
+
+def pending_status_payload(status_code, raw_body):
+  if status_code != 200:
+    return False
+  try:
+    payload = json.loads(raw_body)
+  except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+    return False
+  return isinstance(payload, dict) and payload.get('status') == 'pending'
+
+
+def run_issue6_auth_flow(result, attempt, auth_flow_runner, checkpoint):
+  try:
+    auth_result = capture_auth_flow_outcomes(auth_flow_runner, attempt)
+  except Exception as failure:
+    profile = dict(result.get('issue6_single_node', {}))
+    profile['stage'] = 'auth_flow_failed'
+    profile.update(failure.outcomes if isinstance(failure, AuthFlowFailure) else attempt.outcomes)
+    result['issue6_single_node'] = profile
+    checkpoint()
+    raise AuthFlowFailure(profile) from None
+  profile = dict(result.get('issue6_single_node', {}))
+  profile.update(auth_result)
+  profile['stage'] = 'complete'
+  result['issue6_single_node'] = profile
+  checkpoint()
+  return auth_result
+
+
+def run_issue6_single_node_profile():
+  """Run only the bounded one-node replay/callback qualification flow."""
+  global IMAGE, RUN_CID_DIR
+  IMAGE, image_digest = resolve_immutable_image(IMAGE)
+  runtime_provenance = _prepare_resolver_runtime()
+  runtime_provenance['image_digest'] = image_digest
+  run_id = uuid.uuid4().hex
+  RUN_CID_DIR = Path(SCRATCH) / ('wallet-login-cids-' + run_id)
+  RUN_CID_DIR.mkdir(mode=0o700, parents=True, exist_ok=False)
+  container = 'issue6-single-node-' + run_id
+  password = secrets.token_urlsafe(32)
+  registry = None
+  resolver_tools = None
+  result = {'resolver_runtime': runtime_provenance,
+      'issue6_single_node': {'stage': 'preflight', 'node_count': 1}}
+  evidence = None
+  try:
+    with tempfile.TemporaryDirectory(prefix='issue6-single-node-', dir=SCRATCH) as temp_dir:
+      evidence_path = Path(temp_dir) / 'live-evidence.json'
+
+      def checkpoint():
+        evidence_path.write_text(json.dumps(sanitize_live_checkpoint(result), sort_keys=True),
+            encoding='utf-8')
+
+      def mark_stage(stage):
+        profile = dict(result.get('issue6_single_node', {}))
+        profile.update({'stage': stage, 'node_count': 1})
+        result['issue6_single_node'] = profile
+        checkpoint()
+
+      def partial_evidence():
+        return sanitize_live_checkpoint(result)
+
+      checkpoint()
+      with report_partial_evidence_on_failure(evidence_path, partial_evidence):
+        resolver_tools = start_resolver_tools(Path(temp_dir), IMAGE)
+        os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        mark_stage('resolver_setup')
+        registry_node, bootstrap, _ = start_registry(Path(temp_dir), IMAGE)
+        registry = registry_node
+        mark_stage('registry_setup')
+        resolver_port = free_port()
+        key, wrapper, identifier = write_identity(
+            Path(temp_dir), bootstrap, IMAGE, label='issue6-wallet-login')
+        mark_stage('identity_setup')
+        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE)
+        if not isinstance(client.wallet_container_id, str):
+          raise RuntimeError('Keycloak container ID is unavailable')
+        mark_stage('keycloak_setup')
+        token = admin_token(client, password)
+        runtime_provenance.update(keycloak_runtime_provenance(
+            client, token, client.wallet_container_id))
+        result['resolver_runtime'] = runtime_provenance
+        checkpoint()
+        if runtime_provenance.get('runtime_qualification_status') != 'runtime_facts_verified':
+          raise RuntimeError('Keycloak runtime provenance is not qualified')
+        configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
+        enable_keycloak_login_events(client, token)
+        provision_identity_attribute(client, token, 'wallet-owner', identifier)
+        result['issue6_single_node'] = {
+            **result['issue6_single_node'], 'stage': 'realm_setup', 'node_count': 1,
+            **{field: runtime_provenance[field] for field in (
+                'keycloak_version', 'keycloak_nodes', 'database_mode_configured',
+                'database_mode_effective', 'cache_mode_configured', 'cache_mode_effective',
+                'single_use_object_provider_path') if field in runtime_provenance},
+        }
+        checkpoint()
+        run_issue6_auth_flow(result, AuthFlowAttempt(),
+            lambda: auth_flow(Client(), key, identifier, client.wallet_container_id, IMAGE),
+            checkpoint)
+        evidence = sanitize_live_checkpoint(result)
+  except BaseException as failure:
+    cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+    if cleanup_errors:
+      raise RuntimeError(
+          f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}') from failure
+    raise
+  else:
+    cleanup_errors = cleanup_owned_resources(registry, resolver_tools)
+    if cleanup_errors:
+      raise RuntimeError(
+          f'owned container cleanup incomplete; cleanup_error_count={cleanup_errors}')
+    print('issue6_single_node_evidence=' + json.dumps(evidence, sort_keys=True))
+
+
 def main():
   global IMAGE, RUN_CID_DIR
   profile = os.environ.get('WALLET_IT_PROFILE', 'default')
+  if profile == 'issue6-single-node':
+    return run_issue6_single_node_profile()
   if profile not in {'default', 'expiry', 'provider-not-found-diagnostic'}:
-    raise ValueError('WALLET_IT_PROFILE must be default, expiry, or provider-not-found-diagnostic')
+    raise ValueError('WALLET_IT_PROFILE must be default, expiry, provider-not-found-diagnostic, or issue6-single-node')
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
   runtime_provenance['image_digest'] = image_digest

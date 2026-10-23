@@ -85,6 +85,7 @@ jobs:
           scripts.test_live_gate_order
           scripts.test_acceptance_ledger
           scripts.test_acceptance_workflow
+          scripts.test_issue6_single_node_profile
           -q
 
       - name: Compile Python sources
