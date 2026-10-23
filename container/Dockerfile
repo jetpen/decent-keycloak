@@ -5,6 +5,8 @@ WORKDIR /resolver-build
 COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py
 COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./
 COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py
+COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./
+COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/
 COPY container/resolver-runtime.lock.json container/registry-lock-constraints.txt container/resolver-requirements.in container/resolver-requirements.lock.txt container/resolver-build-requirements.lock.txt ./
 COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
 COPY container/gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel.rpm
@@ -34,6 +36,12 @@ RUN --network=none python3.11 verify_resolver_runtime_inputs.py --archives . --m
 RUN --network=none python3.11 -m venv --copies /opt/decent-resolver/venv \
  && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --require-hashes -r resolver-build-requirements.lock.txt \
  && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --no-build-isolation --require-hashes -r resolver-requirements.lock.txt
+RUN --network=none /opt/decent-resolver/venv/bin/python patch_resolver_runtime.py \
+ --site-packages "/opt/decent-resolver/venv/lib64/python3.11/site-packages" \
+ --registry-file /opt/decent-resolver/registry-src/src/decent_registry/dht/libp2p_dht.py \
+ && /opt/decent-resolver/venv/bin/python scripts/test_pinned_dht_peer_outcomes.py \
+ && RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src /opt/decent-resolver/venv/bin/python scripts/test_pinned_registry_lookup_outcomes.py \
+ && /opt/decent-resolver/venv/bin/python -m compileall -q /opt/decent-resolver/venv/lib64/python3.11/site-packages/libp2p/kad_dht /opt/decent-resolver/registry-src/src
 RUN --network=none mkdir -p /opt/decent-resolver/bin \
  && cat > /opt/decent-resolver/bin/decent-identity <<'EOF'
 #!/bin/sh

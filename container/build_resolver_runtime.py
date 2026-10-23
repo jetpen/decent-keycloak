@@ -78,7 +78,8 @@ def validate_repo_owned_lock() -> dict:
             raise RuntimeError("source revision is not a full immutable commit")
         if not source["url"].startswith("https://github.com/"):
             raise RuntimeError("source archive must use HTTPS GitHub URL")
-    from verify_resolver_runtime_inputs import verify_wheelhouse_archive
+    from verify_resolver_runtime_inputs import verify_repo_overlays, verify_wheelhouse_archive
+    verify_repo_overlays(LOCK_PATH.parent, lock)
     verify_wheelhouse_archive(LOCK_PATH.parent, LOCK_PATH)
     return lock
 

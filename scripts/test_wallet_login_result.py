@@ -444,20 +444,20 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     end = source.index('def classify_oidc_action_error(', start)
     namespace = {'run': lambda *args, **kwargs: None, 're': __import__('re')}
     exec(source[start:end], namespace)
-    record = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|dial_warning|unknown, lines=64, capped=true'
+    record = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|dial_warning|unknown, lines=64, capped=true, dht=get_value:1/1/0/0/0|remote_identity:2/2/0/0/0'
     prefixed_record = ('2026-10-17 11:23:45,678 DEBUG [org.decentwallet.keycloak.wallet.ProcessIdentityResolver] '
-        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=3, reason=history_unavailable, lines=1, capped=false')
-    secrets = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|mailto:private@example.invalid, lines=4, capped=false'
+        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=3, reason=history_unavailable, lines=1, capped=false, dht=none')
+    secrets = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|mailto:private@example.invalid, lines=4, capped=false, dht=none'
     self.assertEqual(['ok:registry_miss|dial_warning|unknown'],
         namespace['sanitized_resolver_diagnostic_lines'](record))
     nonzero_record = ('2026-10-17 11:23:45,678 DEBUG [org.decentwallet.keycloak.wallet.ProcessIdentityResolver] '
-        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=7, reason=nonzero_exit, lines=0, capped=false')
+        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=7, reason=nonzero_exit, lines=0, capped=false, dht=none')
     process_start_record = ('2026-10-17 11:23:45,678 DEBUG [org.decentwallet.keycloak.wallet.ProcessIdentityResolver] '
-        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=-1, reason=process_start, lines=0, capped=false')
+        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=-1, reason=process_start, lines=0, capped=false, dht=none')
     self.assertEqual(['ok:process_start'],
         namespace['sanitized_resolver_diagnostic_lines'](process_start_record))
     failure_records = [
-        f'[WALLET-RESOLVER-DIAG] exit=-1, reason=unknown|{category}, lines=1, capped=false'
+        f'[WALLET-RESOLVER-DIAG] exit=-1, reason=unknown|{category}, lines=1, capped=false, dht=none'
         for category in ('timeout', 'interrupted', 'termination_interrupted', 'output_overflow')]
     self.assertEqual([f'ok:unknown|{category}' for category in
         ('timeout', 'interrupted', 'termination_interrupted', 'output_overflow')],
@@ -473,8 +473,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     end = source.index('def classify_oidc_action_error(', start)
     namespace = {'run': lambda *args, **kwargs: None, 're': __import__('re')}
     exec(source[start:end], namespace)
-    oversized = '[WALLET-RESOLVER-DIAG] exit=999, reason=unknown, lines=65, capped=true'
-    invalid_negative = '[WALLET-RESOLVER-DIAG] exit=-2, reason=process_start, lines=0, capped=false'
+    oversized = '[WALLET-RESOLVER-DIAG] exit=999, reason=unknown, lines=65, capped=true, dht=none'
+    invalid_negative = '[WALLET-RESOLVER-DIAG] exit=-2, reason=process_start, lines=0, capped=false, dht=none'
     self.assertEqual(['invalid'], namespace['sanitized_resolver_diagnostic_lines'](oversized))
     self.assertEqual(['invalid'], namespace['sanitized_resolver_diagnostic_lines'](invalid_negative))
 
@@ -568,9 +568,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
   def test_unavailable_categories_preserve_history_and_traceback_reason(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
-    start = source.index('def classify_identity_lookup(')
+    start = source.index('def parse_dht_lookup_summary_line(')
     end = source.index('def parse_exact_identity_result(', start)
-    namespace = {}
+    namespace = {'re': __import__('re')}
     exec(source[start:end], namespace)
 
     for diagnostic, expected_category in (
@@ -590,9 +590,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     ))
 
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
-    start = source.index('def classify_identity_lookup(')
-    end = source.index('\n\ndef parse_exact_identity_result', start)
-    namespace = {}
+    start = source.index('def parse_dht_lookup_summary_line(')
+    end = source.index('def parse_exact_identity_result(', start)
+    namespace = {'re': __import__('re')}
     exec(source[start:end], namespace)
     resolution, categories = namespace['classify_identity_lookup'](output, 1)
 
@@ -601,9 +601,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
   def test_well_formed_registry_miss_with_handshake_failure_stays_unavailable(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
-    start = source.index('def classify_identity_lookup(')
-    end = source.index('\ndef parse_exact_identity_result', start)
-    namespace = {}
+    start = source.index('def parse_dht_lookup_summary_line(')
+    end = source.index('def parse_exact_identity_result(', start)
+    namespace = {'re': __import__('re')}
     exec(source[start:end], namespace)
     output = '\n'.join((
         'Value not found for key /decent-registry/identity/' + 'ab' * 32,
@@ -645,6 +645,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     identifier = 'mailto:alice@example.org'
     expected_key = '4aa8889aa1e3f193844b32d36e58b50a8817304b9e15d798d460d00bff828a29'
     output = chr(10).join((
+        'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0',
+        'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0',
         'Value not found for key /decent-registry/identity/' + expected_key,
         'not found',
     ))
@@ -653,6 +655,21 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
     self.assertEqual('not_found', resolution)
     self.assertEqual(['registry_miss', 'not_found'], categories)
+
+  def test_exact_miss_requires_clean_summaries_from_both_lookup_stages(self):
+    identifier = 'mailto:alice@example.org'
+    expected_key = '4aa8889aa1e3f193844b32d36e58b50a8817304b9e15d798d460d00bff828a29'
+    registry_miss = 'Value not found for key /decent-registry/identity/' + expected_key
+    clean_remote = 'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=2 empty=2 failed=0 timeouts=0 incomplete=0'
+    cases = (
+        (chr(10).join((registry_miss, 'not found')), 'missing summaries'),
+        (chr(10).join(('DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0', registry_miss, 'not found')), 'missing fallback summary'),
+        (chr(10).join(('DHT_LOOKUP_SUMMARY stage=get_value attempts=2 empty=1 failed=1 timeouts=0 incomplete=0', clean_remote, registry_miss, 'not found')), 'mixed peer outcome'),
+        (chr(10).join(('DHT_LOOKUP_SUMMARY stage=get_value attempts=0 empty=0 failed=0 timeouts=0 incomplete=0', clean_remote, registry_miss, 'not found')), 'zero peer attempts'),
+    )
+    for output, label in cases:
+      with self.subTest(label=label):
+        self.assertEqual('unavailable', classify_identity_lookup(output, 1, identifier)[0])
 
   def test_registry_miss_for_another_identity_key_is_unavailable(self):
     identifier = 'mailto:alice@example.org'
