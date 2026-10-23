@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -23,6 +24,20 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         provenance.get('runtime_manifest_sha256'))
     self.assertEqual(hashlib.sha256((ROOT / 'container/resolver-requirements.lock.txt').read_bytes()).hexdigest(),
         provenance.get('runtime_lock_sha256'))
+
+  def test_runtime_patcher_finds_helper_when_copied_into_flat_build_context(self):
+    import runpy
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+      build_context = Path(temporary_directory)
+      patcher_copy = build_context / 'patch_resolver_runtime.py'
+      overlay_copy = build_context / 'pinned_lookup_outcomes.py'
+      patcher_copy.write_bytes((ROOT / 'container/patch_resolver_runtime.py').read_bytes())
+      overlay_copy.write_bytes((ROOT / 'container/pinned_lookup_outcomes.py').read_bytes())
+
+      patcher = runpy.run_path(str(patcher_copy))
+      self.assertEqual(overlay_copy.resolve(), patcher['OVERLAY'])
+      self.assertEqual(overlay_copy.read_bytes(), patcher['OVERLAY'].read_bytes())
 
   def test_runtime_lock_pins_wheelhouse_archive_and_exact_size(self):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())

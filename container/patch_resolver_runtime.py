@@ -7,8 +7,7 @@ import ast
 import shutil
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-OVERLAY = ROOT / "container/pinned_lookup_outcomes.py"
+OVERLAY = Path(__file__).resolve().with_name("pinned_lookup_outcomes.py")
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:

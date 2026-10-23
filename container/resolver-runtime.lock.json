@@ -39,7 +39,7 @@
     },
     "runtime_patcher": {
       "file": "patch_resolver_runtime.py",
-      "sha256": "c68a6b13c9116ed08e4e37108f277d2fb861ca7044e7994bfb89f80e25190f32"
+      "sha256": "feb472aa5d4d0762a831b30a32838949b5102ae6744053398b0aaaa8554f4fd1"
     }
   },
   "sources": {
