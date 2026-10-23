@@ -77,8 +77,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
     clients = [FakeClient('status' if redirect_during == 'status' else None),
         FakeClient('proof' if redirect_during == 'proof' else None)]
-    with tempfile.TemporaryDirectory(dir=live.SCRATCH) as temp:
-      with patch.object(live, 'Client', side_effect=clients), \
+    with tempfile.TemporaryDirectory() as temp:
+      with patch.object(live, 'SCRATCH', Path(temp)), \
+          patch.object(live, 'Client', side_effect=clients), \
           patch.object(live, 'generate_owner_key', side_effect=fake_generate_owner_key), \
           patch.object(live, 'run_image_resolver', side_effect=fake_resolver), \
           patch.object(live, 'classify_identity_lookup',
