@@ -1,0 +1,7 @@
+# Issue #7: test-only post-create UserProvider readback fault fixture
+
+This offline-only slice adds a test-scope `UserProviderFactory` decorator for one exact identity-attribute query after successful `addUser`. The `empty` and `throw` modes inject an unavailable readback; `over-cap` returns a wrapper-mediated stream of 65 references to the same created user object. Those are synthetic query rows, not 65 persisted accounts. The decorator delegates to Keycloak's `jpa` provider, preserves its `UserCredentialStore` interface, and never removes the created account.
+
+This is not a runnable acceptance profile: `WALLET_IT_PROFILE` is unchanged, and the live harness does not dispatch to this fixture. No test image has been built or started. To prepare the isolated test artifact after `mvn test-compile`, `scripts/build_issue7_user_readback_provider.py` packages only the test-compiled decorator and test service registration as `target/issue7-user-readback-provider.jar`. `container/Dockerfile` copies and selects that JAR only in the separate `issue7-user-readback-test-runtime` target; the production runtime stage does not copy it.
+
+Offline Java tests exercise the decorator, retained-account behavior, credential delegation, and synthetic over-cap stream. The Issue #7 integration remains open: no live Keycloak/signup/callback/code/receipt behavior has been qualified, and the full recovery flow and lifecycle/evidence coordinator are not included. No multi-node, HA, or distributed guarantee is claimed.
