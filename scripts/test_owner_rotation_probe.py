@@ -28,7 +28,8 @@ class OwnerRotationProbeTest(unittest.TestCase):
     self.assertIn("'/opt/decent-resolver/rotation_registry_roundtrip.py'", flow)
     self.assertIn("str(old_key_in_tools)", flow)
     self.assertIn("str(new_key_in_tools)", flow)
-    assert "separate Identity resolver confirms seq 2 and exact successor key" in flow
+    assert "readback[0] == str(expected_sequence)" in flow
+    assert "separate Identity resolver confirms sequence {expected_sequence} and exact successor key" in flow
     assert "status == 401" in flow
     assert "rotation_browser, rotation_csrf" in flow
     assert "current_browser, current_csrf" in flow

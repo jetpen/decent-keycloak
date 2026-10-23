@@ -75,7 +75,9 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         'disabled_account_case', 'signup_case', 'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case'):
       self.assertIn(f"result['{case}']", harness)
     self.assertGreaterEqual(harness.count('checkpoint()'), 9)
-    self.assertIn("result['wallet_login'] = auth_flow", harness)
+    self.assertIn("current_result = invoke_current_identity_attempt", harness)
+    self.assertIn("result['wallet_login'] = current_result.pop('wallet_login')", harness)
+    self.assertIn("result['registry_matrix']", harness)
     self.assertNotIn("result.update(auth_flow", harness)
     self.assertIn("json.dumps(sanitize_live_checkpoint(result), sort_keys=True)", harness)
     self.assertNotIn("print('partial_evidence=', result)", harness)

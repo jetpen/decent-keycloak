@@ -133,7 +133,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     end = source.index('def signup_wallet_flow(', start)
     body = source[start:end]
     self.assertIn("helper = project / 'scripts/rotation_registry_roundtrip.py'", body)
-    self.assertIn('separate Identity resolver confirms seq 2 and exact successor key', body)
+    self.assertIn("readback[0] == str(expected_sequence)", body)
+    self.assertIn("separate Identity resolver confirms sequence {expected_sequence} and exact successor key", body)
     helper = Path(__file__).with_name('rotation_registry_roundtrip.py').read_text()
     self.assertIn('draft_identity_bundle(', helper)
     self.assertIn('predecessor_state_hash=predecessor_hash', helper)

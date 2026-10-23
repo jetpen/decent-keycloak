@@ -541,7 +541,7 @@ def sanitize_live_checkpoint(candidate):
       'unmapped_account_case', 'disabled_account_case', 'signup_case', 'rotation_case',
       'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case', 'expiry_case',
       'issue6_single_node', 'issue6_postconsume_receipt_failure_case',
-      'issue6_postconsume_receipt_recovery', 'issue6_single_node_case',
+      'issue6_postconsume_receipt_recovery', 'issue6_single_node_case', 'registry_matrix',
   }
   signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
@@ -709,6 +709,55 @@ def sanitize_live_checkpoint(candidate):
   projected = {}
   for key, value in candidate.items():
     if key not in allowed or not isinstance(value, dict):
+      continue
+    if key == 'registry_matrix':
+      case_names = {'current_identity', 'missing_identity', 'unavailable_registry',
+          'history_incomplete', 'malformed_result', 'ambiguous_registry_result', 'rotation'}
+      matrix_outcomes = {'current_accepted', 'provider_registry_inconsistent',
+          'registry_unavailable', 'provider_unavailable', 'provider_denied_unclassified',
+          'unexpected_acceptance', 'unexpected_status', 'unqualified'}
+      safe_matrix = {}
+      for case_name, case_value in value.items():
+        if case_name not in case_names or not isinstance(case_value, dict):
+          continue
+        attempts = case_value.get('attempts')
+        if not isinstance(attempts, list) or len(attempts) > 5:
+          continue
+        safe_attempts = []
+        for attempt in attempts:
+          if not isinstance(attempt, dict):
+            continue
+          safe_attempt = {}
+          number = attempt.get('attempt_number')
+          if type(number) is int and 1 <= number <= 5:
+            safe_attempt['attempt_number'] = number
+          direct = attempt.get('direct_resolution')
+          if isinstance(direct, str) and direct in {'resolved', 'not_found', 'unavailable'}:
+            safe_attempt['direct_resolution'] = direct
+          for field in {'provider_http', 'status_http', 'proof_post_http',
+              'status_poll_http', 'stale_key_proof_http', 'current_key_proof_http'}:
+            status = attempt.get(field)
+            if type(status) is int and 100 <= status <= 599:
+              safe_attempt[field] = status
+          for field in {'exact_readback', 'status_pending', 'no_acceptance_or_callback',
+              'stale_transaction_remains_pending', 'current_transaction_accepted'}:
+            flag = attempt.get(field)
+            if type(flag) is bool:
+              safe_attempt[field] = flag
+          outcome = attempt.get('outcome')
+          if isinstance(outcome, str) and outcome in matrix_outcomes:
+            safe_attempt['outcome'] = outcome
+          fixture = attempt.get('fixture')
+          if isinstance(fixture, str) and re.fullmatch(r'unpublished-fixture-[1-5]', fixture):
+            safe_attempt['fixture'] = fixture
+          sequence = attempt.get('current_sequence')
+          if type(sequence) is int and 0 <= sequence <= 60000:
+            safe_attempt['current_sequence'] = sequence
+          if safe_attempt:
+            safe_attempts.append(safe_attempt)
+        safe_matrix[case_name] = {'attempts': safe_attempts}
+      if safe_matrix:
+        projected[key] = safe_matrix
       continue
     if key == 'missing_identity_case' and isinstance(value, dict):
       fields = {'cli_resolution', 'cli_exit', 'cli_output_categories', 'cli_output_shape',
@@ -960,6 +1009,15 @@ def free_port():
   with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0))
     return sock.getsockname()[1]
+
+
+def unavailable_bootstrap(bootstrap, port):
+  if not isinstance(bootstrap, str) or type(port) is not int or not 1 <= port <= 65535:
+    return None
+  match = re.search(r'/tcp/(\d+)(?=/p2p/)', bootstrap)
+  if match is None or int(match.group(1)) == port:
+    return None
+  return bootstrap[:match.start(1)] + str(port) + bootstrap[match.end(1):]
 
 
 def run(args, timeout=60, env=None):
@@ -3090,7 +3148,7 @@ def rotation_readback_samples(identifier, expected_public_key_hex, configured_po
   return samples, resolved
 
 def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
-    resolver_port, bootstrap, wrapper_name, progress, image, rotation_root):
+    resolver_port, bootstrap, wrapper_name, progress, image, rotation_root, expected_sequence=2):
   def start_rotation_transaction():
     fresh_browser = Client()
     verifier = b64url(secrets.token_bytes(32))
@@ -3181,10 +3239,10 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
     require(expected_key.returncode == 0 and len(expected_key.stdout) >= 32,
         'derive expected post-rotation owner key')
     readback = readback_path.read_text(encoding='ascii').splitlines()
-    require(len(readback) == 2 and readback[0] == '2'
+    require(len(readback) == 2 and readback[0] == str(expected_sequence)
         and readback[1] == expected_key.stdout[-32:].hex(),
-        'separate Identity resolver confirms seq 2 and exact successor key')
-    progress('readback', {'rotation_publish': 'read_back_exact', 'current_sequence': 2})
+        f'separate Identity resolver confirms sequence {expected_sequence} and exact successor key')
+    progress('readback', {'rotation_publish': 'read_back_exact', 'current_sequence': expected_sequence})
     provider_lookup = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
         ['get', '--identifier', identifier, '--host', '127.0.0.1',
          '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=30, image=image)
@@ -3202,10 +3260,10 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
            '--port', str(port), '--bootstrap', bootstrap], timeout=30, image=image),
       free_port,
       lambda samples: progress('readback', {
-          'rotation_publish': 'read_back_exact', 'current_sequence': 2,
+          'rotation_publish': 'read_back_exact', 'current_sequence': expected_sequence,
           'resolver_samples': samples}),
   )
-  progress('readback', {'rotation_publish': 'read_back_exact', 'current_sequence': 2,
+  progress('readback', {'rotation_publish': 'read_back_exact', 'current_sequence': expected_sequence,
       'resolver_samples': resolver_samples})
   require(resolved_fresh_read,
       'at least one fresh production-container read confirms the exact successor key before proofs',
@@ -3323,7 +3381,7 @@ def stale_key_rotation_flow(client, old_key, new_key, identifier, container,
       and callback.startswith(f'https://idp.example:{KC_PORT}/auth/')})
   require(isinstance(callback, str) and callback.startswith(f'https://idp.example:{KC_PORT}/auth/'),
       'current-key accepted status returns the Keycloak execution callback')
-  return {'rotation_publish': 'passed', 'current_sequence': 2,
+  return {'rotation_publish': 'passed', 'current_sequence': expected_sequence,
       'current_key_proof_http': current_key_status, 'stale_key_proof_http': stale_key_status,
       'stale_transaction_remains_pending': True, 'current_transaction_accepted': True}
 
@@ -4004,7 +4062,7 @@ class AuthFlowAttempt:
         'callback_error_returned', 'callback_code_returned',
         'callback_redirect_uri_matches', 'callback_replay_state_preserved',
         'callback_replay_error_returned', 'callback_replay_code_returned',
-        'callback_replay_redirect_uri_matches', 'status_after_callback_safe',
+        'callback_replay_redirect_uri_matches', 'status_after_callback_safe', 'status_pending',
     } and type(value) is bool:
       self.outcomes[name] = value
     return value
@@ -4042,6 +4100,223 @@ def capture_auth_flow_outcomes(operation, attempt=None):
     raise attempt.failure() from None
   finally:
     _ACTIVE_AUTH_FLOW_ATTEMPT = previous
+
+
+def run_registry_attempts(case_name, attempt_runner, checkpoint, *, fixture_factory=None):
+  """Run and checkpoint two attempts, retaining failed flow HTTP outcomes."""
+  result = {'case': case_name, 'attempts': []}
+  for attempt_number in (1, 2):
+    attempt_trace = AuthFlowAttempt()
+    identity_fixture = fixture_factory(attempt_number) if fixture_factory is not None else None
+
+    def invoke():
+      try:
+        if fixture_factory is None:
+          return attempt_runner(attempt_number)
+        return attempt_runner(attempt_number, identity_fixture)
+      except AuthFlowFailure:
+        raise
+      except Exception as failure:
+        raise attempt_trace.failure(str(failure)) from failure
+
+    try:
+      outcome = capture_auth_flow_outcomes(invoke, attempt_trace)
+    except AuthFlowFailure as failure:
+      outcome = {'outcome': 'unqualified', **failure.outcomes}
+    if outcome is None:
+      outcome = {}
+    outcome = dict(outcome)
+    if identity_fixture is not None:
+      outcome.setdefault('fixture', identity_fixture[0])
+    attempt = dict(outcome)
+    attempt.setdefault('attempt_number', attempt_number)
+    result['attempts'].append(attempt)
+    checkpoint(sanitize_live_checkpoint({'registry_matrix': {case_name: result}}))
+  return result
+
+
+def classify_registry_matrix_attempt(direct_resolution, provider_http, *, status_pending,
+    exact_readback):
+  if not isinstance(direct_resolution, str) or direct_resolution not in {
+      'resolved', 'not_found', 'unavailable'}:
+    return 'unqualified'
+  if type(status_pending) is not bool or type(exact_readback) is not bool:
+    return 'unqualified'
+  if type(provider_http) is not int or not 100 <= provider_http <= 599:
+    return 'unqualified'
+  if provider_http == 202:
+    return ('current_accepted' if direct_resolution == 'resolved' and exact_readback
+        and not status_pending else 'unexpected_acceptance')
+  if provider_http == 503:
+    if not status_pending:
+      return 'unexpected_status'
+    if direct_resolution == 'not_found':
+      return 'provider_registry_inconsistent'
+    if direct_resolution == 'unavailable':
+      return 'registry_unavailable'
+    return 'provider_unavailable'
+  if provider_http == 401:
+    return 'provider_denied_unclassified'
+  return 'unexpected_status'
+
+
+def set_registry_bootstrap(client, token, bootstrap):
+  path = f'/auth/admin/realms/{REALM}'
+  _, _, raw = admin_call(client, token, 'GET', path)
+  realm = json.loads(raw)
+  attributes = dict(realm.get('attributes', {}))
+  attributes['decent.wallet.registry.bootstrap'] = bootstrap
+  realm['attributes'] = attributes
+  admin_call(client, token, 'PUT', path, realm, expected=(204,))
+  _, _, verified_raw = admin_call(client, token, 'GET', path)
+  verified = json.loads(verified_raw)
+  require(verified.get('attributes', {}).get('decent.wallet.registry.bootstrap') == bootstrap,
+      'Registry bootstrap fixture configuration persisted exactly')
+
+
+def registry_proof_probe(temp, resolver_port, bootstrap, image,
+    identity_key=None, identity_id=None):
+  attempt_suffix = uuid.uuid4().hex
+  attempt_label = 'wallet-login-unpublished-' + attempt_suffix
+  if identity_key is None:
+    missing_key = generate_owner_key(temp, attempt_label, image)
+  else:
+    missing_key = identity_key
+  if identity_id is None:
+    missing_id = attempt_label + '@example.invalid'
+  else:
+    missing_id = identity_id
+  lookup_started = time.monotonic()
+  registry_lookup = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+      ['get', '--identifier', missing_id,
+      '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20, image=image)
+  lookup_ms = int((time.monotonic() - lookup_started) * 1000)
+  resolution_category, result_categories = classify_identity_lookup(
+      registry_lookup.stdout, registry_lookup.returncode, missing_id)
+  safe_lines = ['object' for category in result_categories if category == 'json']
+  if resolution_category == 'not_found' and result_categories[-1:] == ['not_found']:
+    safe_lines.append('terminal-not-found')
+
+  # Use a separate Keycloak transaction so the direct CLI probe cannot trigger
+  # the per-browser/client resolver cooldown on the provider request.
+  provider_browser = Client()
+  provider_query = urllib.parse.urlencode({
+      'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
+      'scope': 'openid', 'state': b64url(secrets.token_bytes(24)),
+      'nonce': b64url(secrets.token_bytes(24)),
+      'code_challenge': b64url(hashlib.sha256(secrets.token_bytes(32)).digest()),
+      'code_challenge_method': 'S256',
+  })
+  provider_status, _, provider_page = provider_browser.request('GET',
+      f'/auth/realms/{REALM}/protocol/openid-connect/auth?{provider_query}')
+  require(provider_status == 200, 'fresh provider unknown-Identity login page')
+  provider_parser = LoginPageParser()
+  provider_parser.feed(provider_page.decode('utf-8', errors='strict'))
+  provider_locator = ''.join(provider_parser.locator_parts).strip()
+  require(provider_locator.startswith(
+      f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/decent-wallet-login/v1/transactions/'),
+      'fresh provider unknown-Identity transaction locator')
+  provider_text = provider_page.decode('utf-8', errors='strict')
+  provider_status_url = re.search(r'const statusUrl = "([^"]+)";', provider_text)
+  provider_csrf = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', provider_text)
+  require(provider_status_url is not None and provider_csrf is not None,
+      'fresh provider browser status binding')
+  if provider_status_url is None or provider_csrf is None:
+    raise RuntimeError('acceptance probe failed at fresh provider browser status binding')
+  provider_wallet = Client()
+  challenge_status, _, challenge_raw = provider_wallet.request('GET', provider_locator)
+  require(challenge_status == 200, 'fresh provider unknown-Identity challenge GET')
+  challenge_envelope = json.loads(challenge_raw)
+  signing_input = json.dumps({
+      'challenge': challenge_envelope['challenge'], 'identity_id': missing_id,
+      'profile': challenge_envelope['profile'],
+  }, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode('utf-8')
+  with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=missing_key.parent) as signing_dir:
+    payload = write_private_signing_input(signing_dir, 'missing-identity', signing_input)
+    try:
+      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin',
+          '-inkey', str(missing_key), '-in', str(payload)], stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE, timeout=10, check=False)
+    finally:
+      payload.unlink(missing_ok=True)
+  require(signature.returncode == 0 and len(signature.stdout) == 64,
+      'sign exact unpublished Identity proof')
+  provider_proof = json.dumps({
+      'profile': challenge_envelope['profile'], 'challenge': challenge_envelope['challenge'],
+      'identity_id': missing_id, 'signature': b64url(signature.stdout),
+  }, separators=(',', ':')).encode('utf-8')
+  provider_started = time.monotonic()
+  proof_redirect_cursor = len(provider_wallet.redirects)
+  provider_http, proof_headers, proof_raw = provider_wallet.request('POST', provider_locator, provider_proof,
+      {'Content-Type': 'application/json'})
+  direct_provider_ms = int((time.monotonic() - provider_started) * 1000)
+  provider_resolution_outcome = classify_provider_identity_outcome(provider_http)
+  status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': provider_csrf.group(1)}
+  status_redirect_cursor = len(provider_browser.redirects)
+  status_poll, status_response_headers, status_raw = provider_browser.request(
+      'GET', provider_status_url.group(1), headers=status_headers)
+  status_payload = None
+  try:
+    status_payload = json.loads(status_raw) if status_raw else {}
+  except (json.JSONDecodeError, UnicodeDecodeError):
+    pass
+  status_pending = status_payload == {'status': 'pending'}
+  locations_safe = (_expiry_location_is_safe(proof_headers.get('Location', ''))
+      and _expiry_location_is_safe(status_response_headers.get('Location', '')))
+  redirects_safe = _expiry_redirects_are_safe(
+      provider_wallet.redirects[proof_redirect_cursor:]
+      + provider_browser.redirects[status_redirect_cursor:])
+  no_acceptance_or_callback = (provider_http != 202 and status_pending
+      and _expiry_body_is_safe(proof_raw) and _expiry_body_is_safe(status_raw)
+      and locations_safe and redirects_safe)
+  return {'cli_resolution': resolution_category, 'cli_exit': registry_lookup.returncode,
+      'cli_output_categories': result_categories, 'cli_output_shape': safe_lines,
+      'cli_lookup_ms': lookup_ms, 'provider_resolution_outcome': provider_resolution_outcome,
+      'direct_provider_http': provider_http, 'proof_post_http': provider_http,
+      'direct_provider_lookup_ms': direct_provider_ms,
+      'status_http': status_poll, 'status_pending': status_pending,
+      'no_acceptance_or_callback': no_acceptance_or_callback}
+
+
+def invoke_current_identity_attempt(identifier, key, container, image, attempt_number,
+    direct_lookup, auth_flow_runner=auth_flow):
+  """Read back one current fixture, then authenticate and retain HTTP outcomes."""
+  lookup = direct_lookup(attempt_number)
+  public = subprocess.run(['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'],
+      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+  exact_readback = (public.returncode == 0 and len(public.stdout) >= 32
+      and packaged_resolver_readback(lookup.stdout, lookup.returncode, identifier,
+          public.stdout[-32:].hex()))
+  direct_resolution, _ = classify_identity_lookup(lookup.stdout, lookup.returncode, identifier)
+  if exact_readback:
+    direct_resolution = 'resolved'
+  elif direct_resolution == 'resolved':
+    direct_resolution = 'unavailable'
+  evidence = {'attempt_number': attempt_number, 'direct_resolution': direct_resolution,
+      'exact_readback': exact_readback, 'outcome': 'unqualified'}
+  if not exact_readback:
+    return evidence
+  try:
+    login_result = capture_auth_flow_outcomes(
+        lambda: auth_flow_runner(Client(), key, identifier, container, image))
+  except AuthFlowFailure as failure:
+    evidence.update(failure.outcomes)
+    if 'proof_post_http' in failure.outcomes:
+      evidence['provider_http'] = failure.outcomes['proof_post_http']
+    if 'status_poll_http' in failure.outcomes:
+      evidence['status_http'] = failure.outcomes['status_poll_http']
+    return evidence
+  evidence.update({
+      'provider_http': login_result['proof_post_http'],
+      'status_http': login_result['status_poll_http'],
+      'status_pending': False,
+      'no_acceptance_or_callback': False,
+      'outcome': classify_registry_matrix_attempt(direct_resolution,
+          login_result['proof_post_http'], status_pending=False, exact_readback=True),
+      'wallet_login': login_result,
+  })
+  return evidence
 
 
 def changed_signed_proof(proof, signature_bytes):
@@ -4541,13 +4816,110 @@ def main():
           resolver_tools = None
           return
         provision_identity_attribute(client, token, 'wallet-owner-duplicate', replay_identifier)
-        probe = run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
-            ['get', '--identifier', identifier,
-            '--host', '127.0.0.1', '--port', str(resolver_port), '--bootstrap', bootstrap], timeout=20, image=IMAGE)
-        require(probe.returncode == 0, 'sanitized container Identity CLI lookup')
-        auth_browser = Client()
-        result['wallet_login'] = auth_flow(auth_browser, key, identifier, container, IMAGE)
+        result['registry_matrix'] = {'current_identity': {'attempts': []}}
+
+        def checkpoint_current_attempt(snapshot):
+          current = snapshot['registry_matrix']['current_identity']
+          result['registry_matrix']['current_identity'] = current
+          checkpoint()
+
+        for attempt_number in range(1, 3):
+          def current_lookup(_attempt_number):
+            return run_image_resolver(os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'],
+                ['get', '--identifier', identifier, '--host', '127.0.0.1',
+                 '--port', str(free_port()), '--bootstrap', bootstrap], timeout=20, image=IMAGE)
+
+          current_result = invoke_current_identity_attempt(identifier, key, container,
+              IMAGE, attempt_number, current_lookup)
+          if current_result.get('exact_readback') and 'wallet_login' in current_result:
+            if 'wallet_login' not in result:
+              result['wallet_login'] = current_result.pop('wallet_login')
+            else:
+              current_result.pop('wallet_login', None)
+          attempts = result['registry_matrix']['current_identity']['attempts']
+          attempts.append(current_result)
+          checkpoint_current_attempt({'registry_matrix': {'current_identity': {
+              'attempts': attempts}}})
+
+        result['registry_matrix']['missing_identity'] = {'attempts': []}
+        latest_missing_result = {}
+
+        def run_missing_attempt(attempt_number, identity_fixture):
+          del attempt_number
+          fixture_name, _, missing_key, missing_id = identity_fixture
+          missing_result = registry_proof_probe(temp, resolver_port, bootstrap, IMAGE,
+              identity_key=missing_key, identity_id=missing_id)
+          latest_missing_result.clear()
+          latest_missing_result.update(missing_result)
+          missing_outcome = classify_registry_matrix_attempt(
+              missing_result['cli_resolution'], missing_result['direct_provider_http'],
+              status_pending=missing_result['status_pending'], exact_readback=False)
+          return {
+              'direct_resolution': missing_result['cli_resolution'],
+              'provider_http': missing_result['direct_provider_http'],
+              'proof_post_http': missing_result['direct_provider_http'],
+              'status_http': missing_result['status_http'],
+              'status_poll_http': missing_result['status_http'],
+              'status_pending': missing_result['status_pending'],
+              'no_acceptance_or_callback': missing_result['no_acceptance_or_callback'],
+              'exact_readback': False, 'outcome': missing_outcome,
+              'fixture': fixture_name}
+
+        def checkpoint_missing_attempt(snapshot):
+          result['registry_matrix']['missing_identity'] = {
+              'attempts': snapshot['registry_matrix']['missing_identity']['attempts']}
+          checkpoint()
+
+        def fresh_missing_fixture(attempt_number):
+          attempt_label = 'wallet-login-unpublished-' + uuid.uuid4().hex
+          missing_key = generate_owner_key(temp, attempt_label, IMAGE)
+          missing_id = attempt_label + '@example.invalid'
+          return f'unpublished-fixture-{attempt_number}', attempt_label, missing_key, missing_id
+
+        missing_attempts = run_registry_attempts('missing_identity', run_missing_attempt,
+            checkpoint_missing_attempt, fixture_factory=fresh_missing_fixture)
+        result['missing_identity_case'] = latest_missing_result
+        result['registry_matrix']['missing_identity'] = {
+            'attempts': missing_attempts['attempts']}
+        for missing_attempt in missing_attempts['attempts']:
+          require(missing_attempt.get('no_acceptance_or_callback') is True,
+              'missing-Identity proof produced no accepted receipt or callback',
+              missing_attempt.get('provider_http'))
         checkpoint()
+
+        result['registry_matrix']['unavailable_registry'] = {'attempts': []}
+        unavailable_port = free_port()
+        unavailable_bootstrap_value = unavailable_bootstrap(bootstrap, unavailable_port)
+        require(unavailable_bootstrap_value is not None,
+            'construct unreachable Registry bootstrap fixture')
+        set_registry_bootstrap(client, token, unavailable_bootstrap_value)
+        try:
+          for attempt_number in range(1, 3):
+            unavailable_result = registry_proof_probe(temp, resolver_port,
+                unavailable_bootstrap_value, IMAGE, identity_key=key, identity_id=identifier)
+            unavailable_outcome = classify_registry_matrix_attempt(
+                unavailable_result['cli_resolution'], unavailable_result['direct_provider_http'],
+                status_pending=unavailable_result['status_pending'], exact_readback=False)
+            result['registry_matrix']['unavailable_registry']['attempts'].append({
+                'attempt_number': attempt_number,
+                'direct_resolution': unavailable_result['cli_resolution'],
+                'provider_http': unavailable_result['direct_provider_http'],
+                'status_http': unavailable_result['status_http'],
+                'status_pending': unavailable_result['status_pending'],
+                'no_acceptance_or_callback': unavailable_result['no_acceptance_or_callback'],
+                'exact_readback': False, 'outcome': unavailable_outcome})
+            checkpoint()
+            require(unavailable_result['no_acceptance_or_callback'],
+                'unavailable Registry proof produced no accepted receipt or callback',
+                unavailable_result['direct_provider_http'])
+        finally:
+          set_registry_bootstrap(client, token, bootstrap)
+        result['registry_matrix']['history_incomplete'] = {'attempts': []}
+        result['registry_matrix']['malformed_result'] = {'attempts': []}
+        result['registry_matrix']['ambiguous_registry_result'] = {'attempts': []}
+        result['registry_matrix']['rotation'] = {'attempts': []}
+        checkpoint()
+
         result['browser_preflight'] = browser_preflight_flow(IMAGE)
         checkpoint()
         result['negative_case'] = negative_proof_flow(identifier, IMAGE)
@@ -4638,6 +5010,37 @@ def main():
         rotation_result = stale_key_rotation_flow(
             client, rotated_old_key, rotated_key, rotated_identifier, container,
             resolver_port, bootstrap, rotated_wrapper.name, rotation_progress, IMAGE, temp)
+        first_rotation_outcome = classify_registry_matrix_attempt('resolved',
+            rotation_result['current_key_proof_http'], status_pending=False, exact_readback=True)
+        result['registry_matrix']['rotation']['attempts'].append({
+            'attempt_number': 1, 'direct_resolution': 'resolved', 'exact_readback': True,
+            'provider_http': rotation_result['current_key_proof_http'],
+            'stale_key_proof_http': rotation_result['stale_key_proof_http'],
+            'current_key_proof_http': rotation_result['current_key_proof_http'],
+            'current_sequence': rotation_result['current_sequence'],
+            'stale_transaction_remains_pending': rotation_result['stale_transaction_remains_pending'],
+            'current_transaction_accepted': rotation_result['current_transaction_accepted'],
+            'status_pending': False, 'no_acceptance_or_callback': False,
+            'outcome': first_rotation_outcome})
+        checkpoint()
+        rotated_successor = generate_owner_key(
+            temp, 'wallet-login-rotated-successor-2', IMAGE)
+        rotation_repeat = stale_key_rotation_flow(
+            client, rotated_key, rotated_successor, rotated_identifier, container,
+            resolver_port, bootstrap, rotated_wrapper.name, rotation_progress, IMAGE, temp,
+            expected_sequence=3)
+        repeated_rotation_outcome = classify_registry_matrix_attempt('resolved',
+            rotation_repeat['current_key_proof_http'], status_pending=False, exact_readback=True)
+        result['registry_matrix']['rotation']['attempts'].append({
+            'attempt_number': 2, 'direct_resolution': 'resolved', 'exact_readback': True,
+            'provider_http': rotation_repeat['current_key_proof_http'],
+            'stale_key_proof_http': rotation_repeat['stale_key_proof_http'],
+            'current_key_proof_http': rotation_repeat['current_key_proof_http'],
+            'current_sequence': rotation_repeat['current_sequence'],
+            'stale_transaction_remains_pending': rotation_repeat['stale_transaction_remains_pending'],
+            'current_transaction_accepted': rotation_repeat['current_transaction_accepted'],
+            'status_pending': False, 'no_acceptance_or_callback': False,
+            'outcome': repeated_rotation_outcome})
         token = admin_token(client, AdminPassword(password))
         rotated_user = json.loads(admin_call(client, token, 'GET',
             f'/auth/admin/realms/{REALM}/users?username=wallet-rotated-owner&exact=true')[2])
@@ -4646,7 +5049,7 @@ def main():
         rotation_progress('mapping', {'local_mapping_persisted': local_mapping_persisted})
         require(local_mapping_persisted, 'rotated account Identity mapping persisted exactly')
         result['rotated_identity_case'] = {
-            **result.get('rotated_identity_case', {}), 'stage': 'complete', **rotation_result,
+            **result.get('rotated_identity_case', {}), 'stage': 'complete', **rotation_repeat,
             'local_mapping_persisted': True}
         checkpoint()
         provision_identity_attribute(client, token, 'wallet-owner-duplicate', identifier)
@@ -4657,9 +5060,6 @@ def main():
             'ambiguous account denial has fresh provider policy evidence',
             ambiguity_result.get('outcome'))
         result['ambiguous_account_case'] = ambiguity_result
-        checkpoint()
-        result['missing_identity_case'] = missing_identity_flow(
-            temp, resolver_port, bootstrap, IMAGE)
         checkpoint()
         print('E2E_SCENARIOS_COMPLETE: inspect per-case outcomes; overall provider qualification remains limited')
         runtime_provenance['diagnostic_categories'] = capture_live_resolver_diagnostics(
