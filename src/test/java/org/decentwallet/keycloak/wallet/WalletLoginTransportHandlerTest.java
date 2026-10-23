@@ -788,9 +788,17 @@ final class WalletLoginTransportHandlerTest {
         issued.csrfToken(), proof, IDP_ORIGIN);
     var retry = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
         issued.csrfToken(), proof, IDP_ORIGIN);
-    byte[] changedEncoding = (new String(proof, StandardCharsets.UTF_8) + " ").getBytes(StandardCharsets.UTF_8);
+    KeyPair alternateKeyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    byte[] changedSignatureProof = signedProof(issued.challenge(), "mailto:alice@example.org", alternateKeyPair);
+    var mapper = new ObjectMapper();
+    var acceptedProofFields = mapper.readTree(proof);
+    var changedProofFields = mapper.readTree(changedSignatureProof);
+    assertEquals(acceptedProofFields.get("profile"), changedProofFields.get("profile"));
+    assertEquals(acceptedProofFields.get("challenge"), changedProofFields.get("challenge"));
+    assertEquals(acceptedProofFields.get("identity_id"), changedProofFields.get("identity_id"));
+    assertNotEquals(acceptedProofFields.get("signature"), changedProofFields.get("signature"));
     var differentProof = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
-        issued.csrfToken(), changedEncoding, IDP_ORIGIN);
+        issued.csrfToken(), changedSignatureProof, IDP_ORIGIN);
     assertTrue(store.takeAccepted(issued.handle(), BINDING).isPresent());
     var retryAfterCallback = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
         issued.csrfToken(), proof, IDP_ORIGIN);
