@@ -16,6 +16,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
+import org.keycloak.models.AuthenticationExecutionModel;
 import org.keycloak.models.ClientModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
@@ -132,6 +133,9 @@ final class WalletChallengeUserMappingTest {
     }
 
     var context = mock(AuthenticationFlowContext.class);
+    var execution = mock(AuthenticationExecutionModel.class);
+    when(execution.getId()).thenReturn("wallet-execution");
+    when(context.getExecution()).thenReturn(execution);
     var session = mock(KeycloakSession.class);
     var auth = mock(AuthenticationSessionModel.class);
     var parent = mock(RootAuthenticationSessionModel.class);

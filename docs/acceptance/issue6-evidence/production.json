@@ -1,0 +1,130 @@
+{
+  "cleanup": {
+    "cid_files_present": false,
+    "containers_remaining": 0,
+    "credential_files_present": false,
+    "test_listener_remaining": false
+  },
+  "evidence": {
+    "expiry_case": {
+      "challenge_get_http": 200,
+      "fresh_challenge_http": 200,
+      "fresh_locator_distinct": true,
+      "fresh_login_http": 200,
+      "fresh_login_transaction_available": true,
+      "location_safe": true,
+      "login_page_http": 200,
+      "no_accepted_receipt": true,
+      "no_authorization_code": true,
+      "no_callback": true,
+      "proof_denied": true,
+      "proof_post_http": 404,
+      "redirects_safe": true,
+      "request_correlated_denial": true,
+      "response_body_safe": true,
+      "runtime_qualification_status": "runtime_facts_verified",
+      "single_use_object_provider_path": "infinispan",
+      "stage": "complete",
+      "status_denied": true,
+      "status_http": 404,
+      "ttl_seconds": 300,
+      "wait_seconds": 305
+    },
+    "issue6_single_node": {
+      "cache_mode_configured": "local",
+      "cache_mode_effective": "local",
+      "callback_code_returned": true,
+      "callback_http": 302,
+      "callback_redirect_uri_matches": true,
+      "callback_replay_code_returned": false,
+      "callback_replay_denied_safely": true,
+      "callback_replay_error_returned": true,
+      "callback_replay_guard_log_read": true,
+      "callback_replay_guard_marker_count": 0,
+      "callback_replay_guard_other_marker_count": 0,
+      "callback_replay_guard_reached": false,
+      "callback_replay_guard_unavailable_marker_count": 0,
+      "callback_replay_http": 302,
+      "callback_replay_redirect_uri_matches": true,
+      "callback_replay_state_preserved": true,
+      "callback_state_preserved": true,
+      "changed_retry_http": 409,
+      "database_mode_configured": "dev-file",
+      "database_mode_effective": "dev-file",
+      "identical_retry_http": 202,
+      "initial_status_accepted": true,
+      "initial_status_http": 200,
+      "keycloak_nodes": "one",
+      "keycloak_version": "26.8.0",
+      "node_count": 1,
+      "pkce_token_http": 200,
+      "proof_post_http": 202,
+      "single_use_object_provider_configured": "unavailable",
+      "single_use_object_provider_path": "unavailable",
+      "stage": "complete",
+      "status_after_callback_http": 404,
+      "status_after_callback_safe": true
+    },
+    "issue6_single_node_case": {
+      "auth_flow_complete": true,
+      "expiry_flow_complete": true,
+      "phase_order": [
+        "auth_flow",
+        "expiry_flow"
+      ],
+      "stage": "complete"
+    },
+    "resolver_runtime": {
+      "cache_mode_configured": "local",
+      "cache_mode_effective": "local",
+      "cache_mode_effective_evidence": "infinispan_configuration_log",
+      "cache_stack_effective": null,
+      "database_mode_configured": "dev-file",
+      "database_mode_effective": "dev-file",
+      "diagnostic_categories": [],
+      "harness_sha256": "f861cefbaeb82e552a33e8473355753ce455c9d300d59a2e305082580b7c1958",
+      "identity_commit": "2caec24de52c2dbe241e72fe317281c051d03f89",
+      "image_digest": "sha256:994c096991b920fd5f9e29dbfbd49f9d1a680a8d60c4ba13ee288389c8e1ca52",
+      "keycloak_config_fields_present": [
+        "database_mode_effective"
+      ],
+      "keycloak_config_read_status": "show_config_fields_missing",
+      "keycloak_nodes": "one",
+      "keycloak_version": "26.8.0",
+      "registry_commit": "0fa9a6b631bd77725418e990ae9ea4d974dc546c",
+      "runtime_command_fields_present": [
+        "cache_mode_configured",
+        "database_mode_configured"
+      ],
+      "runtime_lock_sha256": "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff",
+      "runtime_manifest_sha256": "a5db32698d8b48a8435fe3a8f4b1c62c038c3fad49c5ab243b2e25ace379462f",
+      "runtime_qualification_status": "runtime_facts_verified",
+      "single_use_object_provider_configured": "unavailable",
+      "single_use_object_provider_ids": [
+        "infinispan"
+      ],
+      "single_use_object_provider_path": "infinispan"
+    },
+    "wallet_login": {
+      "callback_replay_guard_log_read": true,
+      "callback_replay_guard_marker_count": 0,
+      "callback_replay_guard_other_marker_count": 0,
+      "callback_replay_guard_reached": false,
+      "callback_replay_guard_unavailable_marker_count": 0,
+      "login_page_http": 200,
+      "pkce_token_http": 200,
+      "proof_post_http": 202
+    }
+  },
+  "exit_code": 0,
+  "expiry_profile_requested": true,
+  "finished_at": "2026-10-24T22:59:02.544705+00:00",
+  "harness_sha256": "f861cefbaeb82e552a33e8473355753ce455c9d300d59a2e305082580b7c1958",
+  "image_digest": "sha256:994c096991b920fd5f9e29dbfbd49f9d1a680a8d60c4ba13ee288389c8e1ca52",
+  "image_id": "ffb57e2b79c5485ed1069b4bfd676af26a6ba6df4209b14e3af6742ef1aefbc8",
+  "inventory_unchanged": true,
+  "profile": "issue6-single-node",
+  "source_input_file_count": 88,
+  "source_input_fingerprint": "cc74e27a505df393e60fc9d3705f7cab99fe1247e617b86600af13e7a6b35d9f",
+  "started_at": "2026-10-24T22:53:10.561748+00:00"
+}

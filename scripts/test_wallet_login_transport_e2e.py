@@ -220,6 +220,33 @@ class AuthStatusBindingProbeTest(unittest.TestCase):
     self.assertEqual(['auth_flow'], failed_checkpoints[0]['issue6_single_node_case']['phase_order'])
     self.assertFalse(failed_checkpoints[0]['issue6_single_node_case']['expiry_flow_complete'])
 
+  def test_auth_flow_profile_does_not_run_expiry(self):
+    events = []
+    checkpoints = []
+
+    def auth_flow():
+      events.append('auth_flow')
+      return {'wallet_login': {'proof_post_http': 202}}
+
+    def forbidden_expiry():
+      events.append('expiry_flow')
+      raise AssertionError('expiry must be explicitly authorized')
+
+    self.assertEqual('issue6-auth-flow',
+        selected_acceptance_profile({'WALLET_IT_PROFILE': 'issue6-auth-flow'}))
+    selected = run_acceptance_profile('issue6-auth-flow', forbidden_expiry, auth_flow,
+        checkpoint=lambda snapshot: checkpoints.append(sanitize_live_checkpoint(snapshot)))
+
+    self.assertEqual(['auth_flow'], events)
+    self.assertEqual('issue6-auth-flow', selected['profile'])
+    self.assertFalse(selected['broad_matrix_started'])
+    self.assertEqual(['auth_flow'], selected['issue6_single_node_case']['phase_order'])
+    self.assertTrue(selected['issue6_single_node_case']['auth_flow_complete'])
+    self.assertFalse(selected['issue6_single_node_case']['expiry_flow_complete'])
+    self.assertEqual('auth_flow_complete', selected['issue6_single_node_case']['stage'])
+    self.assertNotIn('expiry_case', selected)
+    self.assertEqual(202, checkpoints[0]['wallet_login']['proof_post_http'])
+
   def test_keycloak_nonzero_run_recovers_verified_cid_before_credential_unlink(self):
     import subprocess
     import tempfile
@@ -394,6 +421,47 @@ class AuthStatusBindingProbeTest(unittest.TestCase):
         'single_use_object_provider_evidence': 'not_observed', 'credential_file_retained': False},
         evidence['resolver_runtime'])
 
+  def test_masked_runtime_provider_is_not_inferred_until_request_witness(self):
+    import wallet_login_live_e2e as probe
+    parsed = probe.parse_keycloak_show_config(
+        'kc.db = dev-file (classpath application.properties)\n'
+        'kc.spi-single-use-object--provider-default = ******* (Persisted)\n')
+    self.assertEqual({'database_mode_effective': 'dev-file'}, parsed)
+    self.assertEqual({'database_mode_configured': 'dev-file',
+        'cache_mode_configured': 'local',
+        'single_use_object_provider_configured': 'infinispan'}, probe.parse_keycloak_runtime_command(
+            ['start-dev', '--db=dev-file', '--cache=local',
+                '--spi-single-use-object--provider-default=infinispan']))
+    self.assertEqual({'cache_mode_configured': 'local'}, probe.parse_keycloak_runtime_command(
+        ['start-dev', '--db=dev-file', '--db=dev-file', '--cache=local']))
+    facts = {
+        'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
+        'database_mode_configured': 'dev-file', 'database_mode_effective': 'unavailable',
+        'cache_mode_configured': 'local', 'cache_mode_effective': 'unavailable',
+        'single_use_object_provider_configured': 'infinispan',
+        'single_use_object_provider_path': 'unavailable',
+        'single_use_object_provider_ids': ['infinispan'],
+    }
+    self.assertTrue(probe.runtime_baseline_is_verified(facts))
+    self.assertFalse(probe.runtime_qualification_is_verified(facts))
+    facts['single_use_object_provider_path'] = 'infinispan'
+    self.assertFalse(probe.runtime_qualification_is_verified(facts))
+    facts['cache_mode_effective'] = 'local'
+    self.assertFalse(probe.runtime_qualification_is_verified(facts))
+    facts['database_mode_effective'] = 'dev-file'
+    self.assertTrue(probe.runtime_qualification_is_verified(facts))
+    facts['database_mode_configured'] = 'unavailable'
+    facts['cache_mode_configured'] = 'unavailable'
+    self.assertTrue(probe.runtime_qualification_is_verified(facts))
+    import inspect
+    main_source = inspect.getsource(probe.main)
+    self.assertIn('require(runtime_baseline_is_verified(runtime_provenance)', main_source)
+    self.assertNotIn("runtime_provenance['runtime_qualification_status'] == 'runtime_facts_verified'",
+        main_source)
+    coordinator_source = inspect.getsource(probe.expiry_profile_coordinator)
+    self.assertIn("checkpoint(evidence)\n  require(evidence['proof_denied']", coordinator_source)
+    self.assertNotIn("require(evidence['runtime_qualification_status']", coordinator_source)
+
   def test_owned_container_cleanup_requires_verified_full_id(self):
     import subprocess
     from tempfile import TemporaryDirectory
@@ -551,10 +619,11 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
     def fake_run(argv, **kwargs):
       self.assertEqual(argv[:3], ['podman', 'logs', '--since'])
       self.assertIn('--timestamps', argv)
-      logs = (f'Wallet accepted receipt publication unavailable (request={request_id}, '
-          'cause=post_consume_receipt_failure)\\n'
+      logs = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={probe.ISSUE6_POSTCONSUME_TEST_PROVIDER_ID} '
+          f'operation=transaction_put_if_absent request={request_id}\\n'
+          f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)\\n'
           'ISSUE6_TEST_FAULT: accepted receipt delegate write committed; test decorator threw\\n')
-      return subprocess.CompletedProcess(argv, 0, logs, '')
+      return subprocess.CompletedProcess(argv, 0, logs, None)
 
     browser_state = {}
     with patch('wallet_login_live_e2e.run', side_effect=fake_run):
@@ -570,6 +639,19 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
     self.assertTrue(evidence['fault_signal_correlated'])
     self.assertTrue(evidence['delegate_commit_then_throw'])
 
+  def test_test_provider_selection_witness_is_request_and_factory_specific(self):
+    import wallet_login_live_e2e as probe
+    request_id = 'a' * 32
+    provider = probe.ISSUE6_POSTCONSUME_TEST_PROVIDER_ID
+    marker = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={provider} '
+        f'operation=transaction_put_if_absent request={request_id}')
+    self.assertTrue(probe.issue6_test_provider_selection_is_verified(marker, provider, request_id))
+    self.assertFalse(probe.issue6_test_provider_selection_is_verified(
+        marker, probe.ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID, request_id))
+    self.assertFalse(probe.issue6_test_provider_selection_is_verified(marker, provider, 'b' * 32))
+    self.assertFalse(probe.issue6_test_provider_selection_is_verified(marker + '\\n' + marker,
+        provider, request_id))
+
   def test_test_provider_is_test_image_only_and_selected_at_image_build(self):
     root = Path(__file__).parents[1]
     dockerfile = (root / 'container/Dockerfile').read_text()
@@ -581,12 +663,22 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
 
     self.assertIn('AS issue6-postconsume-test-runtime', dockerfile)
     self.assertIn('target/issue6-postconsume-receipt-failure-provider.jar', dockerfile)
-    self.assertIn('--spi-single-use-object--provider=issue6-postconsume-receipt-failure', dockerfile)
+    self.assertIn('--cache=local', dockerfile)
+    self.assertIn('--spi-single-use-object--provider-default=issue6-postconsume-receipt-failure', dockerfile)
     self.assertIn('--db=dev-file', dockerfile)
-    self.assertIn('--spi-single-use-object--provider=infinispan', dockerfile)
+    self.assertIn('--spi-single-use-object--provider-default=infinispan', dockerfile)
+    self.assertIn('--spi-single-use-object--provider-default=issue6-postconsume-callback-gate-failure', dockerfile)
+    self.assertNotIn('--spi-singleUseObject--provider-default=', dockerfile)
     startup = harness.split('def start_keycloak(', 1)[1].split('def admin_token', 1)[0]
     self.assertIn("'--cache=local'", startup)
-    self.assertNotIn('--spi-single-use-object--provider=', startup)
+    command = startup.split('cmd = [', 1)[1].split(']', 1)[0]
+    self.assertNotIn('--spi-single-use-object--provider-default=', command)
+    self.assertIn("image, 'start-dev'", startup)
+    self.assertIn("cmd.append(f'--spi-single-use-object--provider-default={single_use_object_provider}')", startup)
+    self.assertIn('single_use_object_provider=ISSUE6_POSTCONSUME_TEST_PROVIDER_ID', harness)
+    self.assertIn('single_use_object_provider=ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID', harness)
+    self.assertIn('IDENTITY_LOOKUP_COOLDOWN_SECONDS = 2', harness)
+    self.assertGreaterEqual(harness.count('wait_for_identity_lookup_cooldown()'), 3)
     self.assertNotIn("'show-config', '--all'", harness)
     self.assertNotIn('Issue6PostConsumeReceiptFailureProviderFactory', '\\n'.join(main_sources))
     self.assertIn('target/test-classes', builder)
@@ -648,9 +740,10 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
 
     request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
     def fake_run(argv, **kwargs):
-      logs = (f'Wallet accepted receipt publication unavailable (request={request_id}, '
-          'cause=post_consume_receipt_failure)\n'
-          'ISSUE6_TEST_FAULT: accepted receipt delegate write committed; test decorator threw\n')
+      logs = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={probe.ISSUE6_POSTCONSUME_TEST_PROVIDER_ID} '
+          f'operation=transaction_put_if_absent request={request_id}\\n'
+          f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)\\n'
+          'ISSUE6_TEST_FAULT: accepted receipt delegate write committed; test decorator threw\\n')
       return subprocess.CompletedProcess(argv, 0, logs, '')
 
     def fake_openssl(argv, **kwargs):
@@ -725,6 +818,247 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
       self.assertEqual(200, evidence['issue6_postconsume_receipt_recovery']['pkce_token_http'])
       self.assertNotIn(locator, rendered)
       self.assertNotIn(handle, rendered)
+
+  def test_callback_gate_provider_targets_callback_key_and_commits_before_throwing(self):
+    root = Path(__file__).parents[1]
+    source = (root / 'src/test/java/org/decentwallet/keycloak/issue6test/'
+        'Issue6PostConsumeCallbackGateFailureProviderFactory.java').read_text()
+    dockerfile = (root / 'container/Dockerfile').read_text()
+    builder = (root / 'scripts/build_issue6_callback_gate_provider.py').read_text()
+    main_sources = [path.read_text() for path in (root / 'src/main').rglob('*') if path.is_file()]
+    self.assertIn('delegate.putIfAbsent(key, lifespanSeconds)', source)
+    self.assertIn('key.startsWith(CALLBACK_PREFIX)', source)
+    self.assertIn('ISSUE6_TEST_FAULT: callback gate delegate putIfAbsent committed', source)
+    self.assertIn('AS issue6-callback-gate-test-runtime', dockerfile)
+    self.assertIn('--spi-single-use-object--provider-default=issue6-postconsume-callback-gate-failure', dockerfile)
+    self.assertIn('target/issue6-postconsume-callback-gate-failure-provider.jar', dockerfile)
+    self.assertIn('target/test-classes', builder)
+    self.assertNotIn('Issue6PostConsumeCallbackGateFailureProviderFactory', '\\n'.join(main_sources))
+
+  def test_issue6_provider_builders_include_anonymous_delegate_classes(self):
+    import shutil
+    import zipfile
+    root = Path(__file__).parents[1]
+    cases = [
+        ('build_issue6_postconsume_provider.py',
+         'Issue6PostConsumeReceiptFailureProviderFactory'),
+        ('build_issue6_callback_gate_provider.py',
+         'Issue6PostConsumeCallbackGateFailureProviderFactory'),
+    ]
+    for builder_name, factory_name in cases:
+      with self.subTest(factory=factory_name), tempfile.TemporaryDirectory() as temp:
+        fixture = Path(temp)
+        scripts = fixture / 'scripts'
+        classes = fixture / 'target/test-classes'
+        scripts.mkdir()
+        classes.mkdir(parents=True)
+        shutil.copyfile(root / 'scripts' / builder_name, scripts / builder_name)
+        class_dir = classes / 'org/decentwallet/keycloak/issue6test'
+        class_dir.mkdir(parents=True)
+        outer = class_dir / (factory_name + '.class')
+        inner = class_dir / (factory_name + '$1.class')
+        test_class = class_dir / (factory_name + 'Test.class')
+        outer.write_bytes(b'outer class fixture')
+        inner.write_bytes(b'anonymous delegate class fixture')
+        test_class.write_bytes(b'test class must not be packaged')
+        service = classes / 'META-INF/services/org.keycloak.models.SingleUseObjectProviderFactory'
+        service.parent.mkdir(parents=True)
+        service.write_text('org.decentwallet.keycloak.issue6test.' + factory_name + '\n')
+
+        completed = subprocess.run([sys.executable, str(scripts / builder_name)],
+            cwd=fixture, capture_output=True, text=True, check=False)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        jar_path = next((fixture / 'target').glob('issue6-postconsume-*-provider.jar'))
+        with zipfile.ZipFile(jar_path) as jar:
+          expected = {
+              outer.relative_to(classes).as_posix(),
+              inner.relative_to(classes).as_posix(),
+              'META-INF/services/org.keycloak.models.SingleUseObjectProviderFactory',
+          }
+          self.assertEqual(expected, set(jar.namelist()))
+          self.assertEqual('org.decentwallet.keycloak.issue6test.' + factory_name,
+              jar.read('META-INF/services/org.keycloak.models.SingleUseObjectProviderFactory').decode().strip())
+
+  def test_callback_gate_evidence_sanitizer_drops_identifiers_and_raw_material(self):
+    from wallet_login_live_e2e import sanitize_live_checkpoint
+    unsafe = {'issue6_postconsume_callback_gate_failure_case': {
+        'stage': 'failed_then_denied', 'proof_http': 503, 'retry_http': 404,
+        'status_http': 404, 'proof_body_empty': True, 'proof_redirect_followed': False,
+        'status_body_empty': True, 'status_redirect_followed': False,
+        'callback_exposed': False, 'oidc_code_exposed': False,
+        'fault_signal_correlated': True, 'fault_signal_count': 1,
+        'delegate_commit_then_throw': True, 'request_id': 'secret',
+        'locator': 'https://private.invalid/locator', 'proof': 'secret'},
+        'issue6_postconsume_callback_gate_recovery': {
+            'fresh_login_http': 200, 'fresh_login_transaction_available': True,
+            'callback_http': 302, 'callback_code': True,
+            'callback_replay_denied': True, 'pkce_token_http': 200,
+            'authorization_code': 'secret'}}
+    safe = sanitize_live_checkpoint(unsafe)
+    self.assertEqual(503, safe['issue6_postconsume_callback_gate_failure_case']['proof_http'])
+    self.assertTrue(safe['issue6_postconsume_callback_gate_recovery']['callback_replay_denied'])
+    self.assertNotIn('request_id', str(safe))
+    self.assertNotIn('private.invalid', str(safe))
+    self.assertNotIn('authorization_code', str(safe))
+
+  def test_callback_gate_failure_flow_checks_real_proof_retry_status_and_correlated_markers(self):
+    import hashlib
+    import json
+    import subprocess
+    import wallet_login_live_e2e as probe
+    handle = 'G' * 43
+    locator = (f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}'
+        f'/decent-wallet-login/v1/transactions/{handle}')
+    status_url = (f'/auth/realms/{probe.REALM}/decent-wallet-login/v1/transactions/'
+        f'{handle}/status')
+    csrf = 'C' * 43
+    login_page = (f'<p id="wallet-locator">{locator}</p>'
+        f'<script>const csrfToken = "{csrf}"; const statusUrl = "{status_url}";</script>').encode()
+    class FakeClient:
+      def __init__(self, role): self.role, self.redirects, self.calls = role, [], []
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        self.calls.append((method, path, data, headers))
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          return 200, {}, login_page
+        if method == 'GET' and path == locator:
+          return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+              'challenge': 'challenge', 'csrf_token': csrf}).encode()
+        if method == 'POST' and path == locator:
+          return (503, {}, b'') if sum(call[0] == 'POST' for call in self.calls) == 1 else (404, {}, b'')
+        if method == 'GET' and path == status_url:
+          return 404, {}, b''
+        raise AssertionError('unexpected callback-gate production endpoint request')
+    clients = []
+    def factory():
+      client = FakeClient('browser' if not clients else 'wallet'); clients.append(client); return client
+    request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+    def fake_run(argv, **kwargs):
+      logs = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={probe.ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID} '
+          f'operation=transaction_put_if_absent request={request_id}\\n'
+          f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)\\n'
+          f'Wallet accepted receipt publication unavailable (request={request_id}, '
+          'cause=post_consume_receipt_failure)\\n'
+          'ISSUE6_TEST_FAULT: callback gate delegate putIfAbsent committed; test decorator threw\\n')
+      return subprocess.CompletedProcess(argv, 0, logs, '')
+    state = {}
+    with patch('wallet_login_live_e2e.run', side_effect=fake_run):
+      with self.assertRaisesRegex(RuntimeError, 'not misattributed as receipt publication failure'):
+        probe.postconsume_callback_gate_failure_flow(None, 'fixture-id', 'container',
+            browser_state=state, client_factory=factory, signer=lambda *_: 'A' * 86)
+
+  def test_callback_gate_profile_orchestrates_fault_recovery_and_sanitized_checkpoint(self):
+    import hashlib
+    import io
+    import json
+    import subprocess
+    from contextlib import ExitStack, redirect_stdout
+    from types import SimpleNamespace
+    import wallet_login_live_e2e as probe
+    handle = 'J' * 43
+    locator = (f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}'
+        f'/decent-wallet-login/v1/transactions/{handle}')
+    status_url = (f'/auth/realms/{probe.REALM}/decent-wallet-login/v1/transactions/'
+        f'{handle}/status')
+    csrf = 'C' * 43
+    login_page = (f'<p id="wallet-locator">{locator}</p>'
+        f'<script>const csrfToken = "{csrf}"; const statusUrl = "{status_url}";</script>').encode()
+    class FakeClient:
+      def __init__(self): self.redirects, self.posts = [], 0
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          return 200, {}, login_page
+        if method == 'GET' and path == locator:
+          return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+              'challenge': 'challenge', 'csrf_token': csrf}).encode()
+        if method == 'POST' and path == locator:
+          self.posts += 1
+          return (503, {}, b'') if self.posts == 1 else (404, {}, b'')
+        if method == 'GET' and path == status_url:
+          return 404, {}, b''
+        raise AssertionError('unexpected callback-gate endpoint')
+    clients = []
+    def client_factory():
+      client = FakeClient(); clients.append(client); return client
+    request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+    def fake_run(argv, **kwargs):
+      logs = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={probe.ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID} '
+          f'operation=transaction_put_if_absent request={request_id}\\n'
+          f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)\\n'
+          'ISSUE6_TEST_FAULT: callback gate delegate putIfAbsent committed; test decorator threw\\n')
+      return subprocess.CompletedProcess(argv, 0, logs, '')
+    runtime = {'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
+        'database_mode_configured': 'dev-file', 'database_mode_effective': 'dev-file',
+        'cache_mode_configured': 'local', 'cache_mode_effective': 'local',
+        'single_use_object_provider_path': 'unavailable',
+        'single_use_object_provider_ids': ['issue6-postconsume-callback-gate-failure'],
+        'runtime_qualification_status': 'open_runtime_facts_unavailable'}
+    recovery = {'login_page_http': 200, 'fresh_locator_distinct': True,
+        'initial_status_accepted': True, 'callback_http': 302, 'callback_code_returned': True,
+        'callback_replay_error_returned': True, 'callback_replay_code_returned': False,
+        'pkce_token_http': 200}
+    with tempfile.TemporaryDirectory() as scratch:
+      output = io.StringIO()
+      with ExitStack() as stack:
+        stack.enter_context(patch.object(probe, 'SCRATCH', scratch))
+        stack.enter_context(patch.object(probe, 'IMAGE', 'mutable-tag'))
+        stack.enter_context(patch.object(probe, 'RUN_CID_DIR', None))
+        stack.enter_context(patch.dict(os.environ, {'WALLET_IT_TEST_IMAGE': 'isolated-test-image'}))
+        stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+            return_value=('immutable-test-image', 'sha256:' + 'b' * 64)))
+        stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+        stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
+        registry = object()
+        stack.enter_context(patch.object(probe, 'start_registry', return_value=(registry, 'bootstrap', 12345)))
+        stack.enter_context(patch.object(probe, 'free_port', return_value=12346))
+        key = Path(scratch) / 'identity.pem'
+        stack.enter_context(patch.object(probe, 'write_identity',
+            return_value=(key, SimpleNamespace(name='wrapper'), 'identity-id')))
+        keycloak = SimpleNamespace(wallet_container_id='a' * 64)
+        stack.enter_context(patch.object(probe, 'start_keycloak', return_value=keycloak))
+        stack.enter_context(patch.object(probe, 'admin_token', return_value='admin-token'))
+        stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value=runtime))
+        stack.enter_context(patch.object(probe, 'configure_realm'))
+        stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
+        stack.enter_context(patch.object(probe, 'provision_identity_attribute'))
+        stack.enter_context(patch.object(probe, 'auth_flow', return_value=recovery))
+        stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=0))
+        stack.enter_context(patch.object(probe, 'Client', side_effect=client_factory))
+        stack.enter_context(patch.object(probe, 'run', side_effect=fake_run))
+        def fake_openssl(argv, **kwargs):
+          return subprocess.CompletedProcess(argv, 0, b'X' * (44 if argv[1] == 'pkey' else 64), b'')
+        stack.enter_context(patch.object(probe.subprocess, 'run', side_effect=fake_openssl))
+        stack.enter_context(patch.object(probe, 'write_private_signing_input'))
+        with redirect_stdout(output):
+          probe.run_issue6_postconsume_callback_gate_failure_profile()
+      rendered = next(line.split('=', 1)[1] for line in output.getvalue().splitlines()
+          if line.startswith('issue6_postconsume_callback_gate_failure_evidence='))
+      evidence = json.loads(rendered)
+      self.assertEqual(503, evidence['issue6_postconsume_callback_gate_failure_case']['proof_http'])
+      self.assertEqual(404, evidence['issue6_postconsume_callback_gate_failure_case']['status_http'])
+      self.assertFalse(evidence['issue6_postconsume_callback_gate_failure_case']['callback_exposed'])
+      self.assertFalse(evidence['issue6_postconsume_callback_gate_failure_case']['oidc_code_exposed'])
+      self.assertFalse(evidence['issue6_postconsume_callback_gate_failure_case']['proof_redirect_followed'])
+      self.assertTrue(evidence['issue6_postconsume_callback_gate_recovery']['callback_replay_denied'])
+      self.assertEqual(200, evidence['issue6_postconsume_callback_gate_recovery']['pkce_token_http'])
+      self.assertNotIn(locator, rendered)
+      self.assertNotIn(handle, rendered)
+      self.assertNotIn('authorization_code', rendered)
+
+  def test_callback_gate_selector_is_listed_in_invalid_profile_diagnostic(self):
+    import wallet_login_live_e2e as probe
+    with patch.dict(os.environ, {'WALLET_IT_PROFILE': 'unknown-profile'}):
+      with self.assertRaisesRegex(ValueError, 'issue6-postconsume-callback-gate-failure'):
+        probe.main()
+
+  def test_callback_gate_profile_dispatches_to_separate_issue6_runner(self):
+    import wallet_login_live_e2e as probe
+
+    with patch.dict(os.environ, {'WALLET_IT_PROFILE': 'issue6-postconsume-callback-gate-failure'}):
+      with patch.object(probe, 'run_issue6_postconsume_callback_gate_failure_profile',
+          return_value='selected', create=True) as runner:
+        self.assertEqual('selected', probe.main())
+    runner.assert_called_once_with()
+
 
 class OwnedResourceCleanupFailureTest(unittest.TestCase):
   def run_cleanup(self, cleanup_failures=(), primary_failure=None, cleanup_interrupt=None):

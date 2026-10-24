@@ -4,6 +4,7 @@ import java.security.SecureRandom;
 import java.time.Clock;
 import java.util.List;
 
+import org.keycloak.authentication.AuthenticationFlowCallbackFactory;
 import org.keycloak.authentication.Authenticator;
 import org.keycloak.authentication.AuthenticatorFactory;
 import org.keycloak.authentication.ConfigurableAuthenticatorFactory;
@@ -12,10 +13,11 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.provider.ProviderConfigProperty;
 /** SPI registration and required-flow metadata for the development authenticator. */
-public final class WalletChallengeAuthenticatorFactory implements AuthenticatorFactory, ConfigurableAuthenticatorFactory {
+public final class WalletChallengeAuthenticatorFactory implements AuthenticatorFactory,
+    ConfigurableAuthenticatorFactory, AuthenticationFlowCallbackFactory {
   public static final String ID = "decent-wallet-challenge";
   @Override public Authenticator create(KeycloakSession session) {
-    return new WalletChallengeAuthenticator(() -> new WalletLoginTransactionStore(
+    return new WalletChallengeAuthenticator(session, () -> new WalletLoginTransactionStore(
         session.singleUseObjects(), new SecureRandom(), Clock.systemUTC()));
   }
   @Override public String getId() { return ID; }

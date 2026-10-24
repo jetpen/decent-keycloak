@@ -741,6 +741,35 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       self.assertEqual([['podman', 'rm', '--force', container_id]],
           [call for call in calls if call[:2] == ['podman', 'rm']])
 
+  def test_owned_container_cleanup_accepts_podman_removed_cid_file(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'd' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      inspect_count = 0
+      def fake_run(args, **_kwargs):
+        nonlocal inspect_count
+        if args[:3] == ['podman', 'inspect', '--format']:
+          inspect_count += 1
+          if inspect_count == 1:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1,
+              stdout='Error: no such object: "' + container_id + '"')
+        cid_file.unlink(missing_ok=True)
+        return SimpleNamespace(returncode=0, stdout='')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': True, 'retained_cid': False}, status)
+      self.assertFalse(cid_file.exists())
+
   def test_owned_container_cleanup_refuses_inspect_id_mismatch(self):
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -850,8 +879,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'keycloak_version': 'unavailable', 'keycloak_nodes': 'unknown',
         'database_mode_configured': 'dev-file', 'database_mode_effective': 'unavailable',
         'cache_mode_configured': 'local', 'cache_mode_effective': 'unavailable',
-        'cache_stack_effective': None, 'single_use_object_provider_path': 'unavailable',
-        'single_use_object_provider_ids': [],
+        'cache_stack_effective': None, 'single_use_object_provider_configured': 'unavailable',
+        'single_use_object_provider_path': 'unavailable', 'single_use_object_provider_ids': [],
+        'runtime_command_fields_present': [],
         'runtime_qualification_status': 'open_runtime_facts_unavailable',
     }
     with tempfile.TemporaryDirectory() as scratch:
@@ -874,7 +904,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value=facts))
         stack.enter_context(patch.object(probe, 'record_resolver_diagnostics', return_value=[]))
         stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=0))
-        with self.assertRaisesRegex(RuntimeError, 'effective Keycloak runtime provenance verified'):
+        with self.assertRaisesRegex(RuntimeError,
+            'pinned Keycloak version and single-node baseline verified'):
           probe.main()
 
       evidence = output.getvalue()
@@ -888,17 +919,29 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'kc.db = dev-file (PersistedConfigSource)\n'
         'kc.cache = local (SysPropConfigSource)\n'
         'kc.cache-stack = jdbc-ping (ConfigSource)\n'
-        'kc.spi-single-use-object--provider = infinispan (PersistedConfigSource)\n'
+        'kc.spi-single-use-object--provider-default = infinispan (classpath application.properties)\n'
         'kc.db = postgres (EnvVarConfigSource)\n'
         'kc.hostname = idp.example (SysPropConfigSource)\n'
         'kc.cache=unsafe value (sensitive-source)\n')
     self.assertEqual({'cache_mode_effective': 'local', 'cache_stack_effective': 'jdbc-ping',
-        'single_use_object_provider_path': 'infinispan'}, facts)
+        'single_use_object_provider_configured': 'infinispan'}, facts)
     self.assertNotIn('PersistedConfigSource', json.dumps(facts))
     self.assertNotIn('idp.example', json.dumps(facts))
     self.assertEqual({}, probe.parse_keycloak_show_config(
-        'kc.spi-single-use-object--provider = infinispan\n'
-        'kc.spi-single-use-object--provider = jpa\n'))
+        'kc.spi-single-use-object--provider-default = infinispan\n'
+        'kc.spi-single-use-object--provider-default = jpa\n'))
+
+  def test_runtime_cache_mode_requires_unambiguous_applied_infinispan_configuration(self):
+    import wallet_login_live_e2e as probe
+    prefix = 'INFO boot\nDEBUG Infinispan configuration:\n'
+    self.assertEqual('local', probe.parse_infinispan_runtime_cache_mode(
+        prefix + '<local-cache name="sessions"/><local-cache name="realms"/>'))
+    self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
+        prefix + '<local-cache name="sessions"/><distributed-cache name="sessions"/>'))
+    self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
+        prefix + '<local-cache name="sessions"/>\nInfinispan configuration: <local-cache/>'))
+    self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
+        '<local-cache name="sessions"/>'))
 
   def test_runtime_provenance_reads_allowlisted_config_but_does_not_infer_selected_provider(self):
     from types import SimpleNamespace
@@ -913,20 +956,27 @@ class IdentityLookupClassificationTest(unittest.TestCase):
                 'jpa': {'order': 1, 'operationalInfo': {}}}}}}).encode())
 
     with patch.object(probe, 'run', side_effect=[
-        SimpleNamespace(returncode=0, stdout='a' * 64 + '\n'),
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]\n'),
         SimpleNamespace(returncode=0, stdout=(
             'kc.db = dev-file (Persisted)\n'
             'kc.cache = local (Persisted)\n'
-            'kc.spi-single-use-object--provider = ******* (Persisted)\n'))]) as mocked_run:
+            'kc.spi-single-use-object--provider-default = ******* (Persisted)\n')),
+        SimpleNamespace(returncode=0, stdout='Infinispan configuration:\n<local-cache name="sessions"/>')]) as mocked_run:
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
-    self.assertEqual(2, mocked_run.call_count)
-    self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], mocked_run.call_args_list[0].args[0])
-    self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config'],
+    self.assertEqual(3, mocked_run.call_count)
+    self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}', 'a' * 64], mocked_run.call_args_list[0].args[0])
+    self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config',
+        '--db=dev-file', '--cache=local', '--spi-single-use-object--provider-default=infinispan'],
         mocked_run.call_args_list[1].args[0])
+    self.assertEqual(['podman', 'logs', 'a' * 64], mocked_run.call_args_list[2].args[0])
     self.assertEqual('26.8.0', facts['keycloak_version'])
     self.assertEqual('one', facts['keycloak_nodes'])
     self.assertEqual('dev-file', facts['database_mode_effective'])
     self.assertEqual('local', facts['cache_mode_effective'])
+    self.assertEqual('infinispan_configuration_log', facts['cache_mode_effective_evidence'])
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts['runtime_command_fields_present'])
     self.assertEqual(['infinispan', 'jpa'], facts['single_use_object_provider_ids'])
     self.assertEqual('unavailable', facts['single_use_object_provider_path'])
     self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
@@ -949,14 +999,21 @@ class IdentityLookupClassificationTest(unittest.TestCase):
                 'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
 
     with patch.object(probe, 'run', side_effect=[
-        SimpleNamespace(returncode=0, stdout='a' * 64 + chr(10)),
-        SimpleNamespace(returncode=17, stdout='private show-config output')]):
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]' + chr(10)),
+        SimpleNamespace(returncode=17, stdout='private show-config output'),
+        SimpleNamespace(returncode=0, stdout='')]):
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
 
     self.assertEqual('show_config_nonzero', facts.get('keycloak_config_read_status'))
     self.assertEqual([], facts.get('keycloak_config_fields_present'))
     self.assertNotIn('private show-config output', json.dumps(facts))
+    self.assertEqual('dev-file', facts['database_mode_configured'])
+    self.assertEqual('local', facts['cache_mode_configured'])
     self.assertEqual('unavailable', facts['database_mode_effective'])
+    self.assertEqual('unavailable', facts['cache_mode_effective'])
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts['runtime_command_fields_present'])
 
   def test_runtime_provenance_reports_show_config_timeout(self):
     import subprocess
@@ -969,8 +1026,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'}}).encode())
 
     with patch.object(probe, 'run', side_effect=[
-        SimpleNamespace(returncode=0, stdout='a' * 64 + chr(10)),
-        subprocess.TimeoutExpired('show-config', 8)]):
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]' + chr(10)),
+        subprocess.TimeoutExpired('show-config', 8),
+        SimpleNamespace(returncode=0, stdout='')]):
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
 
     self.assertEqual('show_config_timeout', facts.get('keycloak_config_read_status'))
@@ -1010,14 +1068,56 @@ class IdentityLookupClassificationTest(unittest.TestCase):
                 'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
 
     with patch.object(probe, 'run', return_value=SimpleNamespace(
-        returncode=0, stdout='b' * 64 + '\\n')) as mocked_run:
+        returncode=0, stdout='b' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]\\n')) as mocked_run:
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
     mocked_run.assert_called_once_with(
-        ['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], timeout=8)
+        ['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}', 'a' * 64], timeout=8)
     self.assertEqual('unknown', facts['keycloak_nodes'])
     self.assertEqual('container_id_unverified', facts['keycloak_config_read_status'])
     self.assertEqual('unavailable', facts['database_mode_effective'])
     self.assertEqual('open_runtime_facts_unavailable', facts['runtime_qualification_status'])
+
+  def test_runtime_provenance_keeps_command_inputs_separate_from_effective_readbacks(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import json
+    import wallet_login_live_e2e as probe
+
+    class InfoClient:
+      def request(self, *_args, **_kwargs):
+        return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'},
+            'providers': {'single-use-object': {'providers': {
+                'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
+
+    container_id = 'a' * 64
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout=container_id + '|["start-dev","--db=postgres","--cache=local","--spi-single-use-object--provider-default=infinispan"]\n'),
+        SimpleNamespace(returncode=0,
+            stdout='kc.db = postgres (classpath application.properties)\n', stderr=''),
+        SimpleNamespace(returncode=0, stdout='')]):
+      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
+
+    self.assertEqual('postgres', facts['database_mode_configured'])
+    self.assertEqual('local', facts['cache_mode_configured'])
+    self.assertEqual('postgres', facts['database_mode_effective'])
+    self.assertEqual('unavailable', facts['cache_mode_effective'])
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts['runtime_command_fields_present'])
+    self.assertEqual(['database_mode_effective'], facts['keycloak_config_fields_present'])
+    self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
+    self.assertEqual('open_runtime_facts_unavailable', facts['runtime_qualification_status'])
+
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout=container_id + '|["start-dev","--db=postgres","--cache=local","--spi-single-use-object--provider-default=infinispan"]\n'),
+        SimpleNamespace(returncode=0, stdout=(
+            'kc.db = mysql (classpath application.properties)\n'
+            'kc.cache = local (classpath application.properties)\n'), stderr=''),
+        SimpleNamespace(returncode=0, stdout='')]):
+      conflicting = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
+    self.assertEqual('unavailable', conflicting['database_mode_effective'])
+    self.assertEqual('local', conflicting['cache_mode_effective'])
+    self.assertEqual('show_config_conflict', conflicting['keycloak_config_read_status'])
 
   def test_runtime_checkpoint_projects_allowlisted_facts_without_raw_or_provider_class_data(self):
     candidate = {'resolver_runtime': {
@@ -1027,12 +1127,16 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
         'database_mode_configured': 'dev-file', 'database_mode_effective': 'dev-file',
         'cache_mode_configured': 'local', 'cache_mode_effective': 'local',
+        'cache_mode_effective_evidence': 'infinispan_configuration_log',
         'cache_stack_effective': 'jdbc-ping',
+        'single_use_object_provider_configured': 'infinispan',
         'single_use_object_provider_path': 'infinispan',
         'single_use_object_provider_ids': ['infinispan', 'jpa'],
+        'runtime_command_fields_present': ['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
         'keycloak_config_read_status': 'show_config_fields_complete',
         'keycloak_config_fields_present': ['cache_mode_effective',
-            'database_mode_effective', 'single_use_object_provider_path'],
+            'database_mode_effective', 'single_use_object_provider_configured'],
         'runtime_qualification_status': 'runtime_facts_verified',
         'raw_show_config': 'marker-raw-config', 'selected_provider_class': 'marker-class',
         'admin_token': 'marker-token'}}
@@ -1041,11 +1145,15 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertEqual('26.8.0', facts.get('keycloak_version'))
     self.assertEqual('one', facts.get('keycloak_nodes'))
     self.assertEqual('jdbc-ping', facts.get('cache_stack_effective'))
+    self.assertEqual('infinispan_configuration_log', facts.get('cache_mode_effective_evidence'))
     self.assertEqual(['infinispan', 'jpa'], facts.get('single_use_object_provider_ids'))
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts.get('runtime_command_fields_present'))
     self.assertEqual('runtime_facts_verified', facts.get('runtime_qualification_status'))
     self.assertEqual('show_config_fields_complete', facts.get('keycloak_config_read_status'))
     self.assertEqual(['cache_mode_effective', 'database_mode_effective',
-        'single_use_object_provider_path'], facts.get('keycloak_config_fields_present'))
+        'single_use_object_provider_configured'], facts.get('keycloak_config_fields_present'))
     rendered = json.dumps(projected)
     self.assertNotIn('marker-raw-config', rendered)
     self.assertNotIn('marker-class', rendered)

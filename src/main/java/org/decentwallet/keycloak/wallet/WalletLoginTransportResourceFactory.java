@@ -68,7 +68,9 @@ public final class WalletLoginTransportResourceFactory
     var resource = new WalletLoginTransportResource();
     resource.configure(session,
         new WalletLoginTransportHandler(store, sharedResolver, walletOrigin, idpOrigin, accounts,
-            acceptSignup, store), idpOrigin, acceptSignup);
+            acceptSignup, store,
+            (handle, binding) -> WalletTerminalAuthenticationSession.retire(session, handle, binding)),
+        idpOrigin, acceptSignup);
     return resource;
   }
 

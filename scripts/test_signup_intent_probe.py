@@ -606,7 +606,9 @@ class SignupIntentProbeTest(unittest.TestCase):
     end = source.index("\ndef der(", start)
     block = source[start:end]
     self.assertIn("'users': [{", block)
-    self.assertIn("'email': identifier, 'emailVerified': True", block)
+    self.assertIn("'email': 'wallet-owner@example.com', 'emailVerified': True", block)
+    self.assertIn("'attributes': {'decent_identity_id': [identifier]}", block)
+    self.assertNotIn("'email': identifier", block)
     self.assertNotIn("/users', {\n          'username': 'wallet-owner'", block)
 
   def test_prompt_create_is_not_used_and_signup_fixture_runs_in_full_probe(self):

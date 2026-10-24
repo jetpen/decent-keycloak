@@ -19,6 +19,44 @@ import static org.mockito.Mockito.when;
 
 final class WalletChallengeAuthenticatorTest {
   @Test
+  void completedCallbackReplayReturnsProtocolDenial() {
+    var context = mock(AuthenticationFlowContext.class);
+    var authSession = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var request = mock(org.keycloak.http.HttpRequest.class);
+    var headers = mock(jakarta.ws.rs.core.HttpHeaders.class);
+    var uriInfo = mock(jakarta.ws.rs.core.UriInfo.class);
+    var event = mock(org.keycloak.events.EventBuilder.class);
+    var protocol = mock(org.keycloak.protocol.LoginProtocol.class);
+    var response = mock(jakarta.ws.rs.core.Response.class);
+    when(context.getAuthenticationSession()).thenReturn(authSession);
+    when(authSession.getClientNote("decent.wallet.callback.completed")).thenReturn("true");
+    when(authSession.getProtocol()).thenReturn("openid-connect");
+    when(context.getRealm()).thenReturn(realm);
+    when(context.getSession()).thenReturn(session);
+    when(context.getHttpRequest()).thenReturn(request);
+    when(context.getUriInfo()).thenReturn(uriInfo);
+    when(context.getEvent()).thenReturn(event);
+    when(request.getHttpHeaders()).thenReturn(headers);
+    when(session.getProvider(org.keycloak.protocol.LoginProtocol.class, "openid-connect"))
+        .thenReturn(protocol);
+    when(protocol.setRealm(realm)).thenReturn(protocol);
+    when(protocol.setHttpHeaders(headers)).thenReturn(protocol);
+    when(protocol.setUriInfo(uriInfo)).thenReturn(protocol);
+    when(protocol.setEventBuilder(event)).thenReturn(protocol);
+    when(protocol.sendError(authSession,
+        org.keycloak.protocol.LoginProtocol.Error.CANCELLED_BY_USER, null)).thenReturn(response);
+
+    new WalletChallengeAuthenticator().authenticate(context);
+
+    verify(event).error(org.keycloak.events.Errors.INVALID_CODE);
+    verify(protocol).sendError(authSession,
+        org.keycloak.protocol.LoginProtocol.Error.CANCELLED_BY_USER, null);
+    verify(context).forceChallenge(response);
+  }
+
+  @Test
   void browserLoginFormHasExplicitSignupChoice() throws Exception {
     try {
       java.nio.file.Path templatePath = java.nio.file.Path.of(
@@ -339,6 +377,9 @@ final class WalletChallengeAuthenticatorTest {
     when(store.getAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
     var authenticator = new WalletChallengeAuthenticator(() -> store);
     var context = mock(AuthenticationFlowContext.class);
+    var execution = mock(org.keycloak.models.AuthenticationExecutionModel.class);
+    when(execution.getId()).thenReturn("wallet-execution");
+    when(context.getExecution()).thenReturn(execution);
     var session = mock(org.keycloak.models.KeycloakSession.class);
     var realm = mock(org.keycloak.models.RealmModel.class);
     var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
@@ -378,6 +419,58 @@ final class WalletChallengeAuthenticatorTest {
   }
 
   @Test
+  void consumedWalletCallbackMarksAuthenticationSessionCompleteForReplayGuard() {
+    String handle = "A".repeat(43);
+    String identityId = "mailto:alice@example.org";
+    var binding = new WalletLoginTransactionStore.Binding("realm-id", "client-id", "root-session-id",
+        "tab-id", "https://site.example/callback", "https://idp.example");
+    var accepted = new WalletLoginTransactionStore.AcceptedTransaction(identityId, "AA", "digest", binding);
+    var store = mock(WalletLoginTransactionStore.class);
+    when(store.getAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
+    when(store.takeAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
+    var authenticator = new WalletChallengeAuthenticator(() -> store);
+    var context = mock(AuthenticationFlowContext.class);
+    var execution = mock(org.keycloak.models.AuthenticationExecutionModel.class);
+    when(execution.getId()).thenReturn("wallet-execution");
+    when(context.getExecution()).thenReturn(execution);
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var root = mock(org.keycloak.sessions.RootAuthenticationSessionModel.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var users = mock(org.keycloak.models.UserProvider.class);
+    var user = mock(org.keycloak.models.UserModel.class);
+    when(context.getAuthenticationSession()).thenReturn(auth);
+    when(context.getRealm()).thenReturn(realm);
+    when(realm.getId()).thenReturn("realm-id");
+    when(context.getSession()).thenReturn(session);
+    when(auth.getClient()).thenReturn(client);
+    when(auth.getParentSession()).thenReturn(root);
+    when(auth.getTabId()).thenReturn("tab-id");
+    when(auth.getRedirectUri()).thenReturn("https://site.example/callback");
+    when(auth.getAuthNote("decent.wallet.handle")).thenReturn(handle);
+    when(auth.getAuthNote("decent.wallet.origin")).thenReturn("https://idp.example");
+    when(client.getId()).thenReturn("client-id");
+    when(root.getId()).thenReturn("root-session-id");
+    when(session.users()).thenReturn(users);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)).thenReturn(java.util.stream.Stream.of(user));
+    when(user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)).thenReturn(identityId);
+    when(user.isEnabled()).thenReturn(true);
+
+    authenticator.action(context);
+
+    verify(store).takeAccepted(handle, binding);
+    verify(auth).setClientNote("decent.wallet.callback.completed", "true");
+    verify(auth).setClientNote("decent.wallet.callback.execution", "wallet-execution");
+    verify(auth).setClientNote("decent.wallet.callback.request",
+        WalletLoginTransportHandler.requestCorrelationId(handle));
+    verify(context).success();
+    verify(context, org.mockito.Mockito.never()).failure(
+        AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+  }
+
+  @Test
   void callbackDoesNotConsumeGateWhenLocalUserMappingIsMissing() {
     String handle = "A".repeat(43);
     String identityId = "mailto:alice@example.org";
@@ -388,6 +481,9 @@ final class WalletChallengeAuthenticatorTest {
     when(store.getAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
     var authenticator = new WalletChallengeAuthenticator(() -> store);
     var context = mock(AuthenticationFlowContext.class);
+    var execution = mock(org.keycloak.models.AuthenticationExecutionModel.class);
+    when(execution.getId()).thenReturn("wallet-execution");
+    when(context.getExecution()).thenReturn(execution);
     var session = mock(org.keycloak.models.KeycloakSession.class);
     var realm = mock(org.keycloak.models.RealmModel.class);
     var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);

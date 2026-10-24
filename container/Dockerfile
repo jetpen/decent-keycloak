@@ -89,7 +89,7 @@ FROM keycloak-with-resolver AS runtime
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
-RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --spi-single-use-object--provider=infinispan
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=infinispan
 
 # The fault injector exists only in this separately built test target.
 FROM runtime AS issue7-user-readback-test-runtime
@@ -104,4 +104,12 @@ COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/k
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
 COPY target/issue6-postconsume-receipt-failure-provider.jar /opt/keycloak/providers/
-RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --spi-single-use-object--provider=issue6-postconsume-receipt-failure
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=issue6-postconsume-receipt-failure
+
+# The sibling callback-gate injector is isolated from both production and receipt-failure targets.
+FROM keycloak-with-resolver AS issue6-callback-gate-test-runtime
+COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
+COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
+COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
+COPY target/issue6-postconsume-callback-gate-failure-provider.jar /opt/keycloak/providers/
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=issue6-postconsume-callback-gate-failure

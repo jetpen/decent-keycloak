@@ -25,22 +25,27 @@ SCRATCH = os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch'))
 RESOLVER_WRAPPER = '/opt/decent-resolver/bin/decent-identity'
 REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID = 'infinispan'
 ISSUE6_POSTCONSUME_TEST_PROVIDER_ID = 'issue6-postconsume-receipt-failure'
+ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID = 'issue6-postconsume-callback-gate-failure'
+ISSUE6_TEST_PROVIDER_IDS = frozenset({ISSUE6_POSTCONSUME_TEST_PROVIDER_ID,
+    ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID})
 EXPIRY_WAIT_MARGIN_SECONDS = 5
 EXPIRY_CONTAINER_LIFETIME_SECONDS = 1200
+IDENTITY_LOOKUP_COOLDOWN_SECONDS = 2
+IDENTITY_LOOKUP_COOLDOWN_MARGIN_SECONDS = 1
 
 
 def parse_keycloak_show_config(output):
-  """Extract only known effective config values, ignoring source annotations."""
+  """Extract only allowlisted Keycloak values, ignoring source annotations."""
   allowed = {'kc.db': 'database_mode_effective', 'kc.cache': 'cache_mode_effective',
       'kc.cache-stack': 'cache_stack_effective',
-      'kc.spi-single-use-object--provider': 'single_use_object_provider_path'}
+      'kc.spi-single-use-object--provider-default': 'single_use_object_provider_configured'}
   values = {}
   duplicates = set()
   for line in output.splitlines() if isinstance(output, str) else ():
     match = re.fullmatch(
-        r'\s*(kc\.(?:db|cache|cache-stack|spi-single-use-object--provider))'
+        r'\s*(kc\.(?:db|cache|cache-stack|spi-single-use-object--provider-default))'
         r'\s*=\s*([A-Za-z0-9_.-]{1,96})'
-        r'(?:\s+\([A-Za-z0-9_.-]{1,96}\))?\s*', line)
+        r'(?:\s+\([A-Za-z0-9_. -]{1,128}\))?\s*', line)
     if match is None:
       continue
     key, value = match.groups()
@@ -52,11 +57,55 @@ def parse_keycloak_show_config(output):
       if key in values and key not in duplicates}
 
 
+def parse_infinispan_runtime_cache_mode(log_text):
+  """Recognize a single applied Keycloak cache configuration with local caches only."""
+  marker = 'Infinispan configuration:'
+  if not isinstance(log_text, str) or log_text.count(marker) != 1:
+    return None
+  config = log_text.split(marker, 1)[1]
+  local = len(re.findall(r'<local-cache\b', config))
+  clustered = sum(len(re.findall(r'<' + tag + r'\b', config))
+      for tag in ('distributed-cache', 'replicated-cache', 'invalidation-cache'))
+  return 'local' if local > 0 and clustered == 0 else None
+
+
+def parse_keycloak_runtime_command(arguments):
+  """Read explicit database/cache/provider flags from a Podman-inspected argv vector."""
+  allowed = {'--db': 'database_mode_configured', '--cache': 'cache_mode_configured',
+      '--spi-single-use-object--provider-default': 'single_use_object_provider_configured'}
+  values = {}
+  duplicates = set()
+  for argument in arguments if isinstance(arguments, list) else ():
+    if not isinstance(argument, str):
+      continue
+    key, separator, value = argument.partition('=')
+    if key not in allowed or not separator or re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', value) is None:
+      continue
+    if key in values:
+      duplicates.add(key)
+    else:
+      values[key] = value
+  return {result_name: values[key] for key, result_name in allowed.items()
+      if key in values and key not in duplicates}
+
+
 def runtime_baseline_is_verified(facts):
   return (facts.get('keycloak_version') == '26.8.0'
-      and facts.get('keycloak_nodes') == 'one'
-      and facts.get('database_mode_effective') == facts.get('database_mode_configured')
-      and facts.get('cache_mode_effective') == facts.get('cache_mode_configured'))
+      and facts.get('keycloak_nodes') == 'one')
+
+
+def wait_for_identity_lookup_cooldown():
+  """Let the two-second shared resolver admission key expire before fresh login."""
+  time.sleep(IDENTITY_LOOKUP_COOLDOWN_SECONDS + IDENTITY_LOOKUP_COOLDOWN_MARGIN_SECONDS)
+
+
+def issue6_test_provider_selection_is_verified(log_text, provider_id, request_id):
+  """Require one provider witness for the exact pending transaction handle."""
+  if provider_id not in ISSUE6_TEST_PROVIDER_IDS or not re.fullmatch(r'[0-9a-f]{32}', request_id):
+    return False
+  marker = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={provider_id} '
+      f'operation=transaction_put_if_absent request={request_id}')
+  return isinstance(log_text, str) and log_text.count(marker) == 1
 
 
 def issue6_postconsume_provider_is_registered(facts):
@@ -67,7 +116,13 @@ def issue6_postconsume_provider_is_registered(facts):
 
 def runtime_qualification_is_verified(facts):
   provider = facts.get('single_use_object_provider_path')
+  configured_database = facts.get('database_mode_configured', 'unavailable')
+  configured_cache = facts.get('cache_mode_configured', 'unavailable')
   return (runtime_baseline_is_verified(facts)
+      and facts.get('database_mode_effective') == 'dev-file'
+      and configured_database in {'unavailable', 'dev-file'}
+      and facts.get('cache_mode_effective') == 'local'
+      and configured_cache in {'unavailable', 'local'}
       and provider == REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID
       and provider in facts.get('single_use_object_provider_ids', []))
 
@@ -76,10 +131,12 @@ def keycloak_runtime_provenance(client, token, keycloak_container_id=None):
   """Capture allowlisted server facts; never infer provider selection from availability."""
   facts = {
       'keycloak_version': 'unavailable', 'keycloak_nodes': 'unknown',
-      'database_mode_configured': 'dev-file', 'database_mode_effective': 'unavailable',
-      'cache_mode_configured': 'local', 'cache_mode_effective': 'unavailable',
+      'database_mode_configured': 'unavailable', 'database_mode_effective': 'unavailable',
+      'cache_mode_configured': 'unavailable', 'cache_mode_effective': 'unavailable', 'cache_mode_effective_evidence': 'unavailable',
       'cache_stack_effective': None,
+      'single_use_object_provider_configured': 'unavailable',
       'single_use_object_provider_path': 'unavailable', 'single_use_object_provider_ids': [],
+      'runtime_command_fields_present': [],
       'keycloak_config_read_status': 'container_id_unverified',
       'keycloak_config_fields_present': [],
       'runtime_qualification_status': 'open_runtime_facts_unavailable',
@@ -104,19 +161,35 @@ def keycloak_runtime_provenance(client, token, keycloak_container_id=None):
     pass
   if isinstance(keycloak_container_id, str) and re.fullmatch(r'[0-9a-f]{64}', keycloak_container_id):
     try:
-      inspected = run(['podman', 'inspect', '--format', '{{.Id}}', keycloak_container_id], timeout=8)
+      inspected = run(['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}',
+          keycloak_container_id], timeout=8)
     except subprocess.TimeoutExpired:
       facts['keycloak_config_read_status'] = 'container_inspect_timeout'
     except OSError:
       facts['keycloak_config_read_status'] = 'container_inspect_error'
     else:
-      if inspected.returncode != 0 or inspected.stdout.strip() != keycloak_container_id:
+      inspected_fields = inspected.stdout.strip().split('|', 1)
+      if (inspected.returncode != 0 or len(inspected_fields) != 2
+          or inspected_fields[0] != keycloak_container_id):
         facts['keycloak_config_read_status'] = 'container_id_unverified'
       else:
         facts['keycloak_nodes'] = 'one'
         try:
+          command_argv = json.loads(inspected_fields[1])
+        except (TypeError, ValueError):
+          command_argv = None
+        command_values = parse_keycloak_runtime_command(command_argv)
+        facts.update(command_values)
+        facts['runtime_command_fields_present'] = sorted(command_values)
+        show_config_args = ['/opt/keycloak/bin/kc.sh', 'show-config']
+        for option, field in (('--db', 'database_mode_configured'),
+            ('--cache', 'cache_mode_configured'),
+            ('--spi-single-use-object--provider-default', 'single_use_object_provider_configured')):
+          if field in command_values:
+            show_config_args.append(f'{option}={command_values[field]}')
+        try:
           shown = run(['podman', 'exec', keycloak_container_id,
-              '/opt/keycloak/bin/kc.sh', 'show-config'], timeout=8)
+              *show_config_args], timeout=8)
         except subprocess.TimeoutExpired:
           facts['keycloak_config_read_status'] = 'show_config_timeout'
         except OSError:
@@ -126,14 +199,43 @@ def keycloak_runtime_provenance(client, token, keycloak_container_id=None):
             facts['keycloak_config_read_status'] = 'show_config_nonzero'
           else:
             parsed = parse_keycloak_show_config(shown.stdout)
-            facts.update(parsed)
+            effective_for_configured = {
+                'database_mode_effective': 'database_mode_configured',
+                'cache_mode_effective': 'cache_mode_configured',
+                'single_use_object_provider_configured': 'single_use_object_provider_configured',
+            }
+            conflicts = {field for field, value in parsed.items()
+                if field in effective_for_configured
+                and facts[effective_for_configured[field]] != 'unavailable'
+                and facts[effective_for_configured[field]] != value}
+            for field, value in parsed.items():
+              facts[field] = 'unavailable' if field in conflicts else value
+              if field == 'cache_mode_effective' and field not in conflicts:
+                facts['cache_mode_effective_evidence'] = 'show_config'
             present = sorted(parsed)
             facts['keycloak_config_fields_present'] = present
             required = {'database_mode_effective', 'cache_mode_effective',
-                'single_use_object_provider_path'}
+                'single_use_object_provider_configured'}
             facts['keycloak_config_read_status'] = (
+                'show_config_conflict' if conflicts else
                 'show_config_fields_complete' if required.issubset(present)
                 else 'show_config_fields_missing')
+        try:
+          logs = run(['podman', 'logs', keycloak_container_id], timeout=8)
+        except (subprocess.TimeoutExpired, OSError):
+          pass
+        else:
+          if logs.returncode == 0:
+            observed_cache_mode = parse_infinispan_runtime_cache_mode(subprocess_output_text(logs))
+            if observed_cache_mode is not None:
+              effective_cache_mode = facts['cache_mode_effective']
+              if effective_cache_mode in {'unavailable', observed_cache_mode}:
+                facts['cache_mode_effective'] = observed_cache_mode
+                facts['cache_mode_effective_evidence'] = 'infinispan_configuration_log'
+              else:
+                facts['cache_mode_effective'] = 'unavailable'
+                facts['cache_mode_effective_evidence'] = 'unavailable'
+                facts['keycloak_config_read_status'] = 'runtime_log_conflict'
   facts['runtime_qualification_status'] = ('runtime_facts_verified'
       if runtime_qualification_is_verified(facts)
       else 'open_runtime_facts_unavailable')
@@ -148,14 +250,14 @@ def configured_transaction_lifetime_seconds():
   return int(match.group(1))
 
 TRANSACTION_LIFESPAN_SECONDS = configured_transaction_lifetime_seconds()
-ACCEPTANCE_PROFILES = {'full', 'expiry', 'issue6-single-node'}
+ACCEPTANCE_PROFILES = {'full', 'expiry', 'issue6-single-node', 'issue6-auth-flow'}
 
 
 def selected_acceptance_profile(environ=None):
   source = os.environ if environ is None else environ
   profile = source.get('WALLET_IT_PROFILE', 'full')
   if profile not in ACCEPTANCE_PROFILES:
-    raise ValueError('WALLET_IT_PROFILE must be full, expiry, or issue6-single-node')
+    raise ValueError('WALLET_IT_PROFILE must be full, expiry, issue6-single-node, or issue6-auth-flow')
   return profile
 
 
@@ -165,7 +267,7 @@ def run_acceptance_profile(profile, expiry_runner, auth_flow_runner, checkpoint=
     raise ValueError('unsupported wallet acceptance profile')
   if profile == 'expiry':
     return {'expiry_case': expiry_runner()}
-  if profile == 'issue6-single-node':
+  if profile in {'issue6-single-node', 'issue6-auth-flow'}:
     result = {
         'profile': profile,
         'broad_matrix_started': False,
@@ -177,6 +279,8 @@ def run_acceptance_profile(profile, expiry_runner, auth_flow_runner, checkpoint=
     }
     if checkpoint is not None:
       checkpoint(result)
+    if profile == 'issue6-auth-flow':
+      return result
     result['expiry_case'] = expiry_runner()
     result['issue6_single_node_case'] = {
         'stage': 'complete', 'auth_flow_complete': True,
@@ -380,7 +484,6 @@ def report_partial_evidence_on_failure(evidence_path, diagnostic_provider=None):
         print('resolver_diagnostic_status=unavailable')
     if evidence_path.exists():
       print('partial_evidence=' + evidence_path.read_text(encoding='utf-8'))
-    print('harness_status=failed; failure_type=' + type(failure).__name__)
     raise
 
 
@@ -502,8 +605,9 @@ def sanitize_live_checkpoint(candidate):
       'runtime_manifest_sha256', 'runtime_lock_sha256', 'image_digest', 'diagnostic_categories',
       'keycloak_version', 'keycloak_nodes', 'database_mode_configured',
       'database_mode_effective', 'cache_mode_configured', 'cache_mode_effective',
-      'cache_stack_effective', 'single_use_object_provider_path',
-      'single_use_object_provider_ids', 'keycloak_config_read_status',
+      'cache_mode_effective_evidence', 'cache_stack_effective', 'single_use_object_provider_configured',
+      'single_use_object_provider_path', 'single_use_object_provider_ids', 'runtime_command_fields_present',
+      'keycloak_config_read_status',
       'keycloak_config_fields_present', 'runtime_qualification_status',
       'profile', 'node_count', 'database', 'cache',
       'single_use_object_provider_evidence', 'credential_file_retained',
@@ -521,6 +625,20 @@ def sanitize_live_checkpoint(candidate):
       'identical_retry_accepted', 'changed_retry_denied', 'alien_status_denied',
       'state_preserved', 'error_returned', 'authorization_code_returned',
       'callback_replay', 'local_mapping_persisted', 'credentialed', 'wrong_origin_denied',
+      'callback_replay_internal_error_page', 'callback_replay_internal_error_reason',
+      'callback_replay_internal_error_hostname_matches',
+      'callback_replay_internal_error_port_matches',
+      'callback_replay_guard_log_read', 'callback_replay_guard_reached',
+      'callback_replay_login_error_log_read',
+      'callback_replay_authenticator_entry_reached',
+      'callback_replay_authenticator_entry_completed',
+      'callback_top_flow_rearm_reached', 'callback_top_flow_rearm_execution_id_present',
+      'callback_replay_state_present', 'callback_replay_redirect_uri_present',
+      'callback_replay_redirect_uri_registered', 'callback_replay_protocol_openid_connect',
+      'callback_replay_guard_marker_count', 'callback_replay_guard_unavailable_marker_count',
+      'callback_replay_guard_other_marker_count',
+      'callback_replay_login_error_count',
+      'callback_replay_login_error_category', 'failure_category',
       'signature_rejected_by_verifier', 'no_acceptance_or_callback',
       'registry_unavailable', 'local_account_mapping_decision_observed',
       'pending_after_negative_http', 'current_registry_proof_http',
@@ -541,7 +659,9 @@ def sanitize_live_checkpoint(candidate):
       'unmapped_account_case', 'disabled_account_case', 'signup_case', 'rotation_case',
       'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case', 'expiry_case',
       'issue6_single_node', 'issue6_postconsume_receipt_failure_case',
-      'issue6_postconsume_receipt_recovery', 'issue6_single_node_case', 'registry_matrix',
+      'issue6_postconsume_receipt_recovery',
+      'issue6_postconsume_callback_gate_failure_case',
+      'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
   }
   signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
@@ -563,6 +683,16 @@ def sanitize_live_checkpoint(candidate):
       'initial_status_accepted', 'callback_state_preserved', 'callback_error_returned',
       'callback_code_returned', 'callback_replay_state_preserved',
       'callback_replay_error_returned', 'callback_replay_code_returned',
+      'callback_replay_denied_safely', 'callback_replay_internal_error_page',
+      'callback_replay_internal_error_hostname_matches',
+      'callback_replay_internal_error_port_matches',
+      'callback_replay_guard_log_read', 'callback_replay_guard_reached',
+      'callback_replay_login_error_log_read',
+      'callback_replay_authenticator_entry_reached',
+      'callback_replay_authenticator_entry_completed',
+      'callback_top_flow_rearm_reached', 'callback_top_flow_rearm_execution_id_present',
+      'callback_replay_state_present', 'callback_replay_redirect_uri_present',
+      'callback_replay_redirect_uri_registered', 'callback_replay_protocol_openid_connect',
       'status_after_callback_safe',
       'wrong_origin_denied', 'signature_rejected_by_verifier', 'no_acceptance_or_callback',
       'registry_unavailable', 'local_account_mapping_decision_observed',
@@ -574,6 +704,7 @@ def sanitize_live_checkpoint(candidate):
       'proof_location_present', 'proof_redirect_followed', 'status_body_empty',
       'status_location_present', 'status_redirect_followed', 'callback_exposed',
       'oidc_code_exposed', 'fault_signal_correlated', 'delegate_commit_then_throw',
+      'test_provider_selected',
       'retry_redirect_followed', 'callback_replay_denied',
   }
   http_fields = {
@@ -587,7 +718,9 @@ def sanitize_live_checkpoint(candidate):
       'extra_header_http', 'wrong_origin_http', 'redirect_http',
       'challenge_post', 'get_http', 'post_http', 'four_malformed_proofs_http',
       'status_http', 'login_page_http', 'challenge_get_http',
-      'fresh_login_http', 'fresh_challenge_http', 'initial_status_http',
+      'fresh_login_http', 'fresh_challenge_http', 'fresh_proof_http', 'fresh_retry_http',
+      'fresh_changed_retry_http', 'fresh_status_http', 'fresh_challenge_http',
+      'initial_status_http',
       'identical_retry_http', 'changed_retry_http', 'callback_http',
       'callback_replay_http', 'status_after_callback_http', 'proof_http',
       'retry_http', 'challenge_http',
@@ -609,12 +742,26 @@ def sanitize_live_checkpoint(candidate):
           'provider_denied_unclassified', 'registry_unavailable', 'provider_registry_inconsistent',
           'account_mapping_unavailable', 'provider_unavailable'},
       'runtime_qualification_status': {'runtime_facts_verified', 'open_runtime_facts_unavailable'},
+      'callback_replay_internal_error_reason': {
+          'callback_url_unavailable', 'callback_origin_invalid', 'redirect_scheme_mismatch',
+          'redirect_origin_mismatch',
+          'redirect_path_untrusted', 'authorization_code_present', 'error_parameter_invalid',
+          'same_origin_error_without_code', 'loopback_keycloak_error_without_code',
+          'url_parse_error'},
+      'callback_replay_login_error_category': {
+          'none', 'unavailable', 'multiple', 'other', 'invalid_code', 'expired_code',
+          'already_logged_in', 'cookie_not_found', 'invalid_request', 'invalid_redirect_uri',
+          'access_denied', 'user_not_found'},
+      'failure_category': {'runtime_error', 'timeout', 'value_error', 'other'},
       'single_use_object_provider_path': {'infinispan', 'jpa', 'remote', 'unavailable',
-          'issue6-postconsume-receipt-failure'},
+          'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure'},
+      'selected_provider_path': {'issue6-postconsume-receipt-failure',
+          'issue6-postconsume-callback-gate-failure'},
       'keycloak_config_read_status': {
           'container_id_unverified', 'container_inspect_timeout', 'container_inspect_error',
           'show_config_timeout', 'show_config_error', 'show_config_nonzero',
-          'show_config_fields_complete', 'show_config_fields_missing'},
+          'show_config_fields_complete', 'show_config_fields_missing', 'show_config_conflict',
+          'runtime_log_conflict'},
       'failure_gate': {'proof_post', 'proof_status', 'identical_retry', 'changed_retry',
           'callback', 'callback_replay', 'status_after_callback', 'pkce'},
   }
@@ -650,6 +797,8 @@ def sanitize_live_checkpoint(candidate):
       return isinstance(value, str) and value == pinned_keycloak_version()
     if field == 'keycloak_nodes':
       return value in {'one', 'unknown'}
+    if field == 'cache_mode_effective_evidence':
+      return value in {'show_config', 'infinispan_configuration_log', 'unavailable'}
     if field in {'database_mode_configured', 'database_mode_effective',
         'cache_mode_configured', 'cache_mode_effective', 'cache_stack_effective'}:
       return value is None or (isinstance(value, str)
@@ -658,9 +807,20 @@ def sanitize_live_checkpoint(candidate):
       return isinstance(value, list) and len(value) <= 32 and all(
           isinstance(item, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', item) is not None
           for item in value) and value == sorted(set(value))
+    if field == 'runtime_command_fields_present':
+      allowed_command_fields = {'database_mode_configured', 'cache_mode_configured',
+          'single_use_object_provider_configured'}
+      return (isinstance(value, list) and len(value) <= 3
+          and all(item in allowed_command_fields for item in value)
+          and value == sorted(set(value)))
+    if field == 'single_use_object_provider_configured':
+      return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', value) is not None
+    if field == 'single_use_object_provider_path':
+      return value in {'infinispan', 'jpa', 'remote', 'unavailable',
+          'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure'}
     if field == 'keycloak_config_fields_present':
       allowed_config_fields = {'database_mode_effective', 'cache_mode_effective',
-          'cache_stack_effective', 'single_use_object_provider_path'}
+          'cache_stack_effective', 'single_use_object_provider_configured'}
       return (isinstance(value, list) and len(value) <= 4
           and all(item in allowed_config_fields for item in value)
           and value == sorted(set(value)))
@@ -702,6 +862,19 @@ def sanitize_live_checkpoint(candidate):
       return isinstance(value, str) and value in enums[field]
     if field == 'exact_mapped_users':
       return type(value) is int and 0 <= value <= 2
+    if field in {'callback_replay_guard_marker_count',
+        'callback_replay_guard_unavailable_marker_count',
+        'callback_replay_guard_other_marker_count',
+        'callback_replay_login_error_count',
+        'callback_replay_authenticator_entry_marker_count',
+        'callback_replay_authenticator_entry_unavailable_marker_count',
+        'callback_replay_authenticator_entry_other_marker_count',
+        'callback_replay_authenticator_entry_completed_true_marker_count',
+        'callback_replay_authenticator_entry_completed_false_marker_count',
+        'callback_top_flow_rearm_marker_count',
+        'callback_top_flow_rearm_unavailable_marker_count',
+        'callback_top_flow_rearm_other_marker_count'}:
+      return type(value) is int and 0 <= value <= 10
     if field == 'wallet_locator':
       return value is True
     return False
@@ -801,12 +974,35 @@ def sanitize_live_checkpoint(candidate):
           'node_count', 'keycloak_version', 'keycloak_nodes',
           'database_mode_configured', 'database_mode_effective',
           'cache_mode_configured', 'cache_mode_effective',
-          'single_use_object_provider_path', 'proof_post_http', 'initial_status_http',
+          'single_use_object_provider_configured', 'single_use_object_provider_path',
+          'proof_post_http', 'initial_status_http',
           'initial_status_accepted', 'identical_retry_http', 'changed_retry_http',
           'callback_http', 'callback_redirect_uri_matches', 'callback_state_preserved',
           'callback_code_returned', 'callback_error_returned', 'callback_replay_http',
           'callback_replay_redirect_uri_matches', 'callback_replay_state_preserved',
           'callback_replay_error_returned', 'callback_replay_code_returned',
+          'callback_replay_denied_safely', 'callback_replay_internal_error_page',
+          'callback_replay_internal_error_reason',
+          'callback_replay_internal_error_hostname_matches',
+          'callback_replay_internal_error_port_matches',
+          'callback_replay_guard_log_read', 'callback_replay_guard_reached',
+          'callback_replay_state_present', 'callback_replay_redirect_uri_present',
+          'callback_replay_redirect_uri_registered', 'callback_replay_protocol_openid_connect',
+          'callback_replay_guard_marker_count', 'callback_replay_guard_unavailable_marker_count',
+          'callback_replay_guard_other_marker_count',
+          'callback_replay_login_error_log_read', 'callback_replay_login_error_count',
+          'callback_replay_login_error_category',
+          'callback_replay_authenticator_entry_reached',
+          'callback_replay_authenticator_entry_completed',
+          'callback_replay_authenticator_entry_marker_count',
+          'callback_replay_authenticator_entry_unavailable_marker_count',
+          'callback_replay_authenticator_entry_other_marker_count',
+        'callback_replay_authenticator_entry_completed_true_marker_count',
+        'callback_replay_authenticator_entry_completed_false_marker_count',
+          'callback_top_flow_rearm_reached', 'callback_top_flow_rearm_execution_id_present',
+          'callback_top_flow_rearm_marker_count',
+          'callback_top_flow_rearm_unavailable_marker_count',
+          'callback_top_flow_rearm_other_marker_count',
           'status_after_callback_http', 'status_after_callback_safe', 'pkce_token_http',
           'failure_gate'}
       safe = {'stage': stage}
@@ -816,20 +1012,58 @@ def sanitize_live_checkpoint(candidate):
         projected[key] = safe
       continue
     if key in {'issue6_postconsume_receipt_failure_case',
-        'issue6_postconsume_receipt_recovery'} and isinstance(value, dict):
-      if key == 'issue6_postconsume_receipt_failure_case':
-        safe_fields = {'stage', 'proof_http', 'retry_http', 'status_http',
-            'proof_body_empty', 'proof_location_present', 'proof_redirect_followed',
-            'status_body_empty', 'status_location_present', 'status_redirect_followed',
-            'callback_exposed', 'oidc_code_exposed', 'fault_signal_correlated',
-            'delegate_commit_then_throw', 'retry_redirect_followed', 'fault_signal_count'}
-      else:
-        safe_fields = {'fresh_login_http', 'fresh_login_transaction_available',
-            'callback_http', 'callback_code', 'callback_replay_denied', 'pkce_token_http'}
+        'issue6_postconsume_receipt_recovery',
+        'issue6_postconsume_callback_gate_failure_case',
+        'issue6_postconsume_callback_gate_recovery'} and isinstance(value, dict):
+      failure_case = key.endswith('_failure_case')
+      failure_fields = {'stage', 'proof_http', 'retry_http', 'status_http',
+          'proof_body_empty', 'proof_location_present', 'proof_redirect_followed',
+          'status_body_empty', 'status_location_present', 'status_redirect_followed',
+          'callback_exposed', 'oidc_code_exposed', 'fault_signal_correlated',
+          'delegate_commit_then_throw', 'retry_redirect_followed', 'fault_signal_count',
+          'failure_category'}
+      recovery_fields = {'stage', 'fresh_login_http', 'fresh_challenge_http',
+          'fresh_proof_http', 'fresh_retry_http', 'fresh_changed_retry_http',
+          'fresh_status_http', 'fresh_login_transaction_available',
+          'callback_http', 'callback_state_preserved', 'callback_code_returned',
+          'callback_error_returned', 'callback_code', 'callback_replay_http',
+          'callback_replay_state_preserved', 'callback_replay_error_returned',
+          'callback_replay_code_returned', 'callback_replay_denied', 'pkce_token_http'}
+      recovery_fields.update({
+          'callback_replay_guard_log_read', 'callback_replay_guard_reached',
+          'callback_replay_guard_marker_count',
+          'callback_replay_guard_unavailable_marker_count',
+          'callback_replay_guard_other_marker_count',
+          'callback_replay_login_error_log_read', 'callback_replay_login_error_count',
+          'callback_replay_login_error_category',
+          'callback_replay_authenticator_entry_reached',
+          'callback_replay_authenticator_entry_completed',
+          'callback_replay_authenticator_entry_marker_count',
+          'callback_replay_authenticator_entry_unavailable_marker_count',
+          'callback_replay_authenticator_entry_other_marker_count',
+        'callback_replay_authenticator_entry_completed_true_marker_count',
+        'callback_replay_authenticator_entry_completed_false_marker_count',
+          'callback_top_flow_rearm_reached', 'callback_top_flow_rearm_execution_id_present',
+          'callback_top_flow_rearm_marker_count',
+          'callback_top_flow_rearm_unavailable_marker_count',
+          'callback_top_flow_rearm_other_marker_count',
+          'callback_replay_state_present', 'callback_replay_redirect_uri_present',
+          'callback_replay_redirect_uri_registered', 'callback_replay_protocol_openid_connect',
+          'failure_category'})
+      safe_fields = failure_fields if failure_case else recovery_fields
       safe = {}
       stage = value.get('stage')
-      if key == 'issue6_postconsume_receipt_failure_case' and stage in {
-          'preflight', 'runtime_setup', 'failed_then_denied', 'complete'}:
+      if failure_case and stage in {'preflight', 'resolver_setup', 'registry_setup',
+          'identity_setup', 'keycloak_setup', 'runtime_provenance_read',
+          'runtime_baseline_verified', 'provider_registration_verified',
+          'provider_config_verified', 'configure_realm', 'realm_configured',
+          'enable_login_events', 'login_events_enabled', 'provision_identity',
+          'realm_setup', 'failed_then_denied', 'complete'}:
+        safe['stage'] = stage
+      recovery_stages = {'recovery_started', 'fresh_login_page', 'fresh_challenge', 'fresh_proof',
+          'fresh_identical_retry', 'fresh_changed_retry', 'fresh_status',
+          'fresh_callback', 'fresh_replay', 'fresh_pkce', 'complete'}
+      if not failure_case and stage in recovery_stages:
         safe['stage'] = stage
       for field in safe_fields - {'stage'}:
         item = value.get(field)
@@ -837,7 +1071,24 @@ def sanitize_live_checkpoint(candidate):
           safe[field] = item
         elif field in http_fields and type(item) is int and 100 <= item <= 599:
           safe[field] = item
+        elif field == 'failure_category' and item in enums['failure_category']:
+          safe[field] = item
+        elif field in enums and isinstance(item, str) and item in enums[field]:
+          safe[field] = item
         elif field == 'fault_signal_count' and type(item) is int and 0 <= item <= 10:
+          safe[field] = item
+        elif field in {'callback_replay_guard_marker_count',
+            'callback_replay_guard_unavailable_marker_count',
+            'callback_replay_guard_other_marker_count',
+            'callback_replay_login_error_count',
+            'callback_replay_authenticator_entry_marker_count',
+            'callback_replay_authenticator_entry_unavailable_marker_count',
+            'callback_replay_authenticator_entry_other_marker_count',
+        'callback_replay_authenticator_entry_completed_true_marker_count',
+        'callback_replay_authenticator_entry_completed_false_marker_count',
+            'callback_top_flow_rearm_marker_count',
+            'callback_top_flow_rearm_unavailable_marker_count',
+            'callback_top_flow_rearm_other_marker_count'} and type(item) is int and 0 <= item <= 10:
           safe[field] = item
       if safe:
         projected[key] = safe
@@ -1025,6 +1276,12 @@ def run(args, timeout=60, env=None):
                         stderr=subprocess.STDOUT, timeout=timeout, env=env, check=False)
 
 
+def subprocess_output_text(result):
+  """Combine captured text streams while tolerating merged or omitted stderr."""
+  return ''.join(value for value in (getattr(result, 'stdout', None),
+      getattr(result, 'stderr', None)) if isinstance(value, str))
+
+
 RUN_CID_DIR = None
 
 
@@ -1070,8 +1327,10 @@ def remove_owned_container(cid_file):
   except (OSError, RuntimeError, subprocess.TimeoutExpired):
     return {'removed': False, 'retained_cid': True}
   try:
-    path.unlink()
+    path.unlink(missing_ok=True)
   except OSError:
+    return {'removed': True, 'retained_cid': True}
+  if path.exists():
     return {'removed': True, 'retained_cid': True}
   return {'removed': True, 'retained_cid': False}
 
@@ -1301,8 +1560,8 @@ def expiry_profile_coordinator(client, key, identifier, container, image, checkp
       'runtime_qualification_status': runtime_facts.get(
           'runtime_qualification_status', 'open_runtime_facts_unavailable')}
   checkpoint(evidence)
-  require(runtime_qualification_is_verified(runtime_facts),
-      'expiry runtime baseline and selected provider provenance are verified')
+  require(runtime_baseline_is_verified(runtime_facts),
+      'expiry Keycloak version and single-node baseline are verified')
   verifier = b64url(secrets.token_bytes(32))
   query = urllib.parse.urlencode({
       'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
@@ -1415,6 +1674,7 @@ def expiry_profile_coordinator(client, key, identifier, container, image, checkp
       'response_body_safe': response_body_safe, 'location_safe': location_safe,
       'redirects_safe': redirects_safe,
   })
+  checkpoint(evidence)
   require(evidence['proof_denied'], 'expired valid proof is denied', proof_http)
   require(evidence['status_denied'], 'expired transaction status is denied', status_http)
   require(evidence['no_accepted_receipt'], 'expired proof created no accepted receipt')
@@ -1523,6 +1783,11 @@ class LoginPageParser(html.parser.HTMLParser):
 REDIRECT_DIAGNOSTICS = []
 
 
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    return None
+
+
 class LocalKeycloakRedirects(urllib.request.HTTPRedirectHandler):
   def redirect_request(self, req, fp, code, msg, headers, newurl):
     parsed = urllib.parse.urlsplit(newurl)
@@ -1541,7 +1806,7 @@ class LocalKeycloakRedirects(urllib.request.HTTPRedirectHandler):
         local += '?' + parsed.query
       forwarded = dict(req.header_items())
       forwarded.update({'Host': 'idp.example', 'X-Forwarded-Host': 'idp.example',
-                        'X-Forwarded-Proto': 'https', 'X-Forwarded-Port': '443'})
+                        'X-Forwarded-Proto': 'https', 'X-Forwarded-Port': str(KC_PORT)})
       return urllib.request.Request(local, headers=forwarded, method='GET')
     return None
 
@@ -1551,8 +1816,12 @@ class Client:
     self.redirects = []
     self.privateClientAdminCredential: str | None = None
     self.wallet_container_id: str | None = None
+    cookie_processor = urllib.request.HTTPCookieProcessor()
+    self.cookie_jar = cookie_processor.cookiejar
     self.opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(), LocalKeycloakRedirects())
+        cookie_processor, LocalKeycloakRedirects())
+    self.no_redirect_opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(self.cookie_jar), NoRedirects())
     redirect_handler = next(handler for handler in self.opener.handlers
         if isinstance(handler, LocalKeycloakRedirects))
     original_redirect = redirect_handler.redirect_request
@@ -1566,7 +1835,7 @@ class Client:
     redirect_handler.redirect_request = capture_redirect
     self.forward_headers = {
         'Host': 'idp.example', 'X-Forwarded-Host': 'idp.example',
-        'X-Forwarded-Proto': 'https', 'X-Forwarded-Port': '443',
+        'X-Forwarded-Proto': 'https', 'X-Forwarded-Port': str(KC_PORT),
     }
 
   def url(self, path_or_url):
@@ -1578,7 +1847,7 @@ class Client:
     result = f'http://127.0.0.1:{KC_PORT}{path}'
     return result + ('?' + query if query else '')
 
-  def request(self, method, path, data=None, headers=None, timeout=10):
+  def request(self, method, path, data=None, headers=None, timeout=10, *, follow_redirects=True):
     merged = dict(self.forward_headers)
     if headers:
       merged.update(headers)
@@ -1590,8 +1859,9 @@ class Client:
     if cookies:
       merged['Cookie'] = '; '.join(c.name + '=' + str(c.value or '') for c in cookies)
     req = urllib.request.Request(self.url(path), data=data, headers=merged, method=method)
+    opener = self.opener if follow_redirects else self.no_redirect_opener
     try:
-      with self.opener.open(req, timeout=timeout) as response:
+      with opener.open(req, timeout=timeout) as response:
         return response.status, response.headers, response.read()
     except urllib.error.HTTPError as error:
       return error.code, error.headers, error.read()
@@ -1602,10 +1872,11 @@ class BareLocalClient(Client):
     super().__init__()
     self.opener = urllib.request.build_opener(LocalKeycloakRedirects())
 
-  def request(self, method, path, data=None, headers=None, timeout=10):
+  def request(self, method, path, data=None, headers=None, timeout=10, *, follow_redirects=True):
     req = urllib.request.Request(self.url(path), data=data, headers=headers or {}, method=method)
+    opener = self.opener if follow_redirects else self.no_redirect_opener
     try:
-      with self.opener.open(req, timeout=timeout) as response:
+      with opener.open(req, timeout=timeout) as response:
         return response.status, response.headers, response.read()
     except urllib.error.HTTPError as error:
       return error.code, error.headers, error.read()
@@ -2109,7 +2380,7 @@ def recover_keycloak_ownership(cidfile, returned_id, ownership_callback):
 
 
 def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, image,
-    ownership_callback=None, credential_status=None):
+    ownership_callback=None, credential_status=None, single_use_object_provider=None):
   check = run(['ss', '-ltn', f'( sport = :{KC_PORT} )'], timeout=5)
   require('LISTEN' not in check.stdout, 'disposable Keycloak port available')
   env_fd, env_path = tempfile.mkstemp(prefix='wallet-login-admin-', suffix='.env', dir=SCRATCH)
@@ -2127,8 +2398,12 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, 
         image, 'start-dev', '--http-enabled=true', f'--http-port={KC_PORT}',
         '--http-relative-path=/auth', f'--hostname=https://idp.example:{KC_PORT}/auth',
         '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1', '--db=dev-file', '--cache=local',
-        '--log-level=org.decentwallet.keycloak.wallet:DEBUG'
+        '--log-level=info,org.decentwallet.keycloak.wallet:DEBUG,org.keycloak.connections.infinispan.DefaultInfinispanConnectionProviderFactory:debug'
     ]
+    if single_use_object_provider is not None:
+      require(single_use_object_provider in ISSUE6_TEST_PROVIDER_IDS,
+          'explicit test provider ID is allowlisted')
+      cmd.append(f'--spi-single-use-object--provider-default={single_use_object_provider}')
     started, container_id = start_owned_container(
         cmd, cid_file, timeout=40, stage='start disposable Keycloak',
         ownership_callback=ownership_callback)
@@ -2270,6 +2545,39 @@ def enable_keycloak_login_events(client, token):
       'sanitized disposable Keycloak login-error events enabled')
 
 
+def login_error_event_delta(previous, current):
+  if not isinstance(previous, list) or not isinstance(current, list):
+    return {'read': False, 'count': 0, 'category': 'unavailable'}
+  remaining = list(previous[:20])
+  new_errors = []
+  for event in current[:20]:
+    if not isinstance(event, dict):
+      continue
+    signature = (event.get('type'), event.get('error'),
+        tuple(event.get('detail_names', [])) if isinstance(event.get('detail_names'), list) else ())
+    for index, old_event in enumerate(remaining):
+      if not isinstance(old_event, dict):
+        continue
+      old_signature = (old_event.get('type'), old_event.get('error'),
+          tuple(old_event.get('detail_names', []))
+              if isinstance(old_event.get('detail_names'), list) else ())
+      if signature == old_signature:
+        del remaining[index]
+        break
+    else:
+      if event.get('type') == 'LOGIN_ERROR':
+        raw_error = event.get('error')
+        safe_error = raw_error if isinstance(raw_error, str) and raw_error in {
+            'invalid_code', 'expired_code', 'already_logged_in', 'cookie_not_found',
+            'invalid_request', 'invalid_redirect_uri', 'access_denied', 'user_not_found'} \
+            else 'other'
+        new_errors.append(safe_error)
+  category_set = set(new_errors)
+  category = 'none' if not new_errors else (
+      next(iter(category_set)) if len(category_set) == 1 else 'multiple')
+  return {'read': True, 'count': min(len(new_errors), 20), 'category': category}
+
+
 def recent_login_error_categories(client, token):
   _, _, body = admin_call(client, token, 'GET',
       f'/auth/admin/realms/{REALM}/events?type=LOGIN_ERROR&max=20')
@@ -2312,7 +2620,10 @@ def configure_realm(client, token, identifier, resolver_port, wrapper_path, boot
       }],
       'users': [{
           'username': 'wallet-owner', 'enabled': True,
-          'email': identifier, 'emailVerified': True, 'firstName': 'Synthetic', 'lastName': 'Wallet',
+          # The decentralized Identity ID intentionally remains under .invalid;
+          # Keycloak requires its separate email field to be syntactically valid.
+          'email': 'wallet-owner@example.com', 'emailVerified': True,
+          'firstName': 'Synthetic', 'lastName': 'Wallet',
           'attributes': {'decent_identity_id': [identifier]},
       }],
   }
@@ -2420,17 +2731,135 @@ def verify_id_token(client, token, temp):
   return json.loads(decode(payload_segment))
 
 
-def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
+def wallet_transport_log_categories(container_id):
+  """Project bounded Keycloak logs to allowlisted failure counters."""
+  try:
+    result = run(['podman', 'logs', '--tail', '120', container_id], timeout=15)
+  except (OSError, subprocess.TimeoutExpired):
+    return {'log_read_status': 'error'}
+  text = subprocess_output_text(result)
+  categories = {
+      'identity_resolver_unavailable': 'Wallet Identity resolver unavailable',
+      'account_mapping_unavailable': 'Wallet account mapping lookup unavailable',
+      'proof_acceptance_unavailable': 'Wallet proof acceptance unavailable',
+      'pending_transaction_unavailable': 'Wallet pending transaction unavailable',
+      'transaction_proof_rejected': 'Wallet transaction proof rejected',
+      'receipt_fault': 'ISSUE6_TEST_FAULT: accepted receipt delegate write committed',
+      'callback_gate_fault': 'ISSUE6_TEST_FAULT: callback gate delegate putIfAbsent committed',
+  }
+  return {'log_read_status': 'ok' if result.returncode == 0 else 'error',
+      **{key: text.count(marker) for key, marker in categories.items()}}
+
+
+def callback_replay_guard_log_outcome(log_text, request_id):
+  """Reduce replay-guard log lines to request-correlation facts only."""
+  if not isinstance(log_text, str) or not isinstance(request_id, str) \
+      or re.fullmatch(r'[0-9a-f]{32}', request_id) is None:
+    return {'marker_count': 0, 'unavailable_marker_count': 0,
+        'other_marker_count': 0, 'reached': False}
+  prefix = 'Wallet callback replay guard entered (request='
+  total = min(log_text.count(prefix), 10)
+  pattern = re.compile(re.escape(prefix)
+      + r'([0-9a-f]{32}|unavailable), state_present=(true|false), '
+        r'redirect_uri_present=(true|false), redirect_uri_registered=(true|false), '
+        r'protocol_openid_connect=(true|false)\)')
+  markers = pattern.findall(log_text)
+  expected = [marker for marker in markers if marker[0] == request_id]
+  unavailable = sum(marker[0] == 'unavailable' for marker in markers)
+  other = sum(marker[0] not in {request_id, 'unavailable'} for marker in markers)
+  reached = total == 1 and len(markers) == 1 and len(expected) == 1
+  result = {'marker_count': total,
+      'unavailable_marker_count': min(unavailable, 10),
+      'other_marker_count': min(other, 10), 'reached': reached}
+  if reached:
+    result.update({
+        'state_present': expected[0][1] == 'true',
+        'redirect_uri_present': expected[0][2] == 'true',
+        'redirect_uri_registered': expected[0][3] == 'true',
+        'protocol_openid_connect': expected[0][4] == 'true',
+    })
+  return result
+
+
+def callback_authenticator_lifecycle_log_outcome(log_text, request_id):
+  """Reduce authenticator-entry and top-flow-rearm logs to bounded request facts."""
+  result = {
+      'authenticator_entry_marker_count': 0,
+      'authenticator_entry_unavailable_marker_count': 0,
+      'authenticator_entry_other_marker_count': 0,
+      'authenticator_entry_callback_completed_true_marker_count': 0,
+      'authenticator_entry_callback_completed_false_marker_count': 0,
+      'authenticator_entry_reached': False,
+      'authenticator_entry_completed_marker_present': False,
+      'callback_flow_rearm_marker_count': 0,
+      'callback_flow_rearm_unavailable_marker_count': 0,
+      'callback_flow_rearm_other_marker_count': 0,
+      'callback_flow_rearmed': False,
+      'callback_flow_rearm_execution_id_present': False,
+  }
+  if not isinstance(log_text, str) or not isinstance(request_id, str) \
+      or re.fullmatch(r'[0-9a-f]{32}', request_id) is None:
+    return result
+
+  entry_prefix = 'Wallet challenge authenticator entered (request='
+  entry_total = min(log_text.count(entry_prefix), 10)
+  entry_pattern = re.compile(re.escape(entry_prefix)
+      + r'([0-9a-f]{32}|unavailable), callback_completed=(true|false)\)')
+  entries = entry_pattern.findall(log_text)
+  matching_entries = [entry for entry in entries if entry[0] == request_id]
+  result.update({
+      'authenticator_entry_marker_count': entry_total,
+      'authenticator_entry_unavailable_marker_count': min(
+          sum(entry[0] == 'unavailable' for entry in entries), 10),
+      'authenticator_entry_other_marker_count': min(
+          sum(entry[0] not in {request_id, 'unavailable'} for entry in entries), 10),
+      'authenticator_entry_callback_completed_true_marker_count': min(
+          sum(entry[1] == 'true' for entry in entries), 10),
+      'authenticator_entry_callback_completed_false_marker_count': min(
+          sum(entry[1] == 'false' for entry in entries), 10),
+      'authenticator_entry_reached': bool(matching_entries),
+      'authenticator_entry_completed_marker_present': any(
+          entry[1] == 'true' for entry in matching_entries),
+  })
+
+  rearm_prefix = 'Wallet callback execution rearmed (request='
+  rearm_total = min(log_text.count(rearm_prefix), 10)
+  rearm_pattern = re.compile(re.escape(rearm_prefix)
+      + r'([0-9a-f]{32}|unavailable), execution_id_present=(true|false)\)')
+  rearms = rearm_pattern.findall(log_text)
+  matching_rearms = [event for event in rearms if event[0] == request_id]
+  result.update({
+      'callback_flow_rearm_marker_count': rearm_total,
+      'callback_flow_rearm_unavailable_marker_count': min(
+          sum(event[0] == 'unavailable' for event in rearms), 10),
+      'callback_flow_rearm_other_marker_count': min(
+          sum(event[0] not in {request_id, 'unavailable'} for event in rearms), 10),
+      'callback_flow_rearmed': any(event[1] == 'true' for event in matching_rearms),
+      'callback_flow_rearm_execution_id_present': any(
+          event[1] == 'true' for event in matching_rearms),
+  })
+  return result
+
+
+def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
+    progress_callback=None, admin_access_token=None):
+  def report_progress(stage, **facts):
+    if progress_callback is not None:
+      progress_callback(stage, facts)
+
   verifier = b64url(secrets.token_bytes(32))
   challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
   nonce = b64url(secrets.token_bytes(24))
+  from datetime import datetime, timezone
+  callback_flow_log_cursor = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
   query = urllib.parse.urlencode({
       'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
       'scope': 'openid', 'state': state, 'nonce': nonce,
       'code_challenge': challenge, 'code_challenge_method': 'S256',
   })
   status, _, page = client.request('GET', f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
+  report_progress('fresh_login_page', fresh_login_http=status)
   require(status == 200, 'wallet authenticator challenge page', status)
   text = page.decode('utf-8', errors='strict')
   parser = LoginPageParser()
@@ -2480,6 +2909,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
       'provider login page displays configured site label')
   wallet = Client()
   wallet_status, wallet_headers, envelope_raw = wallet.request('GET', locator)
+  report_progress('fresh_challenge', fresh_challenge_http=wallet_status)
   require(wallet_status == 200, 'native challenge GET', wallet_status)
   envelope = json.loads(envelope_raw)
   require(set(envelope) == {'profile', 'challenge', 'csrf_token'}, 'challenge response exact contract fields')
@@ -2504,8 +2934,12 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
       'identity_id': identifier, 'signature': b64url(sig.stdout)}
   proof = json.dumps(proof_fields, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
   submitted, proof_headers, accepted = wallet.request('POST', locator, proof, {'Content-Type': 'application/json'})
+  report_progress('fresh_proof', fresh_proof_http=submitted)
   require_transport_security_headers(proof_headers, 'native proof security headers')
   record_auth_flow_outcome('proof_post_http', submitted)
+  if submitted != 202:
+    print('wallet_proof_failure_categories=' + json.dumps(
+        wallet_transport_log_categories(container), sort_keys=True))
   require(submitted == 202 and json.loads(accepted).get('status') == 'pending',
       'valid wallet proof POST', submitted, failure_gate='proof_post')
   diagnostic = run(['podman', 'logs', '--tail', '80', container], timeout=15)
@@ -2514,6 +2948,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
     if '[WALLET-RESOLVER-DIAG]' in line:
       print('resolver-diagnostic:', 'Identity resolver failure')
   retried, _, retry_raw = wallet.request('POST', locator, proof, {'Content-Type': 'application/json'})
+  report_progress('fresh_identical_retry', fresh_retry_http=retried)
   record_auth_flow_outcome('identical_retry_http', retried)
   require(retried == 202 and json.loads(retry_raw).get('status') == 'accepted',
       'identical native proof retry', retried, failure_gate='identical_retry')
@@ -2550,6 +2985,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
   finally:
     changed_key.unlink(missing_ok=True)
   record_auth_flow_outcome('changed_retry_http', changed)
+  report_progress('fresh_changed_retry', fresh_changed_retry_http=changed)
   require(changed == 409, 'changed-signature proof replay denied', changed,
       failure_gate='changed_retry')
   oversized_status, oversized_headers, _ = wallet.request('POST', locator,
@@ -2564,6 +3000,9 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
   require_transport_security_headers(status_headers_out, 'valid accepted status security headers')
   record_auth_flow_outcome('initial_status_http', polled)
   initial_status_accepted = accepted_status_payload(polled, status_raw)
+  report_progress('fresh_status', fresh_status_http=polled,
+      fresh_login_transaction_available=(prior_locator is None or locator != prior_locator)
+          and initial_status_accepted)
   record_auth_flow_outcome('initial_status_accepted', initial_status_accepted)
   require(initial_status_accepted, 'initiating browser observes accepted receipt and callback',
       polled, failure_gate='proof_status')
@@ -2582,6 +3021,10 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
   callback_query = urllib.parse.parse_qs(callback_parts.query, keep_blank_values=True)
   code_values = callback_query.get('code', [])
   code = code_values[0] if callback_code_returned else None
+  report_progress('fresh_callback', callback_http=callback_status,
+      callback_state_preserved=callback_state_matches,
+      callback_code_returned=callback_code_returned,
+      callback_error_returned=callback_error_returned)
   record_auth_flow_outcome('callback_http', callback_status)
   record_auth_flow_outcome('callback_redirect_uri_matches', callback_target_matches)
   record_auth_flow_outcome('callback_state_preserved', callback_state_matches)
@@ -2593,18 +3036,155 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
       failure_gate='callback')
   require(code is not None, 'Keycloak callback returns exactly one authorization code', callback_status,
       failure_gate='callback')
-  repeated_status, repeated_headers, _ = client.request('GET', callback)
+  replay_login_errors_before = None
+  if admin_access_token is not None:
+    try:
+      replay_login_errors_before = recent_login_error_categories(Client(), admin_access_token)
+    except Exception:
+      replay_login_errors_before = None
+  callback_replay_log_cursor = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+  repeated_status, repeated_headers, _ = client.request('GET', callback, follow_redirects=False)
+  report_progress('fresh_replay', callback_replay_http=repeated_status)
+  replay_login_errors_after = None
+  if admin_access_token is not None:
+    try:
+      replay_login_errors_after = recent_login_error_categories(Client(), admin_access_token)
+    except Exception:
+      replay_login_errors_after = None
+  replay_login_error_delta = login_error_event_delta(
+      replay_login_errors_before, replay_login_errors_after)
+  replay_logs = run(['podman', 'logs', '--since', callback_replay_log_cursor,
+      '--timestamps', container], timeout=15)
+  flow_logs = run(['podman', 'logs', '--since', callback_flow_log_cursor,
+      '--timestamps', container], timeout=15)
+  replay_log_read = replay_logs.returncode == 0 and flow_logs.returncode == 0
+  replay_log_text = subprocess_output_text(replay_logs) if replay_logs.returncode == 0 else ''
+  flow_log_text = subprocess_output_text(flow_logs) if flow_logs.returncode == 0 else ''
+  request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+  replay_guard = callback_replay_guard_log_outcome(
+      replay_log_text if replay_logs.returncode == 0 else '', request_id)
+  lifecycle = callback_authenticator_lifecycle_log_outcome(
+      replay_log_text if replay_logs.returncode == 0 else '', request_id)
+  flow_lifecycle = callback_authenticator_lifecycle_log_outcome(
+      flow_log_text if flow_logs.returncode == 0 else '', request_id)
+  for field in ('callback_flow_rearm_marker_count',
+      'callback_flow_rearm_unavailable_marker_count', 'callback_flow_rearm_other_marker_count',
+      'callback_flow_rearmed', 'callback_flow_rearm_execution_id_present'):
+    lifecycle[field] = flow_lifecycle[field]
+  marker_count = replay_guard['marker_count']
+  replay_guard_reached = replay_guard['reached']
+  replay_guard_facts = {
+      'callback_replay_guard_log_read': replay_log_read,
+      'callback_replay_guard_reached': replay_guard_reached,
+      'callback_replay_guard_marker_count': marker_count,
+      'callback_replay_guard_unavailable_marker_count': replay_guard['unavailable_marker_count'],
+      'callback_replay_guard_other_marker_count': replay_guard['other_marker_count'],
+      'callback_replay_authenticator_entry_reached': lifecycle['authenticator_entry_reached'],
+      'callback_replay_authenticator_entry_completed': lifecycle[
+          'authenticator_entry_completed_marker_present'],
+      'callback_replay_authenticator_entry_marker_count': lifecycle[
+          'authenticator_entry_marker_count'],
+      'callback_replay_authenticator_entry_unavailable_marker_count': lifecycle[
+          'authenticator_entry_unavailable_marker_count'],
+      'callback_replay_authenticator_entry_other_marker_count': lifecycle[
+          'authenticator_entry_other_marker_count'],
+      'callback_replay_authenticator_entry_completed_true_marker_count': lifecycle[
+          'authenticator_entry_callback_completed_true_marker_count'],
+      'callback_replay_authenticator_entry_completed_false_marker_count': lifecycle[
+          'authenticator_entry_callback_completed_false_marker_count'],
+      'callback_replay_login_error_log_read': replay_login_error_delta['read'],
+      'callback_replay_login_error_count': replay_login_error_delta['count'],
+      'callback_replay_login_error_category': replay_login_error_delta['category'],
+      'callback_top_flow_rearm_reached': lifecycle['callback_flow_rearmed'],
+      'callback_top_flow_rearm_execution_id_present': lifecycle[
+          'callback_flow_rearm_execution_id_present'],
+      'callback_top_flow_rearm_marker_count': lifecycle['callback_flow_rearm_marker_count'],
+      'callback_top_flow_rearm_unavailable_marker_count': lifecycle[
+          'callback_flow_rearm_unavailable_marker_count'],
+      'callback_top_flow_rearm_other_marker_count': lifecycle[
+          'callback_flow_rearm_other_marker_count'],
+  }
+  if replay_guard_reached:
+    replay_guard_facts.update({
+        'callback_replay_state_present': replay_guard['state_present'],
+        'callback_replay_redirect_uri_present': replay_guard['redirect_uri_present'],
+        'callback_replay_redirect_uri_registered': replay_guard['redirect_uri_registered'],
+        'callback_replay_protocol_openid_connect': replay_guard['protocol_openid_connect'],
+    })
+  report_progress('fresh_replay', **replay_guard_facts)
   repeated_location = repeated_headers.get('Location', '')
-  callback_replay = callback_replay_outcome(repeated_status, repeated_location, state, REDIRECT)
+  callback_replay = callback_replay_outcome(
+      repeated_status, repeated_location, state, REDIRECT, callback)
+  report_progress('fresh_replay', callback_replay_http=repeated_status,
+      callback_replay_state_preserved=callback_replay['state_preserved'],
+      callback_replay_error_returned=callback_replay['error_returned'],
+      callback_replay_code_returned=callback_replay['authorization_code_returned'])
   record_auth_flow_outcome('callback_replay_http', repeated_status)
   record_auth_flow_outcome('callback_replay_redirect_uri_matches', callback_replay['redirect_uri_matches'])
   record_auth_flow_outcome('callback_replay_state_preserved', callback_replay['state_preserved'])
   record_auth_flow_outcome('callback_replay_error_returned', callback_replay['error_returned'])
   record_auth_flow_outcome('callback_replay_code_returned', callback_replay['authorization_code_returned'])
-  require(repeated_status == 302 and callback_replay['redirect_uri_matches']
-      and callback_replay['state_preserved'] and callback_replay['error_returned']
-      and not callback_replay['authorization_code_returned'],
-      'consumed callback replay preserves registered redirect/state and returns error without code',
+  record_auth_flow_outcome('callback_replay_internal_error_page', callback_replay['internal_error_page'])
+  record_auth_flow_outcome('callback_replay_internal_error_reason', callback_replay['internal_error_reason'])
+  record_auth_flow_outcome('callback_replay_internal_error_hostname_matches',
+      callback_replay['internal_error_hostname_matches'])
+  record_auth_flow_outcome('callback_replay_internal_error_port_matches',
+      callback_replay['internal_error_port_matches'])
+  record_auth_flow_outcome('callback_replay_guard_log_read', replay_log_read)
+  record_auth_flow_outcome('callback_replay_guard_reached', replay_guard_reached)
+  record_auth_flow_outcome('callback_replay_guard_marker_count', marker_count)
+  record_auth_flow_outcome('callback_replay_guard_unavailable_marker_count',
+      replay_guard['unavailable_marker_count'])
+  record_auth_flow_outcome('callback_replay_guard_other_marker_count',
+      replay_guard['other_marker_count'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_reached',
+      lifecycle['authenticator_entry_reached'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_completed',
+      lifecycle['authenticator_entry_completed_marker_present'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_marker_count',
+      lifecycle['authenticator_entry_marker_count'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_unavailable_marker_count',
+      lifecycle['authenticator_entry_unavailable_marker_count'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_other_marker_count',
+      lifecycle['authenticator_entry_other_marker_count'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_completed_true_marker_count',
+      lifecycle['authenticator_entry_callback_completed_true_marker_count'])
+  record_auth_flow_outcome('callback_replay_authenticator_entry_completed_false_marker_count',
+      lifecycle['authenticator_entry_callback_completed_false_marker_count'])
+  record_auth_flow_outcome('callback_replay_login_error_log_read', replay_login_error_delta['read'])
+  record_auth_flow_outcome('callback_replay_login_error_count', replay_login_error_delta['count'])
+  record_auth_flow_outcome('callback_replay_login_error_category',
+      replay_login_error_delta['category'])
+  record_auth_flow_outcome('callback_top_flow_rearm_reached', lifecycle['callback_flow_rearmed'])
+  record_auth_flow_outcome('callback_top_flow_rearm_execution_id_present',
+      lifecycle['callback_flow_rearm_execution_id_present'])
+  record_auth_flow_outcome('callback_top_flow_rearm_marker_count',
+      lifecycle['callback_flow_rearm_marker_count'])
+  record_auth_flow_outcome('callback_top_flow_rearm_unavailable_marker_count',
+      lifecycle['callback_flow_rearm_unavailable_marker_count'])
+  record_auth_flow_outcome('callback_top_flow_rearm_other_marker_count',
+      lifecycle['callback_flow_rearm_other_marker_count'])
+  if replay_guard_reached:
+    record_auth_flow_outcome('callback_replay_state_present', replay_guard['state_present'])
+    record_auth_flow_outcome('callback_replay_redirect_uri_present', replay_guard['redirect_uri_present'])
+    record_auth_flow_outcome('callback_replay_redirect_uri_registered', replay_guard['redirect_uri_registered'])
+    record_auth_flow_outcome('callback_replay_protocol_openid_connect', replay_guard['protocol_openid_connect'])
+  record_auth_flow_outcome('callback_replay_denied_safely', callback_replay['replay_denied_safely'])
+  if not callback_replay['replay_denied_safely']:
+    safe_replay_fields = {key: callback_replay[key] for key in (
+        'redirect_http', 'redirect_uri_matches', 'state_preserved', 'error_returned',
+        'authorization_code_returned', 'internal_error_page', 'internal_error_reason',
+        'internal_error_hostname_matches', 'internal_error_port_matches')}
+    replay_parts = urllib.parse.urlsplit(repeated_location)
+    safe_replay_fields.update({
+        'redirect_scheme': replay_parts.scheme or 'relative',
+        'redirect_path': replay_parts.path or 'unavailable',
+        'redirect_query_names': sorted(set(urllib.parse.parse_qs(
+            replay_parts.query, keep_blank_values=True)))[:32],
+    })
+    print('callback_replay_diagnostic=' + json.dumps(safe_replay_fields, sort_keys=True))
+  require(callback_replay['replay_denied_safely'],
+      'consumed callback replay is denied without an authorization code',
       repeated_status, failure_gate='callback_replay')
   status_after_callback, _, status_after_callback_raw = client.request(
       'GET', status_url, headers=poll_headers)
@@ -2620,6 +3200,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
       f'/auth/realms/{REALM}/protocol/openid-connect/token', form,
       {'Content-Type': 'application/x-www-form-urlencoded'})
   record_auth_flow_outcome('pkce_token_http', token_status)
+  report_progress('fresh_pkce', pkce_token_http=token_status)
   require(token_status == 200, 'OIDC Code+PKCE token exchange', token_status, failure_gate='pkce')
   id_token = json.loads(token_raw)['id_token']
   pieces = id_token.split('.')
@@ -2645,6 +3226,18 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None):
       'callback_replay_state_preserved': callback_replay['state_preserved'],
       'callback_replay_error_returned': callback_replay['error_returned'],
       'callback_replay_code_returned': callback_replay['authorization_code_returned'],
+      'callback_replay_denied_safely': callback_replay['replay_denied_safely'],
+      'callback_replay_guard_log_read': replay_log_read,
+      'callback_replay_guard_reached': replay_guard_reached,
+      'callback_replay_guard_marker_count': marker_count,
+      'callback_replay_guard_unavailable_marker_count': replay_guard['unavailable_marker_count'],
+      'callback_replay_guard_other_marker_count': replay_guard['other_marker_count'],
+      **({
+          'callback_replay_state_present': replay_guard['state_present'],
+          'callback_replay_redirect_uri_present': replay_guard['redirect_uri_present'],
+          'callback_replay_redirect_uri_registered': replay_guard['redirect_uri_registered'],
+          'callback_replay_protocol_openid_connect': replay_guard['protocol_openid_connect'],
+      } if replay_guard_reached else {}),
       'status_after_callback_http': status_after_callback,
       'status_after_callback_safe': status_after_callback_safe,
       'pkce_token_http': token_status,
@@ -4062,8 +4655,45 @@ class AuthFlowAttempt:
         'callback_error_returned', 'callback_code_returned',
         'callback_redirect_uri_matches', 'callback_replay_state_preserved',
         'callback_replay_error_returned', 'callback_replay_code_returned',
-        'callback_replay_redirect_uri_matches', 'status_after_callback_safe', 'status_pending',
+        'callback_replay_redirect_uri_matches', 'callback_replay_denied_safely',
+        'callback_replay_internal_error_page',
+        'callback_replay_internal_error_hostname_matches',
+        'callback_replay_internal_error_port_matches',
+        'callback_replay_guard_log_read', 'callback_replay_guard_reached',
+        'callback_replay_login_error_log_read',
+        'callback_replay_authenticator_entry_reached',
+        'callback_replay_authenticator_entry_completed',
+        'callback_top_flow_rearm_reached', 'callback_top_flow_rearm_execution_id_present',
+        'callback_replay_state_present', 'callback_replay_redirect_uri_present',
+        'callback_replay_redirect_uri_registered', 'callback_replay_protocol_openid_connect',
+        'status_after_callback_safe', 'status_pending',
     } and type(value) is bool:
+      self.outcomes[name] = value
+    elif name == 'callback_replay_guard_marker_count' and type(value) is int and 0 <= value <= 10:
+      self.outcomes[name] = value
+    elif name in {'callback_replay_guard_unavailable_marker_count',
+        'callback_replay_guard_other_marker_count',
+        'callback_replay_login_error_count',
+        'callback_replay_authenticator_entry_marker_count',
+        'callback_replay_authenticator_entry_unavailable_marker_count',
+        'callback_replay_authenticator_entry_other_marker_count',
+        'callback_replay_authenticator_entry_completed_true_marker_count',
+        'callback_replay_authenticator_entry_completed_false_marker_count',
+        'callback_top_flow_rearm_marker_count',
+        'callback_top_flow_rearm_unavailable_marker_count',
+        'callback_top_flow_rearm_other_marker_count'} and type(value) is int and 0 <= value <= 10:
+      self.outcomes[name] = value
+    elif name == 'callback_replay_login_error_category' and isinstance(value, str) and value in {
+        'none', 'unavailable', 'multiple', 'other', 'invalid_code', 'expired_code',
+        'already_logged_in', 'cookie_not_found', 'invalid_request', 'invalid_redirect_uri',
+        'access_denied', 'user_not_found'}:
+      self.outcomes[name] = value
+    elif name == 'callback_replay_internal_error_reason' and isinstance(value, str) and value in {
+        'callback_url_unavailable', 'callback_origin_invalid', 'redirect_scheme_mismatch',
+        'redirect_origin_mismatch',
+        'redirect_path_untrusted', 'authorization_code_present', 'error_parameter_invalid',
+        'same_origin_error_without_code', 'loopback_keycloak_error_without_code',
+        'url_parse_error'}:
       self.outcomes[name] = value
     return value
 
@@ -4354,7 +4984,9 @@ def callback_redirect_outcome(location, expected_state, redirect_uri):
     expected = urllib.parse.urlsplit('https://invalid.invalid/')
     query = {}
     expected_query = {}
-  dynamic = {'code', 'state', 'error', 'iss', 'session_state'}
+  # OAuth/OIDC response metadata is not part of the registered URI's static
+  # query. Keycloak's ALREADY_LOGGED_IN response includes error_description.
+  dynamic = {'code', 'state', 'error', 'error_description', 'iss', 'session_state'}
   actual_static_query = {key: value for key, value in query.items() if key not in dynamic}
   redirect_matches = (
       actual.scheme == expected.scheme and actual.netloc == expected.netloc
@@ -4375,14 +5007,62 @@ def callback_redirect_outcome(location, expected_state, redirect_uri):
   }
 
 
-def callback_replay_outcome(status_code, location, expected_state, redirect_uri):
+def callback_replay_outcome(status_code, location, expected_state, redirect_uri,
+    keycloak_callback_url=None):
   outcome = callback_redirect_outcome(location, expected_state, redirect_uri)
+  internal_error_page = False
+  internal_error_reason = 'callback_url_unavailable'
+  internal_error_hostname_matches = False
+  internal_error_port_matches = False
+  if isinstance(keycloak_callback_url, str):
+    try:
+      callback_parts = urllib.parse.urlsplit(keycloak_callback_url)
+      actual_parts = urllib.parse.urlsplit(urllib.parse.urljoin(keycloak_callback_url, location))
+      actual_query = urllib.parse.parse_qs(actual_parts.query, keep_blank_values=True)
+      internal_error_hostname_matches = (actual_parts.hostname is not None
+          and callback_parts.hostname is not None
+          and actual_parts.hostname.lower() == callback_parts.hostname.lower())
+      internal_error_port_matches = actual_parts.port == callback_parts.port
+      if (callback_parts.scheme not in {'http', 'https'} or not callback_parts.netloc
+          or callback_parts.username is not None or callback_parts.password is not None):
+        internal_error_reason = 'callback_origin_invalid'
+      else:
+        expected_origin = (actual_parts.scheme == callback_parts.scheme
+            and actual_parts.netloc == callback_parts.netloc
+            and actual_parts.username is None and actual_parts.password is None)
+        local_keycloak_origin = (actual_parts.scheme == 'http'
+            and actual_parts.hostname == '127.0.0.1' and actual_parts.port == KC_PORT
+            and actual_parts.username is None and actual_parts.password is None)
+        if not expected_origin and not local_keycloak_origin:
+          internal_error_reason = ('redirect_scheme_mismatch'
+              if actual_parts.scheme != callback_parts.scheme else 'redirect_origin_mismatch')
+        elif not actual_parts.path.startswith('/auth/'):
+          internal_error_reason = 'redirect_path_untrusted'
+        elif 'code' in actual_query:
+          internal_error_reason = 'authorization_code_present'
+        elif len(actual_query.get('error', [])) != 1 or not actual_query['error'][0]:
+          internal_error_reason = 'error_parameter_invalid'
+        else:
+          internal_error_page = True
+          internal_error_reason = ('same_origin_error_without_code' if expected_origin
+              else 'loopback_keycloak_error_without_code')
+    except (TypeError, ValueError):
+      internal_error_reason = 'url_parse_error'
+  safe_denial = (status_code in {302, 303} and outcome['error_returned']
+      and not outcome['authorization_code_returned']
+      and ((outcome['redirect_uri_matches'] and outcome['state_preserved'])
+          or internal_error_page))
   return {
       'redirect_http': status_code,
       'redirect_uri_matches': outcome['redirect_uri_matches'],
       'state_preserved': outcome['state_preserved'],
       'error_returned': outcome['error_returned'],
       'authorization_code_returned': outcome['authorization_code_returned'],
+      'internal_error_page': internal_error_page,
+      'internal_error_reason': internal_error_reason,
+      'internal_error_hostname_matches': internal_error_hostname_matches,
+      'internal_error_port_matches': internal_error_port_matches,
+      'replay_denied_safely': safe_denial,
   }
 
 
@@ -4414,11 +5094,36 @@ def run_issue6_auth_flow(result, attempt, auth_flow_runner, checkpoint):
   return auth_result
 
 
+def safe_failure_category(failure):
+  if isinstance(failure, AuthFlowFailure):
+    return 'auth_flow_gate'
+  if isinstance(failure, (TimeoutError, subprocess.TimeoutExpired)):
+    return 'timeout'
+  if isinstance(failure, ValueError):
+    return 'value_error'
+  if isinstance(failure, RuntimeError):
+    return 'runtime_error'
+  return 'other'
+
+
+def run_checkpointed_step(mark_stage, started_stage, completed_stage, operation):
+  mark_stage(started_stage)
+  try:
+    result = operation()
+  except Exception as failure:
+    mark_stage(started_stage, failure_category=safe_failure_category(failure))
+    raise
+  mark_stage(completed_stage)
+  return result
+
+
 def postconsume_receipt_failure_flow(key, identifier, container, *, browser_state,
     client_factory=None, signer=None):
   """Trigger the test-image decorator once and verify fail-closed browser state."""
   browser = (client_factory or Client)()
   browser_state['browser'] = browser
+  from datetime import datetime, timedelta, timezone
+  selection_cursor = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec='milliseconds')
   query = urllib.parse.urlencode({
       'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
       'scope': 'openid', 'state': b64url(secrets.token_bytes(24)),
@@ -4447,6 +5152,25 @@ def postconsume_receipt_failure_flow(key, identifier, container, *, browser_stat
   wallet = (client_factory or Client)()
   challenge_status, _, challenge_raw = wallet.request('GET', locator)
   require(challenge_status == 200, 'post-consume failure challenge GET', challenge_status)
+  request_id = hashlib.sha256(locator.rsplit('/', 1)[1].encode('ascii')).hexdigest()[:32]
+  selection_logs = run(['podman', 'logs', '--since', selection_cursor,
+      '--timestamps', container], timeout=15)
+  require(selection_logs.returncode == 0, 'receipt failure provider-selection log cursor')
+  selection_text = subprocess_output_text(selection_logs)
+  selection_marker_prefix = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={ISSUE6_POSTCONSUME_TEST_PROVIDER_ID} '
+      'operation=transaction_put_if_absent request=')
+  provider_marker_count = selection_text.count(selection_marker_prefix)
+  provider_selected = issue6_test_provider_selection_is_verified(selection_text,
+      ISSUE6_POSTCONSUME_TEST_PROVIDER_ID, request_id)
+  if not provider_selected:
+    print('issue6_provider_selection_diagnostic=' + json.dumps({
+        'log_read_status': 'ok' if selection_logs.returncode == 0 else 'error',
+        'captured_log_chars': len(selection_text),
+        'factory_created_marker_count': selection_text.count('ISSUE6_TEST_PROVIDER_FACTORY_CREATED:'),
+        'selection_marker_count': selection_text.count('ISSUE6_TEST_PROVIDER_SELECTED:'),
+        'expected_provider_marker_count': provider_marker_count,
+        'request_correlated_marker': False}, sort_keys=True))
+  require(provider_selected, 'receipt test provider selected for pending transaction')
   envelope = json.loads(challenge_raw)
   signed = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
       'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'),
@@ -4473,7 +5197,6 @@ def postconsume_receipt_failure_flow(key, identifier, container, *, browser_stat
       'identity_id': identifier, 'signature': signature_value},
       ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
-  from datetime import datetime, timezone
   log_cursor = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
   redirects_before = len(wallet.redirects)
   proof_status, proof_headers, proof_body = wallet.request('POST', locator, proof,
@@ -4503,9 +5226,8 @@ def postconsume_receipt_failure_flow(key, identifier, container, *, browser_stat
   logs = run(['podman', 'logs', '--since', log_cursor, '--timestamps', container], timeout=15)
   require(logs.returncode == 0, 'per-run Keycloak failure log cursor')
   request_id = hashlib.sha256(locator.rsplit('/', 1)[1].encode('ascii')).hexdigest()[:32]
-  handler_marker = (f'Wallet accepted receipt publication unavailable (request={request_id}, '
-      'cause=post_consume_receipt_failure)')
-  log_text = logs.stdout + logs.stderr
+  handler_marker = f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)'
+  log_text = subprocess_output_text(logs)
   handler_count = log_text.count(handler_marker)
   decorator_count = log_text.count(
       'ISSUE6_TEST_FAULT: accepted receipt delegate write committed; test decorator threw')
@@ -4520,11 +5242,146 @@ def postconsume_receipt_failure_flow(key, identifier, container, *, browser_stat
       'status_redirect_followed': status_redirected, 'callback_exposed': False,
       'oidc_code_exposed': False, 'fault_signal_correlated': handler_count == 1,
       'fault_signal_count': handler_count,
-      'delegate_commit_then_throw': decorator_count == 1}
+      'delegate_commit_then_throw': decorator_count == 1,
+      'test_provider_selected': provider_selected,
+      'selected_provider_path': ISSUE6_POSTCONSUME_TEST_PROVIDER_ID}
 
 
-def run_issue6_single_node_profile():
-  """Run the bounded one-node replay/callback flow, then expiry and fresh login."""
+def postconsume_callback_gate_failure_flow(key, identifier, container, *, browser_state,
+    client_factory=None, signer=None):
+  """Exercise the real proof endpoint through a one-shot callback-gate decorator fault."""
+  browser = (client_factory or Client)()
+  browser_state['browser'] = browser
+  from datetime import datetime, timedelta, timezone
+  selection_cursor = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec='milliseconds')
+  query = urllib.parse.urlencode({
+      'client_id': CLIENT, 'redirect_uri': REDIRECT, 'response_type': 'code',
+      'scope': 'openid', 'state': b64url(secrets.token_bytes(24)),
+      'nonce': b64url(secrets.token_bytes(24)),
+      'code_challenge': b64url(hashlib.sha256(secrets.token_bytes(32)).digest()),
+      'code_challenge_method': 'S256',
+  })
+  login_status, _, page = browser.request('GET',
+      f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
+  require(login_status == 200, 'callback-gate failure profile login page', login_status)
+  text = page.decode('utf-8', errors='strict')
+  parser = LoginPageParser()
+  parser.feed(text)
+  locator = ''.join(parser.locator_parts).strip()
+  require(locator.startswith(
+      f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/decent-wallet-login/v1/transactions/'),
+      'callback-gate failure profile transaction locator')
+  browser_state['initial_locator'] = locator
+  csrf = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', text)
+  status_match = re.search(r'const statusUrl = "([^"]+)";', text)
+  require(csrf is not None and status_match is not None,
+      'callback-gate failure profile status binding')
+  if csrf is None or status_match is None:
+    raise RuntimeError('callback-gate failure profile status binding unavailable')
+  wallet = (client_factory or Client)()
+  challenge_status, _, challenge_raw = wallet.request('GET', locator)
+  require(challenge_status == 200, 'callback-gate failure challenge GET', challenge_status)
+  request_id = hashlib.sha256(locator.rsplit('/', 1)[1].encode('ascii')).hexdigest()[:32]
+  selection_logs = run(['podman', 'logs', '--since', selection_cursor,
+      '--timestamps', container], timeout=15)
+  require(selection_logs.returncode == 0, 'callback-gate provider-selection log cursor')
+  selection_text = subprocess_output_text(selection_logs)
+  selection_marker_prefix = (f'ISSUE6_TEST_PROVIDER_SELECTED: provider={ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID} '
+      'operation=transaction_put_if_absent request=')
+  provider_marker_count = selection_text.count(selection_marker_prefix)
+  provider_selected = issue6_test_provider_selection_is_verified(selection_text,
+      ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID, request_id)
+  if not provider_selected:
+    print('issue6_provider_selection_diagnostic=' + json.dumps({
+        'log_read_status': 'ok' if selection_logs.returncode == 0 else 'error',
+        'captured_log_chars': len(selection_text),
+        'factory_created_marker_count': selection_text.count('ISSUE6_TEST_PROVIDER_FACTORY_CREATED:'),
+        'selection_marker_count': selection_text.count('ISSUE6_TEST_PROVIDER_SELECTED:'),
+        'expected_provider_marker_count': provider_marker_count,
+        'request_correlated_marker': False}, sort_keys=True))
+  require(provider_selected, 'callback-gate test provider selected for pending transaction')
+  envelope = json.loads(challenge_raw)
+  signed = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
+      'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'),
+      sort_keys=True).encode('utf-8')
+  if signer is None:
+    public = subprocess.run(['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+    require(public.returncode == 0 and len(public.stdout) >= 32,
+        'callback-gate failure proof public key')
+    with tempfile.TemporaryDirectory(prefix='wallet-callback-signing-', dir=key.parent) as signing_dir:
+      payload = write_private_signing_input(signing_dir, 'proof', signed)
+      try:
+        signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin',
+            '-inkey', str(key), '-in', str(payload)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10, check=False)
+      finally:
+        payload.unlink(missing_ok=True)
+    require(signature.returncode == 0 and len(signature.stdout) == 64,
+        'callback-gate failure valid Ed25519 proof')
+    signature_value = b64url(signature.stdout)
+  else:
+    signature_value = signer(envelope, identifier)
+  proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
+      'identity_id': identifier, 'signature': signature_value},
+      ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+  log_cursor = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+  redirects_before = len(wallet.redirects)
+  proof_status, proof_headers, proof_body = wallet.request('POST', locator, proof,
+      {'Content-Type': 'application/json'})
+  proof_location = proof_headers.get('Location')
+  proof_redirected = len(wallet.redirects) != redirects_before
+  require(proof_status == 503 and not proof_body and proof_location is None
+      and not proof_redirected, 'callback-gate commit-then-throw is empty 503 without redirect', proof_status)
+  retry_redirects_before = len(wallet.redirects)
+  retry_status, retry_headers, retry_body = wallet.request('POST', locator, proof,
+      {'Content-Type': 'application/json'})
+  retry_redirected = len(wallet.redirects) != retry_redirects_before
+  require(retry_status == 404 and not retry_body and retry_headers.get('Location') is None
+      and not retry_redirected, 'consumed transaction retry is empty 404', retry_status)
+  status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
+  status_redirects_before = len(browser.redirects)
+  status_status, status_response_headers, status_body = browser.request(
+      'GET', status_match.group(1), headers=status_headers)
+  status_redirected = len(browser.redirects) != status_redirects_before
+  require(status_status == 404 and not status_body
+      and status_response_headers.get('Location') is None and not status_redirected,
+      'initiating browser sees no callback from failed callback gate', status_status)
+  require(b'callback' not in status_body.lower() and b'code' not in status_body.lower(),
+      'callback-gate failure reveals neither callback nor code')
+
+  logs = run(['podman', 'logs', '--since', log_cursor, '--timestamps', container], timeout=15)
+  require(logs.returncode == 0, 'per-run callback-gate failure log cursor')
+  request_id = hashlib.sha256(locator.rsplit('/', 1)[1].encode('ascii')).hexdigest()[:32]
+  production_marker = f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)'
+  test_marker = ('ISSUE6_TEST_FAULT: callback gate delegate putIfAbsent committed; '
+      'test decorator threw')
+  log_text = subprocess_output_text(logs)
+  production_count = log_text.count(production_marker)
+  test_count = log_text.count(test_marker)
+  require(production_count == 1 and test_count == 1,
+      'one correlated neutral production failure and one callback-gate commit-then-throw marker')
+  receipt_failure_marker = (f'Wallet accepted receipt publication unavailable (request={request_id}, '
+      'cause=post_consume_receipt_failure)')
+  require(receipt_failure_marker not in log_text,
+      'callback-gate failure is not misattributed as receipt publication failure')
+  return {'stage': 'failed_then_denied', 'proof_http': proof_status,
+      'proof_body_empty': not proof_body, 'proof_location_present': proof_location is not None,
+      'proof_redirect_followed': proof_redirected, 'retry_http': retry_status,
+      'retry_redirect_followed': retry_redirected, 'status_http': status_status,
+      'status_body_empty': not status_body,
+      'status_location_present': status_response_headers.get('Location') is not None,
+      'status_redirect_followed': status_redirected, 'callback_exposed': False,
+      'oidc_code_exposed': False, 'fault_signal_correlated': production_count == 1,
+      'fault_signal_count': production_count, 'delegate_commit_then_throw': test_count == 1,
+      'test_provider_selected': provider_selected,
+      'selected_provider_path': ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID}
+
+
+def run_issue6_single_node_profile(*, run_expiry=True):
+  """Run the one-node auth flow, optionally including its authorized expiry phase."""
   global IMAGE, RUN_CID_DIR
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
@@ -4577,8 +5434,8 @@ def run_issue6_single_node_profile():
             client, token, client.wallet_container_id))
         result['resolver_runtime'] = runtime_provenance
         checkpoint()
-        if runtime_provenance.get('runtime_qualification_status') != 'runtime_facts_verified':
-          raise RuntimeError('Keycloak runtime provenance is not qualified')
+        if not runtime_baseline_is_verified(runtime_provenance):
+          raise RuntimeError('Keycloak version and single-node baseline are not verified')
         configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
         enable_keycloak_login_events(client, token)
         provision_identity_attribute(client, token, 'wallet-owner', identifier)
@@ -4587,21 +5444,23 @@ def run_issue6_single_node_profile():
             **{field: runtime_provenance[field] for field in (
                 'keycloak_version', 'keycloak_nodes', 'database_mode_configured',
                 'database_mode_effective', 'cache_mode_configured', 'cache_mode_effective',
-                'single_use_object_provider_path') if field in runtime_provenance},
+                'single_use_object_provider_configured', 'single_use_object_provider_path')
+              if field in runtime_provenance},
         }
         checkpoint()
         def auth_phase():
           auth_result = run_issue6_auth_flow(result, AuthFlowAttempt(),
-              lambda: auth_flow(Client(), key, identifier, client.wallet_container_id, IMAGE),
+              lambda: auth_flow(Client(), key, identifier, client.wallet_container_id, IMAGE,
+                  admin_access_token=token),
               checkpoint)
           return {'wallet_login': auth_result}
 
-        def expiry_progress(stage, fields):
-          checkpoint_live_case(result, 'expiry_case', {'stage': stage, **fields}, checkpoint)
-
         profile_result = run_acceptance_profile(
-            'issue6-single-node',
-            lambda: expiry_acceptance_flow(key, identifier, progress=expiry_progress),
+            'issue6-single-node' if run_expiry else 'issue6-auth-flow',
+            lambda: expiry_profile_coordinator(
+                client, key, identifier, client.wallet_container_id, IMAGE,
+                lambda snapshot: checkpoint_live_case(
+                    result, 'expiry_case', snapshot, checkpoint), runtime_provenance),
             auth_phase,
             checkpoint=lambda snapshot: (result.update(snapshot), checkpoint()))
         result.update(profile_result)
@@ -4644,8 +5503,8 @@ def run_issue6_postconsume_receipt_failure_profile():
         evidence_path.write_text(json.dumps(sanitize_live_checkpoint(result), sort_keys=True),
             encoding='utf-8')
 
-      def mark_stage(stage):
-        result['issue6_postconsume_receipt_failure_case'] = {'stage': stage}
+      def mark_stage(stage, **facts):
+        result['issue6_postconsume_receipt_failure_case'] = {'stage': stage, **facts}
         checkpoint()
 
       def partial_evidence():
@@ -4655,41 +5514,67 @@ def run_issue6_postconsume_receipt_failure_profile():
       with report_partial_evidence_on_failure(evidence_path, partial_evidence):
         resolver_tools = start_resolver_tools(Path(temp_dir), IMAGE)
         os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
-        mark_stage('runtime_setup')
+        mark_stage('resolver_setup')
         registry_node, bootstrap, _ = start_registry(Path(temp_dir), IMAGE)
         registry = registry_node
+        mark_stage('registry_setup')
         resolver_port = free_port()
         key, wrapper, identifier = write_identity(
             Path(temp_dir), bootstrap, IMAGE, label='issue6-postconsume-wallet-login')
-        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE)
+        mark_stage('identity_setup')
+        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE,
+            single_use_object_provider=ISSUE6_POSTCONSUME_TEST_PROVIDER_ID)
         if not isinstance(client.wallet_container_id, str):
           raise RuntimeError('Keycloak container ID is unavailable')
+        mark_stage('keycloak_setup')
         token = admin_token(client, password)
         runtime_provenance.update(keycloak_runtime_provenance(
             client, token, client.wallet_container_id))
         result['resolver_runtime'] = runtime_provenance
-        checkpoint()
+        mark_stage('runtime_provenance_read')
         if not runtime_baseline_is_verified(runtime_provenance):
           raise RuntimeError('Keycloak one-node runtime baseline is not verified')
+        mark_stage('runtime_baseline_verified')
         if not issue6_postconsume_provider_is_registered(runtime_provenance):
           raise RuntimeError('Issue #6 test decorator is not registered by Keycloak runtime')
         selected_provider = runtime_provenance.get('single_use_object_provider_path')
         if selected_provider not in {
             'issue6-postconsume-receipt-failure', 'unavailable'}:
           raise RuntimeError('Issue #6 test decorator is not selected by Keycloak runtime config')
-        configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
-        enable_keycloak_login_events(client, token)
-        provision_identity_attribute(client, token, 'wallet-owner', identifier)
-        mark_stage('runtime_setup')
+        mark_stage('provider_registration_verified')
+        run_checkpointed_step(mark_stage, 'configure_realm', 'realm_configured',
+            lambda: configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap))
+        run_checkpointed_step(mark_stage, 'enable_login_events', 'login_events_enabled',
+            lambda: enable_keycloak_login_events(client, token))
+        run_checkpointed_step(mark_stage, 'provision_identity', 'realm_setup',
+            lambda: provision_identity_attribute(client, token, 'wallet-owner', identifier))
 
         browser_state = {}
         failure_case = postconsume_receipt_failure_flow(
             key, identifier, client.wallet_container_id, browser_state=browser_state)
         result['issue6_postconsume_receipt_failure_case'] = failure_case
         checkpoint()
-        recovery = auth_flow(browser_state['browser'], key, identifier,
-            client.wallet_container_id, IMAGE, prior_locator=browser_state['initial_locator'])
+        wait_for_identity_lookup_cooldown()
+        def recovery_progress(stage, fields):
+          recovery_checkpoint = dict(result.get('issue6_postconsume_receipt_recovery', {}))
+          recovery_checkpoint.update(fields)
+          recovery_checkpoint['stage'] = stage
+          result['issue6_postconsume_receipt_recovery'] = recovery_checkpoint
+          checkpoint()
+
+        recovery_progress('recovery_started', {})
+        try:
+          recovery = auth_flow(browser_state['browser'], key, identifier,
+              client.wallet_container_id, IMAGE, prior_locator=browser_state['initial_locator'],
+              progress_callback=recovery_progress, admin_access_token=token)
+        except BaseException as failure:
+          current = result.get('issue6_postconsume_receipt_recovery', {})
+          recovery_progress(current.get('stage', 'recovery_started'),
+              {'failure_category': safe_failure_category(failure)})
+          raise
         recovery_case = {
+            **result.get('issue6_postconsume_receipt_recovery', {}),
+            'stage': 'complete',
             'fresh_login_http': recovery['login_page_http'],
             'fresh_login_transaction_available': (
                 recovery['fresh_locator_distinct'] and recovery['initial_status_accepted']),
@@ -4714,17 +5599,143 @@ def run_issue6_postconsume_receipt_failure_profile():
     print('issue6_postconsume_receipt_failure_evidence=' + json.dumps(evidence, sort_keys=True))
 
 
+
+def run_issue6_postconsume_callback_gate_failure_profile():
+  """Run the isolated callback-gate fault and then the ordinary recovery flow."""
+  global IMAGE, RUN_CID_DIR
+  test_image = os.environ.get('WALLET_IT_TEST_IMAGE')
+  if not test_image:
+    raise RuntimeError('WALLET_IT_TEST_IMAGE must name the isolated Issue #6 test image')
+  IMAGE, image_digest = resolve_immutable_image(test_image)
+  runtime_provenance = _prepare_resolver_runtime()
+  runtime_provenance['image_digest'] = image_digest
+  run_id = uuid.uuid4().hex
+  RUN_CID_DIR = Path(SCRATCH) / ('wallet-login-cids-' + run_id)
+  RUN_CID_DIR.mkdir(mode=0o700, parents=True, exist_ok=False)
+  container = 'issue6-callback-gate-test-' + run_id
+  password = secrets.token_urlsafe(32)
+  registry = resolver_tools = None
+  result = {'resolver_runtime': runtime_provenance,
+      'issue6_postconsume_callback_gate_failure_case': {'stage': 'preflight'}}
+  evidence = None
+  try:
+    with tempfile.TemporaryDirectory(prefix='issue6-callback-gate-', dir=SCRATCH) as temp_dir:
+      evidence_path = Path(temp_dir) / 'live-evidence.json'
+
+      def checkpoint():
+        evidence_path.write_text(json.dumps(sanitize_live_checkpoint(result), sort_keys=True),
+            encoding='utf-8')
+
+      def mark_stage(stage, **facts):
+        result['issue6_postconsume_callback_gate_failure_case'] = {'stage': stage, **facts}
+        checkpoint()
+
+      checkpoint()
+      with report_partial_evidence_on_failure(evidence_path, lambda: sanitize_live_checkpoint(result)):
+        resolver_tools = start_resolver_tools(Path(temp_dir), IMAGE)
+        os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        mark_stage('resolver_setup')
+        registry_node, bootstrap, _ = start_registry(Path(temp_dir), IMAGE)
+        registry = registry_node
+        mark_stage('registry_setup')
+        resolver_port = free_port()
+        key, wrapper, identifier = write_identity(
+            Path(temp_dir), bootstrap, IMAGE, label='issue6-callback-gate-wallet-login')
+        mark_stage('identity_setup')
+        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE,
+            single_use_object_provider=ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID)
+        if not isinstance(client.wallet_container_id, str):
+          raise RuntimeError('Keycloak container ID is unavailable')
+        mark_stage('keycloak_setup')
+        token = admin_token(client, password)
+        runtime_provenance.update(keycloak_runtime_provenance(
+            client, token, client.wallet_container_id))
+        result['resolver_runtime'] = runtime_provenance
+        mark_stage('runtime_provenance_read')
+        if not runtime_baseline_is_verified(runtime_provenance):
+          raise RuntimeError('Keycloak one-node runtime baseline is not verified')
+        mark_stage('runtime_baseline_verified')
+        provider_id = 'issue6-postconsume-callback-gate-failure'
+        provider_ids = runtime_provenance.get('single_use_object_provider_ids')
+        if not isinstance(provider_ids, list) or provider_id not in provider_ids:
+          raise RuntimeError('Issue #6 callback-gate test provider is not registered by Keycloak runtime')
+        mark_stage('provider_registration_verified')
+        if runtime_provenance.get('single_use_object_provider_path') not in {provider_id, 'unavailable'}:
+          raise RuntimeError('Issue #6 callback-gate test provider is not selected by Keycloak runtime config')
+        mark_stage('provider_config_verified')
+        run_checkpointed_step(mark_stage, 'configure_realm', 'realm_configured',
+            lambda: configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap))
+        run_checkpointed_step(mark_stage, 'enable_login_events', 'login_events_enabled',
+            lambda: enable_keycloak_login_events(client, token))
+        run_checkpointed_step(mark_stage, 'provision_identity', 'realm_setup',
+            lambda: provision_identity_attribute(client, token, 'wallet-owner', identifier))
+
+        browser_state = {}
+        failure_case = postconsume_callback_gate_failure_flow(
+            key, identifier, client.wallet_container_id, browser_state=browser_state)
+        result['issue6_postconsume_callback_gate_failure_case'] = failure_case
+        checkpoint()
+        wait_for_identity_lookup_cooldown()
+        def recovery_progress(stage, fields):
+          recovery_checkpoint = dict(result.get('issue6_postconsume_callback_gate_recovery', {}))
+          recovery_checkpoint.update(fields)
+          recovery_checkpoint['stage'] = stage
+          result['issue6_postconsume_callback_gate_recovery'] = recovery_checkpoint
+          checkpoint()
+
+        recovery_progress('recovery_started', {})
+        try:
+          recovery = auth_flow(browser_state['browser'], key, identifier,
+              client.wallet_container_id, IMAGE, prior_locator=browser_state['initial_locator'],
+              progress_callback=recovery_progress, admin_access_token=token)
+        except BaseException as failure:
+          current = result.get('issue6_postconsume_callback_gate_recovery', {})
+          recovery_progress(current.get('stage', 'recovery_started'),
+              {'failure_category': safe_failure_category(failure)})
+          raise
+        recovery_case = {
+            **result.get('issue6_postconsume_callback_gate_recovery', {}),
+            'stage': 'complete',
+            'fresh_login_http': recovery['login_page_http'],
+            'fresh_login_transaction_available': (
+                recovery['fresh_locator_distinct'] and recovery['initial_status_accepted']),
+            'callback_http': recovery['callback_http'],
+            'callback_code': recovery['callback_code_returned'],
+            'callback_replay_denied': (recovery['callback_replay_error_returned']
+                and not recovery['callback_replay_code_returned']),
+            'pkce_token_http': recovery['pkce_token_http'],
+        }
+        require(recovery_case['fresh_login_transaction_available'],
+            'fresh login after callback-gate failure obtains a distinct accepted transaction')
+        require(recovery_case['callback_replay_denied'],
+            'recovery callback replay is denied without returning another code')
+        result['issue6_postconsume_callback_gate_recovery'] = recovery_case
+        checkpoint()
+        evidence = sanitize_live_checkpoint(result)
+  except BaseException:
+    cleanup_after_failure(registry, resolver_tools)
+    raise
+  else:
+    finish_owned_cleanup(registry, resolver_tools)
+    print('issue6_postconsume_callback_gate_failure_evidence=' + json.dumps(evidence, sort_keys=True))
+
+
 def main():
   global IMAGE, RUN_CID_DIR
   profile = os.environ.get('WALLET_IT_PROFILE', 'default')
   if profile == 'issue6-single-node':
     return run_issue6_single_node_profile()
+  if profile == 'issue6-auth-flow':
+    return run_issue6_single_node_profile(run_expiry=False)
   if profile == 'issue6-postconsume-receipt-failure':
     return run_issue6_postconsume_receipt_failure_profile()
+  if profile == 'issue6-postconsume-callback-gate-failure':
+    return run_issue6_postconsume_callback_gate_failure_profile()
   if profile not in {'default', 'expiry', 'provider-not-found-diagnostic'}:
     raise ValueError(
         'WALLET_IT_PROFILE must be default, expiry, provider-not-found-diagnostic, '
-        'issue6-single-node, or issue6-postconsume-receipt-failure')
+        'issue6-single-node, issue6-auth-flow, issue6-postconsume-receipt-failure, '
+        'or issue6-postconsume-callback-gate-failure')
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
   runtime_provenance['image_digest'] = image_digest
@@ -4797,9 +5808,9 @@ def main():
           registry = None
           resolver_tools = None
           return
-        require(runtime_provenance['runtime_qualification_status'] == 'runtime_facts_verified',
-            'effective Keycloak runtime provenance verified',
-            runtime_provenance['runtime_qualification_status'])
+        require(runtime_baseline_is_verified(runtime_provenance),
+            'pinned Keycloak version and single-node baseline verified',
+            runtime_provenance['keycloak_version'])
         configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
         enable_keycloak_login_events(client, token)
         if profile == 'expiry':
@@ -5073,4 +6084,13 @@ def main():
 
 
 if __name__ == '__main__':
-  main()
+  try:
+    main()
+  except KeyboardInterrupt:
+    print('harness_status=interrupted')
+    raise SystemExit(130) from None
+  except SystemExit:
+    raise
+  except Exception as failure:
+    print('harness_status=failed; failure_category=' + safe_failure_category(failure))
+    raise SystemExit(1) from None
