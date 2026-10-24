@@ -102,9 +102,12 @@ jobs:
       - name: Validate the submitted diff
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
         run: |
           if [ -n "$PR_BASE_SHA" ]; then
             git diff --check "$PR_BASE_SHA...HEAD"
+          elif [ -n "$PUSH_BASE_SHA" ] && [ "$PUSH_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$PUSH_BASE_SHA...HEAD"
           else
             git diff --check HEAD^ HEAD
           fi

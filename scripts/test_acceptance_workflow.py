@@ -16,6 +16,19 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
 
+  def test_push_validation_checks_all_commits_since_the_previous_ref(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+    validation = workflow.split("      - name: Validate the submitted diff\n", 1)[1]
+
+    self.assertIn("PUSH_BASE_SHA: ${{ github.event.before }}", validation)
+    pr_base = 'if [ -n "$PR_BASE_SHA" ]'
+    push_base = 'elif [ -n "$PUSH_BASE_SHA" ]'
+    self.assertLess(validation.index(pr_base), validation.index(push_base))
+    self.assertIn('git diff --check "$PR_BASE_SHA...HEAD"', validation)
+    self.assertIn('git diff --check "$PUSH_BASE_SHA...HEAD"', validation)
+    self.assertIn('"0000000000000000000000000000000000000000"', validation)
+    self.assertIn("git diff --check HEAD^ HEAD", validation)
+
   def test_provider_image_build_uses_repository_dockerfile_path(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     build = workflow.split("      - name: Build and check the immutable-base provider image\n", 1)[1]
