@@ -13,10 +13,13 @@ import org.keycloak.models.SingleUseObjectProviderFactory;
 public final class Issue6PostConsumeReceiptFailureProviderFactory
     implements SingleUseObjectProviderFactory<SingleUseObjectProvider> {
   private static final String ACCEPTED_PREFIX = "decent-wallet-login-v1:accepted:";
+  private static final String HANDLE_PREFIX = "decent-wallet-login-v1:transaction:";
+  private static final AtomicBoolean SELECTION_WITNESSED = new AtomicBoolean();
   private static final AtomicBoolean INJECTED = new AtomicBoolean();
 
   @Override
   public SingleUseObjectProvider create(KeycloakSession session) {
+    System.err.println("ISSUE6_TEST_PROVIDER_FACTORY_CREATED: provider=issue6-postconsume-receipt-failure");
     SingleUseObjectProvider delegate = session.getProvider(SingleUseObjectProvider.class, "infinispan");
     if (delegate == null) {
       throw new IllegalStateException("Keycloak infinispan single-use provider unavailable");
@@ -38,11 +41,29 @@ public final class Issue6PostConsumeReceiptFailureProviderFactory
         return committed;
       }
       @Override public boolean putIfAbsent(String key, long lifespanSeconds) {
-        return delegate.putIfAbsent(key, lifespanSeconds);
+        boolean committed = delegate.putIfAbsent(key, lifespanSeconds);
+        if (key.startsWith(HANDLE_PREFIX)) {
+          String requestId = requestId(key);
+          if (requestId != null && SELECTION_WITNESSED.compareAndSet(false, true)) {
+            System.err.println("ISSUE6_TEST_PROVIDER_SELECTED: provider=issue6-postconsume-receipt-failure "
+                + "operation=transaction_put_if_absent request=" + requestId);
+          }
+        }
+        return committed;
       }
       @Override public boolean contains(String key) { return delegate.contains(key); }
       @Override public void close() { /* The session owns the delegate lifecycle. */ }
     };
+  }
+
+  private static String requestId(String key) {
+    String storageDigest = key.substring(HANDLE_PREFIX.length());
+    if (storageDigest.length() != 64) return null;
+    for (int i = 0; i < storageDigest.length(); i++) {
+      char value = storageDigest.charAt(i);
+      if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'))) return null;
+    }
+    return storageDigest.substring(0, 32);
   }
 
   @Override public void init(Config.Scope config) {}

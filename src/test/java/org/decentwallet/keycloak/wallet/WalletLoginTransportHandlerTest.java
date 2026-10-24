@@ -953,9 +953,13 @@ final class WalletLoginTransportHandlerTest {
     var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     String identity = "mailto:commit-then-throw@example.org";
+    var retired = new java.util.ArrayList<String>();
     var handler = new WalletLoginTransportHandler(store,
         exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
-        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true, true, store, (handle, binding) -> {
+          assertEquals(BINDING, binding);
+          retired.add(handle);
+        });
     var issued = store.issue(BINDING);
     byte[] proof = signedProof(issued.challenge(), identity, keyPair);
 
@@ -964,6 +968,7 @@ final class WalletLoginTransportHandlerTest {
     assertTrue(provider.committedThenThrew);
     var status = handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
         issued.csrfToken(), IDP_ORIGIN, BINDING);
+    assertEquals(java.util.List.of(issued.handle()), retired);
     var retry = handler.submitProof(issued.handle(), WALLET_ORIGIN, "cross-site", "application/json",
         issued.csrfToken(), proof, IDP_ORIGIN);
 

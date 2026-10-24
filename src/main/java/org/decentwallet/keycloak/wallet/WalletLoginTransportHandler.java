@@ -20,6 +20,7 @@ public final class WalletLoginTransportHandler {
   private final WalletLoginAccountResolver accounts;
   private final boolean acceptSignup;
   private final WalletLoginTransactionStore transactionStore;
+  private final java.util.function.BiConsumer<String, WalletLoginTransactionStore.Binding> terminalFailure;
   private final WalletLoginVerifier verifier = new WalletLoginVerifier();
 
   public WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
@@ -48,6 +49,15 @@ public final class WalletLoginTransportHandler {
       WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
       WalletLoginAccountResolver accounts, boolean acceptSignup,
       WalletLoginTransactionStore transactionStore) {
+    this(transactions, identities, walletOrigin, idpOrigin, accounts, acceptSignup,
+        transactionStore, (handle, binding) -> {});
+  }
+
+  WalletLoginTransportHandler(WalletLoginTransactionStore transactions,
+      WalletLoginIdentityResolver identities, String walletOrigin, String idpOrigin,
+      WalletLoginAccountResolver accounts, boolean acceptSignup,
+      WalletLoginTransactionStore transactionStore,
+      java.util.function.BiConsumer<String, WalletLoginTransactionStore.Binding> terminalFailure) {
     this.transactions = java.util.Objects.requireNonNull(transactions);
     this.identities = identities;
     this.walletOrigin = walletOrigin == null || walletOrigin.isBlank()
@@ -56,6 +66,7 @@ public final class WalletLoginTransportHandler {
     this.accounts = accounts;
     this.acceptSignup = acceptSignup;
     this.transactionStore = java.util.Objects.requireNonNull(transactionStore);
+    this.terminalFailure = java.util.Objects.requireNonNull(terminalFailure);
   }
 
   HttpResult getChallenge(String handle, String requestOrigin, String fetchSite,
@@ -205,7 +216,14 @@ public final class WalletLoginTransportHandler {
           consumed.get().intent());
     } catch (RuntimeException ex) {
       // Nonce is consumed; no OIDC result unless its separate accepted receipt persists.
-      LOG.warnf("Wallet accepted receipt publication unavailable (request=%s, cause=post_consume_receipt_failure)", requestId);
+      LOG.warnf("Wallet proof acceptance unavailable (request=%s, outcome=not_accepted)", requestId);
+      try {
+        terminalFailure.accept(handle, binding);
+      } catch (RuntimeException cleanupFailure) {
+        // Preserve the empty failure response even if targeted session retirement
+        // is unavailable. Never broaden cleanup to the root or sibling tabs.
+        LOG.warn("Wallet terminal authentication child retirement unavailable");
+      }
       return HttpResult.empty(503);
     }
     return HttpResult.json(202, Map.of("status", "pending"));
