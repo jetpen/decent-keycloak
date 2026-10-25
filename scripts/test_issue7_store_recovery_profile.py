@@ -393,7 +393,8 @@ class LoginRecoveryFlowTest(unittest.TestCase):
 
   def test_real_login_completion_checks_retained_subject_callback_and_pkce(self):
     result = self.scripted_login()
-    self.assertEqual('retained-subject', result['local_subject'])
+    self.assertTrue(result['local_subject_matches_expected'])
+    self.assertNotIn('local_subject', result)
     self.assertTrue(result['fresh_locator_distinct'])
     self.assertTrue(result['callback_replay_denied_safely'])
     self.assertEqual(200, result['pkce_token_http'])
@@ -411,7 +412,8 @@ class MainCoordinatorTest(unittest.TestCase):
         'prior_locator': 'private-old-locator', 'store_fault_count': 1,
         'store_provider_selected': True, 'correlated_store_failure_count': 1}
     recovered = {'signup_proof_http': 202, 'proof_post_http': 202, 'exact_mapped_users': 1,
-        'local_subject': 'retained-subject', 'callback_http': 302, 'pkce_token_http': 200,
+        'local_subject': 'retained-subject', 'local_subject_matches_expected': True,
+        'callback_http': 302, 'pkce_token_http': 200,
         'fresh_locator_distinct': True, 'callback_replay_denied_safely': True,
         'callback_state_preserved': True, 'callback_code_returned': True}
     return failed, recovered
@@ -635,7 +637,7 @@ class MainCoordinatorTest(unittest.TestCase):
   def test_bad_recovery_or_wrong_subject_never_produces_complete_checkpoint(self):
     _, recovered = self.fixtures()
     for profile in probe.issue7_store_recovery.PROFILES:
-      for field, value in {'local_subject': 'wrong-subject', 'callback_http': 500,
+      for field, value in {'local_subject_matches_expected': False, 'callback_http': 500,
           'pkce_token_http': 400}.items():
         with self.subTest(profile=profile, field=field):
           checkpoints, *_ = self.run_main(profile, recovered={**recovered, field: value},
