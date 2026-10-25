@@ -415,6 +415,178 @@ final class WalletLoginTransportHandlerTest {
     assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
   }
 
+  // Single-process handler characterization only; two independent root sessions share one exact identity.
+  // The provider fake is not Keycloak/JPA and this does not establish cross-node atomicity.
+  @Test
+  void distinctSignupTransactionsPreserveConcurrentAccountWinnerWhenOneConsumeLoses() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var users = mock(org.keycloak.models.UserProvider.class);
+    String identity = "mailto:distinct-race@example.org";
+    String username = "wallet-" + java.util.HexFormat.of().formatHex(
+        java.security.MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8)));
+    var accountsByUsername = new java.util.concurrent.ConcurrentHashMap<String, org.keycloak.models.UserModel>();
+    var winner = mock(org.keycloak.models.UserModel.class);
+    var winnerIdentity = new AtomicReference<String>();
+    var winnerEnabled = new AtomicBoolean(false);
+    when(winner.getId()).thenReturn("distinct-race-winner");
+    when(winner.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE))
+        .thenAnswer(ignored -> winnerIdentity.get());
+    when(winner.isEnabled()).thenAnswer(ignored -> winnerEnabled.get());
+    var winnerConfigured = new CountDownLatch(1);
+    var configurationWrites = new AtomicInteger();
+    org.mockito.Mockito.doAnswer(invocation -> {
+      assertEquals(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, invocation.getArgument(0));
+      winnerIdentity.set(invocation.getArgument(1));
+      if (configurationWrites.incrementAndGet() == 2) winnerConfigured.countDown();
+      return null;
+    }).when(winner).setSingleAttribute(org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.anyString());
+    org.mockito.Mockito.doAnswer(invocation -> {
+      winnerEnabled.set(invocation.getArgument(0));
+      if (configurationWrites.incrementAndGet() == 2) winnerConfigured.countDown();
+      return null;
+    }).when(winner).setEnabled(org.mockito.ArgumentMatchers.anyBoolean());
+
+    var caller = new ThreadLocal<String>();
+    var searchesByCaller = new java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>();
+    var lookupBarriers = new CountDownLatch[] {
+        new CountDownLatch(2), new CountDownLatch(2), new CountDownLatch(2)
+    };
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identity)).thenAnswer(invocation -> {
+          String transactionRole = caller.get();
+          assertNotNull(transactionRole, "each handler call identifies its own transaction in this fake");
+          int lookup = searchesByCaller.computeIfAbsent(transactionRole, ignored -> new AtomicInteger())
+              .getAndIncrement();
+          if ((transactionRole.equals("winner") || transactionRole.equals("loser")) && lookup < 3) {
+            lookupBarriers[lookup].countDown();
+            awaitRaceLatch(lookupBarriers[lookup], "both transactions at exact-identity lookup " + lookup);
+            return java.util.stream.Stream.empty();
+          }
+          return accountsByUsername.values().stream().filter(candidate -> identity.equals(
+              candidate.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)));
+        });
+
+    var bothCreateAttempts = new CountDownLatch(2);
+    var createAttempts = new AtomicInteger();
+    var successfulCreates = new AtomicInteger();
+    when(users.addUser(realm, null, username, true, true)).thenAnswer(invocation -> {
+      String transactionRole = caller.get();
+      createAttempts.incrementAndGet();
+      bothCreateAttempts.countDown();
+      awaitRaceLatch(bothCreateAttempts, "both distinct transactions at the deterministic username create boundary");
+      if (transactionRole.equals("winner")) {
+        assertNull(accountsByUsername.putIfAbsent(username, winner),
+            "the actual first production addUser caller creates the only account");
+        successfulCreates.incrementAndGet();
+        return winner;
+      }
+      assertEquals("loser", transactionRole);
+      awaitRaceLatch(winnerConfigured, "production identity and enabled setters on the created winner");
+      assertSame(winner, accountsByUsername.putIfAbsent(username, winner),
+          "the losing deterministic-username create cannot replace the concurrent winner");
+      assertEquals(identity, winnerIdentity.get());
+      assertTrue(winnerEnabled.get());
+      throw new IllegalStateException("deterministic username uniqueness conflict");
+    });
+
+    var provider = new LosePendingAtConsumeAfterAcceptanceStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var winnerBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "distinct-winner-root", "distinct-winner-tab", BINDING.redirectUri(), IDP_ORIGIN);
+    var loserBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "distinct-loser-root", "distinct-loser-tab", BINDING.redirectUri(), IDP_ORIGIN);
+    var winningTransaction = store.issue(winnerBinding, WalletLoginTransactionStore.Intent.SIGNUP);
+    var losingTransaction = store.issue(loserBinding, WalletLoginTransactionStore.Intent.SIGNUP);
+    provider.loseOnConsume(losingTransaction.handle());
+    byte[] winnerProof = signedProof(winningTransaction.challenge(), identity, keyPair);
+    byte[] loserProof = signedProof(losingTransaction.challenge(), identity, keyPair);
+    var accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueEnabledMapping(users, realm, exactIdentityId);
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, exactIdentityId);
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.ensureEnabledUser(users, realm, exactIdentityId, true);
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, accounts, true);
+    var executor = Executors.newFixedThreadPool(2);
+    try {
+      var winningRequest = executor.submit(() -> {
+        caller.set("winner");
+        try {
+          return handler.submitProof(winningTransaction.handle(), null, null, null, null,
+              "application/json", null, winnerProof, IDP_ORIGIN);
+        } finally { caller.remove(); }
+      });
+      var losingRequest = executor.submit(() -> {
+        caller.set("loser");
+        try {
+          return handler.submitProof(losingTransaction.handle(), null, null, null, null,
+              "application/json", null, loserProof, IDP_ORIGIN);
+        } finally { caller.remove(); }
+      });
+
+      var winningResponse = winningRequest.get(15, TimeUnit.SECONDS);
+      var losingResponse = losingRequest.get(15, TimeUnit.SECONDS);
+      assertEquals(202, winningResponse.status());
+      assertEquals(409, losingResponse.status());
+      assertEquals(Map.of(), losingResponse.body(), "the consume loser returns no acceptance data or code");
+      assertFalse(losingResponse.headers().containsKey("Location"));
+      assertNotEquals(winningTransaction.handle(), losingTransaction.handle());
+      assertNotEquals(winnerBinding.rootSessionId(), loserBinding.rootSessionId());
+      assertEquals(5, searchesByCaller.get("winner").get(),
+          "winner completes three empty pre-create lookups, post-create readback, and handler recheck");
+      assertEquals(5, searchesByCaller.get("loser").get(),
+          "loser completes three empty pre-create lookups, conflict readback, and handler recheck");
+      assertTrue(provider.losingConsumeWasInjected.get(),
+          "the losing pending key is removed only when its production consume reaches the provider");
+      assertTrue(store.getAccepted(winningTransaction.handle(), winnerBinding).isPresent());
+      assertTrue(store.callbackGateAvailable(winningTransaction.handle(), winnerBinding));
+      assertFalse(store.getAccepted(losingTransaction.handle(), loserBinding).isPresent());
+      assertFalse(store.callbackGateAvailable(losingTransaction.handle(), loserBinding));
+      assertTrue(store.load(losingTransaction.handle()).isEmpty());
+      assertEquals(404, handler.getStatus(losingTransaction.handle(), null, "same-origin",
+          "cors", "empty", losingTransaction.csrfToken(), IDP_ORIGIN, loserBinding).status());
+      assertEquals(404, handler.submitProof(losingTransaction.handle(), null, null, null, null,
+          "application/json", null, loserProof, IDP_ORIGIN).status());
+
+      assertEquals(2, createAttempts.get(), "both transactions reached the actual addUser boundary");
+      assertEquals(1, successfulCreates.get(), "one exact local user is created");
+      assertEquals(1, accountsByUsername.size());
+      assertSame(winner, accountsByUsername.get(username));
+      assertEquals(identity, winnerIdentity.get());
+      assertTrue(winnerEnabled.get());
+      org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).removeUser(
+          org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.any());
+
+      var freshBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+          "fresh-signup-root", "fresh-signup-tab", BINDING.redirectUri(), IDP_ORIGIN);
+      var freshTransaction = store.issue(freshBinding, WalletLoginTransactionStore.Intent.SIGNUP);
+      byte[] freshProof = signedProof(freshTransaction.challenge(), identity, keyPair);
+      caller.set("fresh");
+      WalletLoginTransportHandler.HttpResult freshResponse;
+      try {
+        freshResponse = handler.submitProof(freshTransaction.handle(), null, null, null, null,
+            "application/json", null, freshProof, IDP_ORIGIN);
+      } finally { caller.remove(); }
+      assertEquals(202, freshResponse.status());
+      assertSame(winner, accountsByUsername.get(username));
+      assertEquals(2, createAttempts.get(), "fresh explicit signup resolves the exact winner without another create");
+      assertTrue(store.getAccepted(freshTransaction.handle(), freshBinding).isPresent());
+      assertTrue(store.callbackGateAvailable(freshTransaction.handle(), freshBinding));
+    } finally {
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS), "race executor terminates within the bound");
+    }
+  }
+
   // Single-process handler concurrency only; the in-memory provider is not a Keycloak store.
   @Test
   void concurrentSignupSubmissionsForOneHandleAllowOnlyTheAdmittedHandlerToProvision() throws Exception {
@@ -1829,6 +2001,40 @@ final class WalletLoginTransportHandlerTest {
       throw new AssertionError(impossible);
     }
   }
+  private static void awaitRaceLatch(CountDownLatch latch, String description) {
+    try {
+      assertTrue(latch.await(10, TimeUnit.SECONDS), "timed out waiting for " + description);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("interrupted waiting for " + description, interrupted);
+    }
+  }
+
+  private static final class LosePendingAtConsumeAfterAcceptanceStore extends MemoryStore {
+    private final AtomicReference<String> losingTransactionKey = new AtomicReference<>();
+    private final AtomicBoolean losingConsumeWasInjected = new AtomicBoolean();
+    private final CountDownLatch acceptedReceiptPublished = new CountDownLatch(1);
+
+    void loseOnConsume(String handle) { losingTransactionKey.set(transactionKey(handle)); }
+
+    @Override public boolean replace(String key, Map<String, String> notes) {
+      boolean replaced = super.replace(key, notes);
+      if (replaced && key.startsWith("decent-wallet-login-v1:accepted:")) {
+        acceptedReceiptPublished.countDown();
+      }
+      return replaced;
+    }
+
+    @Override public Map<String, String> remove(String key) {
+      if (key.equals(losingTransactionKey.get()) && losingConsumeWasInjected.compareAndSet(false, true)) {
+        awaitRaceLatch(acceptedReceiptPublished, "the other transaction's accepted receipt");
+        assertNotNull(super.remove(key), "the loser pending key exists until its consume boundary");
+        return null;
+      }
+      return super.remove(key);
+    }
+  }
+
   private static byte[] rawKey(KeyPair pair) {
     byte[] encoded = pair.getPublic().getEncoded();
     return java.util.Arrays.copyOfRange(encoded, encoded.length - 32, encoded.length);
