@@ -657,6 +657,13 @@ def checkpoint_signup_stage(result, stage, fields, checkpoint):
   checkpoint()
 
 
+def merge_issue7_checkpoint(result, evidence_key, evidence, checkpoint):
+  current = dict(result.get(evidence_key, {}))
+  current.update(evidence)
+  result[evidence_key] = current
+  checkpoint()
+
+
 def checkpoint_live_case(result, case_name, fields, checkpoint):
   if case_name not in {
       'rotated_identity_case', 'ambiguous_account_case', 'unmapped_account_case',
@@ -1095,6 +1102,9 @@ def sanitize_live_checkpoint(candidate):
           'user_readback_fault_mode': {'empty', 'throw', 'over-cap'},
           'effective_user_readback_fault_mode': {'empty', 'throw', 'over-cap'},
           'fault_evidence_provenance': {'wrapper-mediated-application-path'},
+      'failure_stage': issue7_store_recovery.FAILURE_STAGES,
+      'failure_gate': issue7_store_recovery.FAILURE_GATES,
+      'failure_category': issue7_store_recovery.FAILURE_CATEGORIES,
       }
       booleans = {'same_local_subject', 'browser_status_pending',
           'failure_responses_no_callback_or_code', 'account_retained_after_failure',
@@ -1102,7 +1112,8 @@ def sanitize_live_checkpoint(candidate):
           'fresh_signup_reused_account'}
       statuses = {'provider_fault_http', 'browser_status_http', 'fresh_signup_proof_http',
           'fresh_signup_callback_http', 'fresh_signup_pkce_token_http',
-          'signup_intent_action_http', 'signup_proof_http', 'callback_http', 'pkce_token_http'}
+          'signup_intent_action_http', 'signup_proof_http', 'failure_http_status',
+          'callback_http', 'pkce_token_http'}
       safe = {}
       for field, item in value.items():
         if field in enums and isinstance(item, str) and item in enums[field]:
@@ -2090,13 +2101,23 @@ class BareLocalClient(Client):
       return error.code, error.headers, error.read()
 
 
-def require(condition, stage, code=None, *, failure_gate=None):
+def require(condition, stage, code=None, *, failure_gate=None, http_status=None):
   if not condition:
-    message = f'acceptance probe failed at {stage}' + (f' (HTTP {code})' if code else '')
+    valid_http_status = type(http_status) is int and 100 <= http_status <= 599
+    detail = f' (HTTP {http_status})' if valid_http_status else (
+        f' (code {code})' if type(code) is int else '')
+    message = f'acceptance probe failed at {stage}' + detail
     active = _ACTIVE_AUTH_FLOW_ATTEMPT
-    if active is not None:
-      raise active.failure(message, gate=failure_gate)
-    raise RuntimeError(message)
+    failure = active.failure(message, gate=failure_gate) if active is not None else RuntimeError(message)
+    failure_stage, contextual_gate = issue7_store_recovery.FAILURE_CONTEXTS.get(
+        stage, ('signup_flow', 'unclassified'))
+    explicit_gate = failure_gate if failure_gate in issue7_store_recovery.FAILURE_GATES else None
+    setattr(failure, 'failure_stage', failure_stage)
+    setattr(failure, 'failure_gate', explicit_gate or contextual_gate)
+    setattr(failure, 'failure_category', 'assertion_failed')
+    if type(http_status) is int and 100 <= http_status <= 599:
+      setattr(failure, 'failure_http_status', http_status)
+    raise failure
 
 
 def start_registry(temp, image, run_seconds=300):
@@ -3161,7 +3182,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
     print('wallet_proof_failure_categories=' + json.dumps(
         wallet_transport_log_categories(container), sort_keys=True))
   require(submitted == 202 and json.loads(accepted).get('status') == 'pending',
-      'valid wallet proof POST', submitted, failure_gate='proof_post')
+      'valid wallet proof POST', submitted, failure_gate='proof_post', http_status=submitted)
   diagnostic = run(['podman', 'logs', '--tail', '80', container], timeout=15)
   print('diagnostic-log-lines:', len(diagnostic.stdout.splitlines()))
   for line in diagnostic.stdout.splitlines():
@@ -3171,7 +3192,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   report_progress('fresh_identical_retry', fresh_retry_http=retried)
   record_auth_flow_outcome('identical_retry_http', retried)
   require(retried == 202 and json.loads(retry_raw).get('status') == 'accepted',
-      'identical native proof retry', retried, failure_gate='identical_retry')
+      'identical native proof retry', retried, failure_gate='identical_retry', http_status=retried)
   accepted_by_browser, _, browser_retry_body = client.request('POST', locator, proof,
       {'Content-Type': 'application/json', 'X-Decent-CSRF': browser_csrf,
        'Origin': WALLET_ORIGIN, 'Sec-Fetch-Site': 'cross-site',
@@ -3207,7 +3228,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   record_auth_flow_outcome('changed_retry_http', changed)
   report_progress('fresh_changed_retry', fresh_changed_retry_http=changed)
   require(changed == 409, 'changed-signature proof replay denied', changed,
-      failure_gate='changed_retry')
+      failure_gate='changed_retry', http_status=changed)
   oversized_status, oversized_headers, _ = wallet.request('POST', locator,
       b' ' * 8193, {'Content-Type': 'application/json'})
   require_transport_security_headers(oversized_headers, 'oversized native proof security headers')
@@ -3225,7 +3246,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
           and initial_status_accepted)
   record_auth_flow_outcome('initial_status_accepted', initial_status_accepted)
   require(initial_status_accepted, 'initiating browser observes accepted receipt and callback',
-      polled, failure_gate='proof_status')
+      polled, failure_gate='proof_status', http_status=polled)
   status_obj = json.loads(status_raw)
   callback = status_obj.get('callback')
   require(callback and callback.startswith(f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/'),
@@ -3253,9 +3274,9 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   require(callback_status in {302, 303} and callback_target_matches and callback_state_matches
       and not callback_error_returned,
       'OIDC callback uses registered redirect URI and preserves state', callback_status,
-      failure_gate='callback')
+      failure_gate='callback', http_status=callback_status)
   require(code is not None, 'Keycloak callback returns exactly one authorization code', callback_status,
-      failure_gate='callback')
+      failure_gate='callback', http_status=callback_status)
   replay_login_errors_before = None
   if admin_access_token is not None:
     try:
@@ -3405,7 +3426,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
     print('callback_replay_diagnostic=' + json.dumps(safe_replay_fields, sort_keys=True))
   require(callback_replay['replay_denied_safely'],
       'consumed callback replay is denied without an authorization code',
-      repeated_status, failure_gate='callback_replay')
+      repeated_status, failure_gate='callback_replay', http_status=repeated_status)
   status_after_callback, _, status_after_callback_raw = client.request(
       'GET', status_url, headers=poll_headers)
   status_after_callback_safe = status_after_callback == 404 and b'callback' not in status_after_callback_raw.lower()
@@ -3413,7 +3434,7 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   record_auth_flow_outcome('status_after_callback_safe', status_after_callback_safe)
   require(status_after_callback_safe,
       'consumed callback is no longer advertised by browser status',
-      status_after_callback, failure_gate='status_after_callback')
+      status_after_callback, failure_gate='status_after_callback', http_status=status_after_callback)
   form = urllib.parse.urlencode({'grant_type': 'authorization_code', 'client_id': CLIENT,
       'code': code, 'redirect_uri': REDIRECT, 'code_verifier': verifier}).encode()
   token_status, _, token_raw = client.request('POST',
@@ -3421,7 +3442,8 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
       {'Content-Type': 'application/x-www-form-urlencoded'})
   record_auth_flow_outcome('pkce_token_http', token_status)
   report_progress('fresh_pkce', pkce_token_http=token_status)
-  require(token_status == 200, 'OIDC Code+PKCE token exchange', token_status, failure_gate='pkce')
+  require(token_status == 200, 'OIDC Code+PKCE token exchange', token_status,
+      failure_gate='pkce', http_status=token_status)
   id_token = json.loads(token_raw)['id_token']
   pieces = id_token.split('.')
   require(len(pieces) == 3, 'ID token shape')
@@ -4541,7 +4563,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'code_challenge': code_challenge, 'code_challenge_method': 'S256',
   })
   status, _, page = client.request('GET', f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
-  require(status == 200, 'signup login page', status)
+  require(status == 200, 'signup login page', status, http_status=status)
   text = page.decode('utf-8', errors='strict')
   parser = LoginPageParser(); parser.feed(text)
   locator = ''.join(parser.locator_parts).strip()
@@ -4571,7 +4593,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     print('signup-action-diagnostics:', json.dumps(
         sanitize_signup_action_diagnostics(signup_page, logs.stdout), sort_keys=True))
   progress('intent', {'signup_intent_action_http': action_status})
-  require(action_status == 200, 'Keycloak action records signup intent and restarts wallet flow', action_status)
+  require(action_status == 200, 'Keycloak action records signup intent and restarts wallet flow',
+      action_status, http_status=action_status)
   signup_text = signup_page.decode('utf-8', errors='strict')
   require('Creating a new account with this wallet identity.' in signup_text,
       'fresh wallet transaction is bound to signup intent')
@@ -4584,7 +4607,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     raise RuntimeError('acceptance probe failed at signup transaction binding')
   wallet = Client()
   challenge_status, _, challenge_raw = wallet.request('GET', signup_locator)
-  require(challenge_status == 200, 'signup native challenge GET')
+  require(challenge_status == 200, 'signup native challenge GET', http_status=challenge_status)
   envelope = json.loads(challenge_raw)
   signing_input = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
       'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode()
@@ -4649,7 +4672,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     progress('proof', {'signup_proof_http': proof_status,
         'failure_responses_no_callback_or_code': failure_safe})
     require(proof_status == 503 and failure_safe,
-        'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code', proof_status)
+        'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code',
+        proof_status, http_status=proof_status)
     exact_users = json.loads(admin_call(admin_client, admin, 'GET',
         f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
     matched = [user for user in exact_users
@@ -4668,7 +4692,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     pending = browser_status_is_pending(polled, status_body) and status_redirects_safe
     progress('proof', {'signup_proof_http': proof_status, 'browser_status_http': polled,
         'browser_status_pending': pending})
-    require(pending, 'failed signup browser status remains pending and exposes no callback or code', polled)
+    require(pending, 'failed signup browser status remains pending and exposes no callback or code',
+        polled, http_status=polled)
     progress('proof', {'user_readback_factory_selected': factory_selected,
         'effective_user_readback_fault_mode': effective_fault_mode,
         'post_create_read_fault_observed': diagnostics['post_create_read_fault_count'] > 0,
@@ -4688,7 +4713,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
         'fresh_signup_reused_account': False,
         'correlated_mapping_failure_count': diagnostics['correlated_mapping_failure_count'],
         'expected_existing_subject': matched[0]['id']}
-  require(proof_status == 202, 'signup proof provisions exact account before pending consume', proof_status)
+  require(proof_status == 202, 'signup proof provisions exact account before pending consume',
+      proof_status, http_status=proof_status)
   exact_users = json.loads(admin_call(admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   matched = [user for user in exact_users
@@ -4700,7 +4726,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   browser_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
   polled, _, polled_raw = client.request('GET', status_url.group(1), headers=browser_headers)
-  require(polled == 200, 'signup initiating browser observes bound acceptance', polled)
+  require(polled == 200, 'signup initiating browser observes bound acceptance',
+      polled, http_status=polled)
   status_body = json.loads(polled_raw)
   require(status_body.get('status') == 'accepted',
       'signup browser acceptance is bound to the initiating session')
@@ -4743,7 +4770,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
             'status', 'content_type', 'location_path', 'forms', 'field_errors')}, sort_keys=True))
   progress('callback', {'callback_http': callback_status})
   require(callback_status in (302, 303) and code,
-      'callback, OIDC state, and no-code replay', callback_status)
+      'callback, OIDC state, and no-code replay', callback_status, http_status=callback_status)
   location_query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
   require(location_query.get('state') == [state], 'signup callback preserves OIDC state')
   replay_status, replay_headers, _ = client.request('GET', status_callback)
@@ -4758,7 +4785,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
           'redirect_uri':REDIRECT,'code_verifier':verifier}).encode(),
       {'Content-Type':'application/x-www-form-urlencoded'})
   progress('token', {'pkce_token_http': token_status})
-  require(token_status == 200, 'signup authorization code exchanges with PKCE', token_status)
+  require(token_status == 200, 'signup authorization code exchanges with PKCE', token_status,
+      http_status=token_status)
   claims = verify_id_token(client, json.loads(token_raw)['id_token'], key.parent)
   require(claims.get('sub') == matched[0].get('id'), 'signup returns created opaque Keycloak subject')
   require(claims.get('decent_identity_id') == identifier,
@@ -4772,9 +4800,14 @@ def run_issue7_single_node_signup_recovery_profile(client, key, identifier, cont
   phase = 'faulted_signup'
   def phase_progress(stage, fields):
     progress(phase, fields)
-  failed = signup_wallet_flow(client, key, identifier, container, admin_client,
-      phase_progress, image, expect_user_readback_fault=True,
-      expected_fault_mode=user_readback_fault_mode(profile))
+  try:
+    failed = signup_wallet_flow(client, key, identifier, container, admin_client,
+        phase_progress, image, expect_user_readback_fault=True,
+        expected_fault_mode=user_readback_fault_mode(profile))
+  except Exception as failure:
+    issue7_store_recovery.checkpoint_signup_failure(checkpoint, failure,
+        mode_field='user_readback_fault_mode', mode=user_readback_fault_mode(profile))
+    raise
   wait_for_identity_lookup_cooldown()
   phase = 'fresh_signup'
   recovered = signup_wallet_flow(Client(), key, identifier, container, admin_client,
@@ -6225,8 +6258,7 @@ def main():
           require('issue7-fault-injection' in runtime_provenance.get('single_use_object_provider_ids', []),
               'dedicated store fault provider is registered')
           def save_store_checkpoint(evidence):
-            result['issue7_store_recovery'] = evidence
-            checkpoint()
+            merge_issue7_checkpoint(result, 'issue7_store_recovery', evidence, checkpoint)
           def store_progress(stage, fields):
             current = dict(result['issue7_store_recovery'])
             current.update(fields)
@@ -6266,8 +6298,7 @@ def main():
             result['issue7_single_node_signup_recovery'] = current
             checkpoint()
           def save_issue7_checkpoint(evidence):
-            result['issue7_single_node_signup_recovery'] = evidence
-            checkpoint()
+            merge_issue7_checkpoint(result, 'issue7_single_node_signup_recovery', evidence, checkpoint)
           handlers = {
               profile_name: lambda profile_name=profile_name: run_issue7_single_node_signup_recovery_profile(
                   Client(), key, identifier, container, client, IMAGE, progress,

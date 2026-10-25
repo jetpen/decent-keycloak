@@ -17,6 +17,35 @@ MARKERS = {
     'accepted-receipt-write': 'accepted receipt write committed then threw',
     'accepted-receipt-write-false': 'accepted receipt write returned false before commit',
 }
+FAILURE_STAGES = {'signup_flow', 'signup_proof', 'user_readback'}
+FAILURE_GATES = {'unclassified', 'proof_http_status', 'account_readback', 'proof_post',
+    'identical_retry', 'changed_retry', 'proof_status', 'callback', 'callback_replay',
+    'status_after_callback', 'pkce'}
+FAILURE_CATEGORIES = {'runtime_error', 'assertion_failed'}
+FAILURE_CONTEXTS = {
+    'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code':
+        ('signup_proof', 'proof_http_status'),
+    'post-create readback failure retains one exact enabled account':
+        ('user_readback', 'account_readback'),
+}
+
+
+def checkpoint_signup_failure(checkpoint, failure, *, mode_field, mode):
+  evidence = {
+      'stage': 'faulted_signup', 'scope': 'one-keycloak-node', mode_field: mode,
+      'failure_stage': getattr(failure, 'failure_stage', 'signup_flow'),
+      'failure_gate': getattr(failure, 'failure_gate', 'unclassified'),
+      'failure_category': getattr(failure, 'failure_category', 'runtime_error'),
+  }
+  status = getattr(failure, 'failure_http_status', None)
+  if type(status) is int and 100 <= status <= 599:
+    status_field = ('signup_proof_http' if evidence['failure_gate'] == 'proof_http_status'
+        else 'failure_http_status')
+    evidence[status_field] = status
+  try:
+    checkpoint(evidence)
+  except Exception:
+    failure.add_note('Issue #7 failure checkpoint could not be written')
 
 
 def diagnostics(logs, mode, request_id):
@@ -38,7 +67,8 @@ def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof
   """Validate original failure AND old status/retry; do not start recovery here."""
   status, headers, body = proof_response
   api.require(status == 503 and api.failure_response_has_no_callback_or_code(
-      body, headers, proof_redirects), 'store fault denies proof without body, redirect, callback or code', status)
+      body, headers, proof_redirects), 'store fault denies proof without body, redirect, callback or code',
+      status, http_status=status)
   browser_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf}
   for requester, method, url, data, request_headers in (
@@ -48,7 +78,8 @@ def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof
     polled, response_headers, raw = requester.request(method, url, data, headers=request_headers)
     api.require(polled == 404 and api.failure_response_has_no_callback_or_code(
         raw, response_headers, requester.redirects[before:]),
-        'consumed transaction status and retry deny all receipt/callback/code disclosure', polled)
+        'consumed transaction status and retry deny all receipt/callback/code disclosure',
+        polled, http_status=polled)
   handle = urllib.parse.urlsplit(locator).path.rsplit('/', 1)[-1]
   request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
   facts = diagnostics(api.read_provider_fault_log_window(container, log_cursor), mode, request_id)
@@ -70,8 +101,12 @@ def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof
 
 def run(api, client, key, identifier, container, admin_client, image, progress, checkpoint, profile):
   mode = PROFILES[profile]
-  failed = api.signup_wallet_flow(client, key, identifier, container, admin_client,
-      progress, image, store_fault_mode=mode)
+  try:
+    failed = api.signup_wallet_flow(client, key, identifier, container, admin_client,
+        progress, image, store_fault_mode=mode)
+  except Exception as failure:
+    checkpoint_signup_failure(checkpoint, failure, mode_field='store_fault_mode', mode=mode)
+    raise
   # Defense in depth at the coordinator seam, before another ceremony is possible.
   api.require(failed.get('failure_responses_no_callback_or_code') is True
       and failed.get('account_retained_after_failure') is True
@@ -125,12 +160,15 @@ def sanitize(value):
   enums = {'stage': {'setup', 'faulted_signup', 'recovery', 'complete'},
       'scope': {'one-keycloak-node'}, 'store_fault_mode': set(PROFILES.values()),
       'recovery_intent': {'signup', 'login'},
-      'fault_evidence_provenance': {'wrapper-mediated-application-path'}}
+      'fault_evidence_provenance': {'wrapper-mediated-application-path'},
+      'failure_stage': FAILURE_STAGES, 'failure_gate': FAILURE_GATES,
+      'failure_category': FAILURE_CATEGORIES}
   booleans = {'same_local_subject', 'failure_responses_no_callback_or_code',
       'account_retained_after_failure', 'store_provider_selected'}
   counts = {'store_fault_count', 'correlated_store_failure_count', 'exact_mapped_users',
       'keycloak_node_count', 'fresh_explicit_signup_transactions', 'fresh_login_transactions'}
-  statuses = {'signup_proof_http', 'browser_status_http', 'retry_http', 'callback_http', 'pkce_token_http'}
+  statuses = {'signup_proof_http', 'failure_http_status', 'browser_status_http',
+      'retry_http', 'callback_http', 'pkce_token_http', 'signup_intent_action_http'}
   safe = {}
   for field, item in value.items():
     if field in enums and isinstance(item, str) and item in enums[field]:
