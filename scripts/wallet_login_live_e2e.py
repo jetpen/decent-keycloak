@@ -1332,7 +1332,7 @@ def remove_owned_container(cid_file):
         re.IGNORECASE)
     absence_confirmed = (after.returncode != 0 and any(
         container_id in line and absence_marker.search(line) is not None
-        for line in after.stdout.splitlines()))
+        for line in subprocess_output_text(after).splitlines()))
     if not absence_confirmed:
       return {'removed': False, 'retained_cid': True}
   except (OSError, RuntimeError, subprocess.TimeoutExpired):

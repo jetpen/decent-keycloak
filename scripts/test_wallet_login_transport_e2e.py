@@ -474,17 +474,21 @@ class AuthStatusBindingProbeTest(unittest.TestCase):
       calls = []
       def fake_run(argv, **kwargs):
         calls.append(argv)
-        if argv[1] == 'inspect' and len(calls) == 1:
-          return subprocess.CompletedProcess(argv, 0, ('a' * 64) + '\n', '')
+        if argv[1] == 'inspect':
+          inspect_count = sum(call[1] == 'inspect' for call in calls)
+          if inspect_count <= 2:
+            return subprocess.CompletedProcess(argv, 0, ('a' * 64) + '\n', '')
+          return subprocess.CompletedProcess(argv, 125, '', 'Error: no such container ' + ('a' * 64))
         if argv[1] == 'rm':
           return subprocess.CompletedProcess(argv, 0, '', '')
-        return subprocess.CompletedProcess(argv, 125, '', 'Error: no such container ' + ('a' * 64))
+        raise AssertionError('unexpected Podman command')
       with patch.object(probe, 'RUN_CID_DIR', Path(scratch)), patch.object(probe, 'run', side_effect=fake_run):
         result = probe.remove_owned_container(cidfile)
       self.assertEqual({'removed': True, 'retained_cid': False}, result)
       self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], calls[0])
-      self.assertEqual(['podman', 'rm', '--force', 'a' * 64], calls[1])
-      self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], calls[2])
+      self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], calls[1])
+      self.assertEqual(['podman', 'rm', '--force', 'a' * 64], calls[2])
+      self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], calls[3])
       self.assertFalse(cidfile.exists())
 
   def test_owned_container_cleanup_retains_unverified_cidfile(self):

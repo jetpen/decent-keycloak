@@ -930,12 +930,15 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       cid_file = cid_dir / 'keycloak.cid'
       cid_file.write_text(container_id, encoding='ascii')
       calls = []
+      inspect_count = 0
       def fake_run(args, **_kwargs):
+        nonlocal inspect_count
         calls.append(args)
         if args[:3] == ['podman', 'inspect', '--format']:
-          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) == 1:
+          inspect_count += 1
+          if inspect_count <= 2:
             return SimpleNamespace(returncode=0, stdout=container_id + '\n')
-          return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + container_id)
+          return SimpleNamespace(returncode=1, stdout='', stderr='Error: no such container: ' + container_id)
         return SimpleNamespace(returncode=0, stdout='')
 
       with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
@@ -962,10 +965,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         nonlocal inspect_count
         if args[:3] == ['podman', 'inspect', '--format']:
           inspect_count += 1
-          if inspect_count == 1:
+          if inspect_count <= 2:
             return SimpleNamespace(returncode=0, stdout=container_id + '\n')
-          return SimpleNamespace(returncode=1,
-              stdout='Error: no such object: "' + container_id + '"')
+          return SimpleNamespace(returncode=1, stdout='', stderr='Error: no such object: "' + container_id + '"')
         cid_file.unlink(missing_ok=True)
         return SimpleNamespace(returncode=0, stdout='')
 
