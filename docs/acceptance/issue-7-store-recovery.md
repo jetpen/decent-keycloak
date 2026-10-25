@@ -43,9 +43,13 @@ Account creation and gate/receipt publication are not a compound atomic transact
 retained account after failure is expected; do not delete it or a possibly concurrent winner.
 Users start the indicated fresh ceremony; operators inspect exact enabled mappings without
 resetting consumed gates. Empty/unavailable/over-cap readback profiles already on main remain
-separate and unchanged. This candidate does not qualify restart persistence, JPA, actual
-concurrent winners, consume-loser interleaving, or application/provider atomicity across nodes.
-Unsupported loser/concurrent modes fail closed before external setup; they are not aliases.
+separate and unchanged. The offline Java suite now includes a local handler characterization of
+two distinct signup transactions racing to create the same account, followed by a store-level
+consume-loser interleaving after the other transaction publishes its accepted receipt and a
+fresh-signup reuse (see `issue-7-safe-retry-boundary.md`). It does not qualify restart persistence,
+actual Keycloak/JPA/provider winner or consume-loss behavior, real provider atomicity, or
+distributed guarantees. Unsupported live loser/concurrent modes fail closed before external
+setup; they are not aliases.
 
 ## Test-only artifact and invocation (not executed here)
 
