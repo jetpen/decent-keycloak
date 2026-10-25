@@ -84,6 +84,7 @@ jobs:
           scripts.test_owner_rotation_envelope
           scripts.test_live_gate_order
           scripts.test_registry_acceptance_matrix
+          scripts.test_issue7_user_readback_profile
           scripts.test_acceptance_ledger
           scripts.test_acceptance_workflow
           scripts.test_issue6_single_node_profile

@@ -17,12 +17,156 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SCRATCH = os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch'))
 RESOLVER_WRAPPER = '/opt/decent-resolver/bin/decent-identity'
+ISSUE7_USER_READBACK_PROFILE = 'issue7-user-readback-empty'
+ISSUE7_USER_READBACK_OVERCAP_PROFILE = 'issue7-user-readback-overcap'
+ISSUE7_USER_READBACK_THROW_PROFILE = 'issue7-user-readback-throw'
+ISSUE7_USER_READBACK_FAULT_MODES = {
+    ISSUE7_USER_READBACK_PROFILE: 'empty',
+    ISSUE7_USER_READBACK_OVERCAP_PROFILE: 'over-cap',
+    ISSUE7_USER_READBACK_THROW_PROFILE: 'throw',
+}
+SUPPORTED_LIVE_PROFILES = {
+    'default', 'expiry', 'provider-not-found-diagnostic',
+    'issue6-single-node', 'issue6-auth-flow',
+    'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure',
+    *ISSUE7_USER_READBACK_FAULT_MODES,
+}
+
+
+def selected_live_profile():
+  profile = os.environ.get('WALLET_IT_PROFILE', 'default')
+  if profile not in SUPPORTED_LIVE_PROFILES:
+    raise ValueError('unsupported WALLET_IT_PROFILE value; supported values: '
+        + ', '.join(sorted(SUPPORTED_LIVE_PROFILES)))
+  return profile
+
+
+def dispatch_live_profile(profile, handlers):
+  """Select exactly one explicitly allowlisted live branch; unknown values fail closed."""
+  if profile not in SUPPORTED_LIVE_PROFILES or profile not in handlers:
+    raise ValueError('unsupported WALLET_IT_PROFILE value; supported values: '
+        + ', '.join(sorted(SUPPORTED_LIVE_PROFILES)))
+  return handlers[profile]()
+
+
+def user_readback_fault_mode(profile):
+  try:
+    return ISSUE7_USER_READBACK_FAULT_MODES[profile]
+  except KeyError as error:
+    raise ValueError('profile has no UserProvider fault mode') from error
+
+
+def add_test_user_readback_fault_args(command, image, mode):
+  if mode not in {'empty', 'throw', 'over-cap'}:
+    raise ValueError('unsupported UserProvider fault mode')
+  command.extend(['--env', 'ISSUE7_USER_READBACK_FAULT_MODE=' + mode, image, 'start-dev'])
+
+
+def utc_log_cursor():
+  return datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+
+
+def _bounded_command_tail(args, timeout: float = 15, max_bytes=65536):
+  """Drain a child fully while retaining only a strict byte-bounded output tail."""
+  if timeout <= 0 or max_bytes < 1:
+    raise ValueError('timeout and max_bytes must be positive')
+  process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+  if process.stdout is None:
+    process.kill()
+    process.wait()
+    raise RuntimeError('subprocess output pipe is unavailable')
+  fd = process.stdout.fileno()
+  os.set_blocking(fd, False)
+  retained = bytearray()
+  deadline = time.monotonic() + timeout
+  try:
+    while True:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        raise subprocess.TimeoutExpired(args, timeout)
+      readable, _, _ = select.select([fd], [], [], min(remaining, 0.2))
+      if readable:
+        chunk = os.read(fd, 8192)
+        if not chunk:
+          break
+        retained.extend(chunk)
+        if len(retained) > max_bytes:
+          del retained[:-max_bytes]
+      elif process.poll() is not None:
+        break
+    return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    return subprocess.CompletedProcess(args, return_code,
+        retained.decode('utf-8', errors='replace'))
+  except BaseException:
+    if process.poll() is None:
+      process.kill()
+    process.wait()
+    raise
+  finally:
+    process.stdout.close()
+
+
+def read_provider_fault_log_tail(container_id):
+  if not isinstance(container_id, str) or re.fullmatch(r'[0-9a-f]{64}', container_id) is None:
+    raise ValueError('container ID is invalid')
+  logs = _bounded_command_tail(['podman', 'logs', '--tail', '160', container_id])
+  return logs.stdout if logs.returncode == 0 else ''
+
+
+def read_provider_fault_log_window(container_id, cursor):
+  """Read a bounded per-run log window; do not serialize raw lines or identifiers."""
+  if not isinstance(container_id, str) or re.fullmatch(r'[0-9a-f]{64}', container_id) is None:
+    raise ValueError('container ID is invalid')
+  if not isinstance(cursor, str) or not re.fullmatch(
+      r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z', cursor):
+    raise ValueError('invalid UTC log cursor')
+  logs = _bounded_command_tail(
+      ['podman', 'logs', '--since', cursor, '--tail', '160', container_id])
+  return logs.stdout if logs.returncode == 0 else ''
+
+
+def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
+  """Project a byte-bounded log window into allowlisted counts and fault-mode enum."""
+  if not isinstance(logs, str):
+    logs = ''
+  factory = 'ISSUE7_USER_READBACK_PROVIDER: factory selected' in logs
+  modes = [mode for mode in {'empty', 'throw', 'over-cap'}
+      if f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}' in logs]
+  effective_mode = modes[0] if len(modes) == 1 else None
+  fault_count = logs.count('ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted')
+  failure_count = 0
+  if expected_request_id and re.fullmatch(r'[0-9a-f]{32}', expected_request_id):
+    needle = (f'Wallet account mapping lookup unavailable (request={expected_request_id}, '
+        'IdentityMappingUnavailableException)')
+    failure_count = min(5, logs.count(needle))
+  return {'factory_selected': factory,
+      'effective_fault_mode': effective_mode,
+      'post_create_read_fault_count': min(5, fault_count),
+      'correlated_mapping_failure_count': min(5, failure_count)}
+
+
+def failure_response_has_no_callback_or_code(body, headers, redirects=()):
+  if body not in (b'', '') or redirects is None or bool(redirects):
+    return False
+  normalized = {str(name).lower(): value for name, value in headers.items()}
+  return not normalized.get('location') and not any(
+      name in {'callback', 'code', 'authorization'} for name in normalized)
+
+
+def browser_status_is_pending(status, body):
+  try:
+    data = json.loads(body)
+  except (TypeError, ValueError):
+    return False
+  return (status == 200 and isinstance(data, dict) and data.get('status') == 'pending'
+      and not any(key in data for key in ('callback', 'callback_url', 'code', 'authorization_code')))
 REQUIRED_SINGLE_USE_OBJECT_PROVIDER_ID = 'infinispan'
 ISSUE6_POSTCONSUME_TEST_PROVIDER_ID = 'issue6-postconsume-receipt-failure'
 ISSUE6_CALLBACK_GATE_TEST_PROVIDER_ID = 'issue6-postconsume-callback-gate-failure'
@@ -662,6 +806,7 @@ def sanitize_live_checkpoint(candidate):
       'issue6_postconsume_receipt_recovery',
       'issue6_postconsume_callback_gate_failure_case',
       'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
+      'issue7_single_node_signup_recovery',
   }
   signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
@@ -931,6 +1076,49 @@ def sanitize_live_checkpoint(candidate):
         safe_matrix[case_name] = {'attempts': safe_attempts}
       if safe_matrix:
         projected[key] = safe_matrix
+    if key == 'issue7_single_node_signup_recovery':
+      stages = {'setup', 'resolver_tools_starting', 'resolver_tools_started',
+          'registry_starting', 'registry_started', 'identity_writing', 'identity_ready',
+          'keycloak_starting', 'keycloak_started', 'runtime_verifying', 'runtime_verified',
+          'realm_configuring', 'realm_configured', 'events_configuring', 'events_configured',
+          'faulted_signup', 'fresh_signup', 'complete'}
+      enums = {
+          'scope': {'one-keycloak-node'},
+          'stage': stages,
+          'user_readback_fault_mode': {'empty', 'throw', 'over-cap'},
+          'effective_user_readback_fault_mode': {'empty', 'throw', 'over-cap'},
+          'fault_evidence_provenance': {'wrapper-mediated-application-path'},
+      }
+      booleans = {'same_local_subject', 'browser_status_pending',
+          'failure_responses_no_callback_or_code', 'account_retained_after_failure',
+          'user_readback_factory_selected', 'post_create_read_fault_observed',
+          'fresh_signup_reused_account'}
+      statuses = {'provider_fault_http', 'browser_status_http', 'fresh_signup_proof_http',
+          'fresh_signup_callback_http', 'fresh_signup_pkce_token_http',
+          'signup_intent_action_http', 'signup_proof_http', 'callback_http', 'pkce_token_http'}
+      safe = {}
+      for field, item in value.items():
+        if field in enums and isinstance(item, str) and item in enums[field]:
+          safe[field] = item
+        elif field in booleans and type(item) is bool:
+          safe[field] = item
+        elif field in statuses and type(item) is int and 100 <= item <= 599:
+          safe[field] = item
+        elif field == 'synthetic_candidate_count' and type(item) is int and 0 <= item <= 65:
+          safe[field] = item
+        elif (
+            field in {'correlated_mapping_failure_count', 'post_create_read_fault_count'}
+            and type(item) is int and 0 <= item <= 5):
+          safe[field] = item
+        elif field in {'keycloak_node_count', 'fresh_explicit_signup_transactions',
+            'exact_enabled_local_users', 'exact_mapped_users'} and type(item) is int and 0 <= item <= 2:
+          safe[field] = item
+        elif (field == 'exact_enabled_local_accounts_after_each_signup'
+            and isinstance(item, list) and len(item) == 2
+            and all(type(count) is int and 0 <= count <= 2 for count in item)):
+          safe[field] = item
+      if safe:
+        projected[key] = safe
       continue
     if key == 'missing_identity_case' and isinstance(value, dict):
       fields = {'cli_resolution', 'cli_exit', 'cli_output_categories', 'cli_output_shape',
@@ -2393,7 +2581,8 @@ def recover_keycloak_ownership(cidfile, returned_id, ownership_callback):
 
 
 def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, image,
-    ownership_callback=None, credential_status=None, single_use_object_provider=None):
+    ownership_callback=None, credential_status=None, single_use_object_provider=None,
+    user_readback_fault_mode=None):
   check = run(['ss', '-ltn', f'( sport = :{KC_PORT} )'], timeout=5)
   require('LISTEN' not in check.stdout, 'disposable Keycloak port available')
   env_fd, env_path = tempfile.mkstemp(prefix='wallet-login-admin-', suffix='.env', dir=SCRATCH)
@@ -2408,11 +2597,17 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, 
         'podman', 'run', '--detach', '--cidfile', str(cid_file), '--name', container, '--network', 'host',
         '--env-file', str(env_file),
         '--env', 'KC_BOOTSTRAP_ADMIN_USERNAME=wallet-admin',
-        image, 'start-dev', '--http-enabled=true', f'--http-port={KC_PORT}',
+    ]
+    if user_readback_fault_mode is not None:
+      add_test_user_readback_fault_args(cmd, image, user_readback_fault_mode)
+    else:
+      cmd.extend([image, 'start-dev'])
+    cmd.extend([
+        '--http-enabled=true', f'--http-port={KC_PORT}',
         '--http-relative-path=/auth', f'--hostname=https://idp.example:{KC_PORT}/auth',
         '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1', '--db=dev-file', '--cache=local',
         '--log-level=info,org.decentwallet.keycloak.wallet:DEBUG,org.keycloak.connections.infinispan.DefaultInfinispanConnectionProviderFactory:debug'
-    ]
+    ])
     if single_use_object_provider is not None:
       require(single_use_object_provider in ISSUE6_TEST_PROVIDER_IDS,
           'explicit test provider ID is allowlisted')
@@ -4314,7 +4509,8 @@ def signup_form_action(html_body, idp_origin, realm, required_action=False, prof
 
 
 
-def signup_wallet_flow(client, key, identifier, container, admin_client, progress, image):
+def signup_wallet_flow(client, key, identifier, container, admin_client, progress, image,
+    expect_user_readback_fault=False, reuse_existing=False, expected_fault_mode=None):
   verifier = b64url(secrets.token_bytes(32))
   code_challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
@@ -4387,17 +4583,92 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   existing_exact_users = [user for user in exact_users_before_proof
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
-  require(not existing_exact_users, 'no exact Keycloak account exists before signup proof')
-  proof_status, _, _ = wallet.request('POST', signup_locator, proof, {'Content-Type': 'application/json'})
+  if reuse_existing:
+    require(len(existing_exact_users) == 1 and existing_exact_users[0].get('enabled') is True,
+        'fresh explicit signup starts with one exact retained enabled account')
+    expected_subject = existing_exact_users[0].get('id')
+  else:
+    require(not existing_exact_users, 'no exact Keycloak account exists before signup proof')
+    expected_subject = None
+  factory_selected = False
+  effective_fault_mode = None
+  diagnostics = {'factory_selected': False, 'effective_fault_mode': None,
+      'post_create_read_fault_count': 0, 'correlated_mapping_failure_count': 0}
+  request_id = ''
+  log_cursor = ''
+  if expect_user_readback_fault:
+    startup_diagnostics = sanitize_user_readback_fault_diagnostics(
+        read_provider_fault_log_tail(container))
+    factory_selected = startup_diagnostics['factory_selected']
+    effective_fault_mode = startup_diagnostics['effective_fault_mode']
+    if expected_fault_mode not in {'empty', 'throw', 'over-cap'}:
+      raise ValueError('expected UserProvider fault mode is invalid')
+    handle = urllib.parse.urlsplit(signup_locator).path.rsplit('/', 1)[-1]
+    request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+    log_cursor = utc_log_cursor()
+  redirects_before_proof = len(wallet.redirects)
+  proof_status, proof_headers, proof_body = wallet.request('POST', signup_locator, proof,
+      {'Content-Type': 'application/json'})
+  redirects_after_proof = list(wallet.redirects[redirects_before_proof:])
+  if expect_user_readback_fault:
+    fault_logs = read_provider_fault_log_window(container, log_cursor)
+    diagnostics = sanitize_user_readback_fault_diagnostics(
+        fault_logs, expected_request_id=request_id)
   progress('proof', {'signup_proof_http': proof_status})
+  if expect_user_readback_fault:
+    failure_safe = failure_response_has_no_callback_or_code(
+        proof_body, proof_headers, redirects_after_proof)
+    progress('proof', {'signup_proof_http': proof_status,
+        'failure_responses_no_callback_or_code': failure_safe})
+    require(proof_status == 503 and failure_safe,
+        'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code', proof_status)
+    exact_users = json.loads(admin_call(admin_client, admin, 'GET',
+        f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
+    matched = [user for user in exact_users
+        if user.get('attributes', {}).get('decent_identity_id') == [identifier]
+        and user.get('enabled') is True and user.get('id')]
+    retained_account = len(matched) == 1
+    progress('proof', {'exact_mapped_users': len(matched),
+        'account_retained_after_failure': retained_account})
+    require(retained_account,
+        'post-create readback failure retains one exact enabled account')
+    status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
+    status_redirects_before = len(client.redirects)
+    polled, _, status_body = client.request('GET', status_url.group(1), headers=status_headers)
+    status_redirects_safe = len(client.redirects) == status_redirects_before
+    pending = browser_status_is_pending(polled, status_body) and status_redirects_safe
+    progress('proof', {'signup_proof_http': proof_status, 'browser_status_http': polled,
+        'browser_status_pending': pending})
+    require(pending, 'failed signup browser status remains pending and exposes no callback or code', polled)
+    progress('proof', {'user_readback_factory_selected': factory_selected,
+        'effective_user_readback_fault_mode': effective_fault_mode,
+        'post_create_read_fault_observed': diagnostics['post_create_read_fault_count'] > 0,
+        'post_create_read_fault_count': diagnostics['post_create_read_fault_count'],
+        'correlated_mapping_failure_count': diagnostics['correlated_mapping_failure_count']})
+    require(factory_selected and effective_fault_mode == expected_fault_mode
+        and diagnostics['post_create_read_fault_count'] == 1
+        and diagnostics['correlated_mapping_failure_count'] >= 1,
+        'faulted signup has selected mode, one provider read fault, and request-correlated mapping failure')
+    return {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
+        'exact_mapped_users': len(matched), 'browser_status_http': polled,
+        'browser_status_pending': True, 'failure_responses_no_callback_or_code': failure_safe,
+        'account_retained_after_failure': True, 'user_readback_factory_selected': True,
+        'effective_user_readback_fault_mode': effective_fault_mode,
+        'post_create_read_fault_observed': True,
+        'post_create_read_fault_count': diagnostics['post_create_read_fault_count'],
+        'fresh_signup_reused_account': False,
+        'correlated_mapping_failure_count': diagnostics['correlated_mapping_failure_count'],
+        'expected_existing_subject': matched[0]['id']}
   require(proof_status == 202, 'signup proof provisions exact account before pending consume', proof_status)
   exact_users = json.loads(admin_call(admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
   matched = [user for user in exact_users
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
   progress('account', {'exact_mapped_users': len(matched)})
-  require(len(matched) == 1 and matched[0].get('enabled'),
-      'signup provisioned exactly one enabled account with exact identity before consume')
+  require(len(matched) == 1 and matched[0].get('enabled') is True
+      and (expected_subject is None or matched[0].get('id') == expected_subject),
+      'signup has exactly one enabled exact account and a retry reuses the same subject')
   browser_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
   polled, _, polled_raw = client.request('GET', status_url.group(1), headers=browser_headers)
@@ -4465,7 +4736,53 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   require(claims.get('decent_identity_id') == identifier,
       'signup ID token contains exact signed wallet Identity claim')
   return {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
-      'exact_mapped_users': len(matched), 'pkce_token_http': token_status}
+      'exact_mapped_users': len(matched), 'pkce_token_http': token_status,
+      'callback_http': callback_status, 'local_subject': matched[0].get('id')}
+def run_issue7_single_node_signup_recovery_profile(client, key, identifier, container,
+    admin_client, image, progress, checkpoint, profile):
+  """Inject one post-create readback fault, then prove fresh signup reuses the account."""
+  phase = 'faulted_signup'
+  def phase_progress(stage, fields):
+    progress(phase, fields)
+  failed = signup_wallet_flow(client, key, identifier, container, admin_client,
+      phase_progress, image, expect_user_readback_fault=True,
+      expected_fault_mode=user_readback_fault_mode(profile))
+  wait_for_identity_lookup_cooldown()
+  phase = 'fresh_signup'
+  recovered = signup_wallet_flow(Client(), key, identifier, container, admin_client,
+      phase_progress, image, reuse_existing=True)
+  same_subject = (failed.get('expected_existing_subject') is not None
+      and recovered.get('local_subject') == failed.get('expected_existing_subject'))
+  require(same_subject, 'fresh signup reused the retained exact local account subject')
+  evidence = {
+      'stage': 'complete',
+      'scope': 'one-keycloak-node',
+      'keycloak_node_count': 1,
+      'fresh_explicit_signup_transactions': 2,
+      'exact_enabled_local_users': recovered['exact_mapped_users'],
+      'exact_enabled_local_accounts_after_each_signup': [
+          failed['exact_mapped_users'], recovered['exact_mapped_users']],
+      'same_local_subject': same_subject,
+      'user_readback_fault_mode': user_readback_fault_mode(profile),
+      'effective_user_readback_fault_mode': failed['effective_user_readback_fault_mode'],
+      'user_readback_factory_selected': failed['user_readback_factory_selected'],
+      'post_create_read_fault_observed': failed['post_create_read_fault_observed'],
+      'post_create_read_fault_count': failed['post_create_read_fault_count'],
+      'correlated_mapping_failure_count': failed['correlated_mapping_failure_count'],
+      'provider_fault_http': failed['signup_proof_http'],
+      'browser_status_http': failed['browser_status_http'],
+      'browser_status_pending': failed['browser_status_pending'],
+      'failure_responses_no_callback_or_code': failed['failure_responses_no_callback_or_code'],
+      'account_retained_after_failure': failed['account_retained_after_failure'],
+      'fresh_signup_proof_http': recovered['signup_proof_http'],
+      'fresh_signup_callback_http': recovered['callback_http'],
+      'fresh_signup_pkce_token_http': recovered['pkce_token_http'],
+      'fresh_signup_reused_account': True,
+      'synthetic_candidate_count': 65 if user_readback_fault_mode(profile) == 'over-cap' else 0,
+      'fault_evidence_provenance': 'wrapper-mediated-application-path',
+  }
+  checkpoint(evidence)
+  return evidence
 
 
 def provider_missing_identity_is_qualified(evidence):
@@ -5735,7 +6052,13 @@ def run_issue6_postconsume_callback_gate_failure_profile():
 
 def main():
   global IMAGE, RUN_CID_DIR
-  profile = os.environ.get('WALLET_IT_PROFILE', 'default')
+  profile = selected_live_profile()
+  fault_mode = ISSUE7_USER_READBACK_FAULT_MODES.get(profile)
+  if fault_mode is not None:
+    configured_image = os.environ.get('WALLET_IT_USER_READBACK_IMAGE')
+    if not configured_image:
+      raise ValueError('WALLET_IT_USER_READBACK_IMAGE is required for the Issue #7 test-provider profile')
+    IMAGE = configured_image
   if profile == 'issue6-single-node':
     return run_issue6_single_node_profile()
   if profile == 'issue6-auth-flow':
@@ -5744,11 +6067,6 @@ def main():
     return run_issue6_postconsume_receipt_failure_profile()
   if profile == 'issue6-postconsume-callback-gate-failure':
     return run_issue6_postconsume_callback_gate_failure_profile()
-  if profile not in {'default', 'expiry', 'provider-not-found-diagnostic'}:
-    raise ValueError(
-        'WALLET_IT_PROFILE must be default, expiry, provider-not-found-diagnostic, '
-        'issue6-single-node, issue6-auth-flow, issue6-postconsume-receipt-failure, '
-        'or issue6-postconsume-callback-gate-failure')
   IMAGE, image_digest = resolve_immutable_image(IMAGE)
   runtime_provenance = _prepare_resolver_runtime()
   runtime_provenance['image_digest'] = image_digest
@@ -5768,6 +6086,21 @@ def main():
         evidence = {**result, **(snapshot or {})}
         evidence_path.write_text(
             json.dumps(sanitize_live_checkpoint(evidence), sort_keys=True), encoding='utf-8')
+      def issue7_setup_stage(stage):
+        if fault_mode is None:
+          return
+        current = dict(result.get('issue7_single_node_signup_recovery', {}))
+        current['stage'] = stage
+        if stage == 'runtime_verified':
+          current['keycloak_node_count'] = 1
+        result['issue7_single_node_signup_recovery'] = current
+        checkpoint()
+      if fault_mode is not None:
+        result['issue7_single_node_signup_recovery'] = {
+            'stage': 'setup', 'scope': 'one-keycloak-node',
+            'user_readback_fault_mode': fault_mode,
+            'fault_evidence_provenance': 'wrapper-mediated-application-path'}
+        checkpoint()
       def latest_resolver_diagnostics():
         if resolver_tools is None:
           return {'resolver_runtime': runtime_provenance,
@@ -5777,15 +6110,21 @@ def main():
                 'diagnostic_categories': record_resolver_diagnostics(container)}}
       temp = Path(temp_dir)
       with report_partial_evidence_on_failure(evidence_path, latest_resolver_diagnostics):
+        issue7_setup_stage('resolver_tools_starting')
         resolver_tools = start_resolver_tools(temp, IMAGE,
             lifetime=EXPIRY_CONTAINER_LIFETIME_SECONDS if profile == 'expiry' else 300)
+        issue7_setup_stage('resolver_tools_started')
         os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        issue7_setup_stage('registry_starting')
         registry, bootstrap, registry_port = start_registry(temp, IMAGE,
             run_seconds=EXPIRY_CONTAINER_LIFETIME_SECONDS if profile == 'expiry' else 300)
+        issue7_setup_stage('registry_started')
         os.environ['WALLET_IT_RESOLVER_TOOLS_CONTAINER'] = resolver_tools
+        issue7_setup_stage('identity_writing')
         resolver_port = free_port()
         key, wrapper, identifier = write_identity(temp, bootstrap, IMAGE)
-        if profile == 'expiry':
+        issue7_setup_stage('identity_ready')
+        if profile == 'expiry' or fault_mode is not None:
           unmapped_key = replay_key = None
           unmapped_identifier = replay_identifier = None
         else:
@@ -5793,14 +6132,24 @@ def main():
               temp, bootstrap, IMAGE, label='wallet-login-unmapped')
           replay_key, _, replay_identifier = write_identity(
               temp, bootstrap, IMAGE, label='wallet-login-replay')
-        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE)
+        issue7_setup_stage('keycloak_starting')
+        client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE,
+            user_readback_fault_mode=fault_mode)
         client.privateClientAdminCredential = password
         if not isinstance(client.wallet_container_id, str):
           raise RuntimeError('Keycloak container ID is unavailable')
         container = client.wallet_container_id
+        issue7_setup_stage('keycloak_started')
+        issue7_setup_stage('runtime_verifying')
         token = admin_token(client, password)
         runtime_provenance.update(keycloak_runtime_provenance(
             client, token, client.wallet_container_id))
+        if (runtime_provenance.get('runtime_qualification_status') == 'runtime_facts_verified'
+            and runtime_provenance.get('keycloak_version') == '26.8.0'
+            and runtime_provenance.get('keycloak_nodes') == 'one'):
+          issue7_setup_stage('runtime_verified')
+        else:
+          issue7_setup_stage('keycloak_started')
         checkpoint()
         if profile == 'provider-not-found-diagnostic':
           require(runtime_provenance['keycloak_version'] == '26.8.0'
@@ -5824,8 +6173,52 @@ def main():
         require(runtime_baseline_is_verified(runtime_provenance),
             'pinned Keycloak version and single-node baseline verified',
             runtime_provenance['keycloak_version'])
+        issue7_setup_stage('realm_configuring')
         configure_realm(client, token, identifier, resolver_port, wrapper, bootstrap)
+        issue7_setup_stage('realm_configured')
+        issue7_setup_stage('events_configuring')
         enable_keycloak_login_events(client, token)
+        issue7_setup_stage('events_configured')
+        if fault_mode is not None:
+          require(runtime_provenance['keycloak_version'] == '26.8.0'
+              and runtime_provenance['keycloak_nodes'] == 'one',
+              'pinned single-node Keycloak runtime facts verified',
+              runtime_provenance['keycloak_version'])
+          def progress(stage, fields):
+            if stage not in {'faulted_signup', 'fresh_signup'}:
+              return
+            current = dict(result.get('issue7_single_node_signup_recovery', {}))
+            current['stage'] = stage
+            for field, value in fields.items():
+              if field.endswith('_http') and type(value) is int and 100 <= value <= 599:
+                current[field] = value
+              elif field in {'exact_mapped_users', 'post_create_read_fault_count',
+                  'correlated_mapping_failure_count'} and type(value) is int and 0 <= value <= 65:
+                current[field] = value
+              elif field in {'browser_status_pending', 'failure_responses_no_callback_or_code',
+                  'account_retained_after_failure', 'user_readback_factory_selected',
+                  'post_create_read_fault_observed'} and type(value) is bool:
+                current[field] = value
+              elif field == 'effective_user_readback_fault_mode' and value in {'empty', 'throw', 'over-cap'}:
+                current[field] = value
+            result['issue7_single_node_signup_recovery'] = current
+            checkpoint()
+          def save_issue7_checkpoint(evidence):
+            result['issue7_single_node_signup_recovery'] = evidence
+            checkpoint()
+          handlers = {
+              profile_name: lambda profile_name=profile_name: run_issue7_single_node_signup_recovery_profile(
+                  Client(), key, identifier, container, client, IMAGE, progress,
+                  save_issue7_checkpoint, profile_name)
+              for profile_name in ISSUE7_USER_READBACK_FAULT_MODES
+          }
+          evidence = dispatch_live_profile(profile, handlers)
+          print('issue7-user-readback-evidence=',
+              json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+          finish_owned_cleanup(registry, resolver_tools)
+          registry = None
+          resolver_tools = None
+          return
         if profile == 'expiry':
           def expiry_checkpoint(snapshot):
             result['expiry_case'] = snapshot
