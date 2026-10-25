@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
+from types import SimpleNamespace
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 import zipfile
@@ -20,6 +22,44 @@ ROOT = Path(__file__).parents[1]
 
 
 class UserReadbackProfileTest(unittest.TestCase):
+  def test_dedicated_signup_success_profile_is_allowlisted_and_selected(self):
+    profile = 'issue7-signup-success'
+    self.assertIn(profile, probe.SUPPORTED_LIVE_PROFILES)
+    with patch.dict(os.environ, {'WALLET_IT_PROFILE': profile}):
+      self.assertEqual(profile, probe.selected_live_profile())
+
+  def test_success_coordinator_runs_one_unfaulted_signup_and_sanitizes_evidence(self):
+    calls = []
+    def ordinary_signup(*args, **kwargs):
+      calls.append((args, kwargs))
+      self.assertEqual({}, kwargs)
+      args[5]('intent', {'signup_intent_action_http': 200})
+      args[5]('proof', {'signup_proof_http': 202})
+      args[5]('account', {'exact_mapped_users': 1})
+      args[5]('callback', {'callback_http': 302, 'callback_replay': True,
+          'oidc_state_preserved': True})
+      args[5]('token', {'pkce_token_http': 200})
+      return {'signup_intent_action_http': 200, 'signup_proof_http': 202,
+          'exact_mapped_users': 1, 'callback_http': 302, 'callback_replay': True,
+          'oidc_state_preserved': True, 'pkce_token_http': 200,
+          'local_subject': 'private-subject', 'code': 'private-code',
+          'exception': 'private exception', 'logs': 'private log'}
+    progress_events, checkpoints = [], []
+    with patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup):
+      evidence = probe.run_issue7_signup_success_profile(
+          Mock(), Path('key'), 'private-identity', 'container', Mock(), 'ordinary-image',
+          lambda stage, fields: progress_events.append((stage, fields)), checkpoints.append)
+    self.assertEqual(1, len(calls))
+    self.assertEqual('ordinary-image', calls[0][0][6])
+    self.assertEqual('complete', evidence['stage'])
+    self.assertEqual('harness-application-path-only', evidence['evidence_provenance'])
+    self.assertEqual(200, evidence['pkce_token_http'])
+    serialized = json.dumps(probe.sanitize_live_checkpoint({'signup_case': evidence}))
+    for forbidden in ('private-subject', 'private-code', 'private exception',
+        'private log', 'private-identity'):
+      self.assertNotIn(forbidden, serialized)
+    self.assertTrue(checkpoints and checkpoints[0] == evidence)
+
   def test_profile_modes_and_fail_closed_dispatch(self):
     expected = {
         'issue7-user-readback-empty': 'empty',
@@ -40,6 +80,121 @@ class UserReadbackProfileTest(unittest.TestCase):
         probe.selected_live_profile()
     with self.assertRaises(ValueError):
       probe.dispatch_live_profile('unexpected', {'default': lambda: None})
+
+  def test_production_main_dispatches_only_success_profile_and_runs_scripted_signup(self):
+    locator = ('https://idp.example:' + str(probe.KC_PORT)
+        + '/auth/realms/' + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'A' * 43)
+    status_url = '/auth/realms/' + probe.REALM + '/decent-wallet-login/v1/transactions/status'
+    callback_query = urllib.parse.urlencode({'session_code': 's', 'execution': 'e',
+        'client_id': 'c', 'tab_id': 't', 'client_data': 'd'})
+    callback = (f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}'
+        + '/login-actions/authenticate?' + callback_query)
+    class ScriptedClient:
+      def __init__(self):
+        self.redirects = []
+        self.privateClientAdminCredential = 'ignored'
+        self.wallet_container_id = None
+        self.requests = []
+        self.state = None
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        self.requests.append((method, path))
+        parsed = urllib.parse.urlsplit(path)
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          self.state = urllib.parse.parse_qs(parsed.query)['state'][0]
+          html = (f'<p id="wallet-locator">{locator}</p>'
+              f'<form method="post" action="/auth/realms/{probe.REALM}/login-actions/'
+              f'authenticate?session_code=s&amp;execution=e&amp;client_id=c&amp;tab_id=t&amp;client_data=d">'
+              '<input type="hidden" name="wallet_intent" value="signup"></form>')
+          return 200, {}, html.encode()
+        if method == 'POST' and 'login-actions/authenticate?' in path:
+          html = (f'<p id="wallet-locator">{locator}</p>'
+              f'<script>const statusUrl = "{status_url}"; const csrfToken = "{"A" * 43}";</script>'
+              'Creating a new account with this wallet identity.')
+          return 200, {}, html.encode()
+        if method == 'GET' and path == locator:
+          return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+              'challenge': 'challenge', 'csrf_token': 'A' * 43}).encode()
+        if method == 'POST' and path == locator:
+          return 202, {}, b''
+        if method == 'GET' and path == status_url:
+          return 200, {}, json.dumps({'status': 'accepted', 'callback': callback}).encode()
+        if method == 'GET' and parsed.path.endswith('/login-actions/authenticate'):
+          if parsed.scheme == 'https':
+            return 302, {'Location': probe.REDIRECT + '?' + urllib.parse.urlencode(
+                {'error': 'invalid_request', 'state': self.state})}, b''
+          return 302, {'Location': probe.REDIRECT + '?' + urllib.parse.urlencode(
+              {'code': 'opaque-code', 'state': self.state})}, b''
+        if method == 'POST' and parsed.path.endswith('/protocol/openid-connect/token'):
+          return 200, {}, b'{"id_token":"unused-token"}'
+        if method == 'GET' and parsed.path.endswith('/protocol/openid-connect/certs'):
+          return 200, {}, b'{"keys":[]}'
+        raise AssertionError((method, path))
+
+    browser, wallet, admin = ScriptedClient(), ScriptedClient(), Mock(wallet_container_id='a' * 64)
+    checkpoints = []
+    original_write = Path.write_text
+    def capture(path, data, *args, **kwargs):
+      if path.name == 'live-evidence.json':
+        checkpoints.append(json.loads(data))
+      return original_write(path, data, *args, **kwargs)
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      key_path = Path(scratch) / 'identity.pem'
+      for name, value in {'SCRATCH': scratch, 'IMAGE': 'original-image',
+          'RUN_CID_DIR': None}.items():
+        stack.enter_context(patch.object(probe, name, value))
+      stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE': 'issue7-signup-success'}, clear=False))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('ordinary-image', 'sha256:' + 'a' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
+      stack.enter_context(patch.object(probe, 'start_registry', return_value=('registry', 'bootstrap', 1234)))
+      stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
+      identity = stack.enter_context(patch.object(probe, 'write_identity',
+          return_value=(key_path, Path(scratch) / 'wrapper', 'private-identity')))
+      stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='token'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
+          'runtime_qualification_status': 'runtime_facts_verified',
+          'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
+      stack.enter_context(patch.object(probe, 'configure_realm'))
+      stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
+      stack.enter_context(patch.object(probe, 'admin_call', side_effect=[
+          (200, {}, b'[]'), (200, {}, b'[{"attributes":{"decent_identity_id":["private-identity"]},"enabled":true,"id":"private-subject"}]')]))
+      stack.enter_context(patch.object(probe, 'Client', side_effect=[browser, wallet]))
+      stack.enter_context(patch.object(probe.subprocess, 'run',
+          return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
+      stack.enter_context(patch.object(probe, 'verify_id_token', return_value={
+          'sub': 'private-subject', 'decent_identity_id': 'private-identity'}))
+      stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
+      stack.enter_context(patch.object(Path, 'write_text', autospec=True, side_effect=capture))
+      dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
+          wraps=probe.dispatch_live_profile))
+      printed = stack.enter_context(patch('builtins.print'))
+      probe.main()
+    identity.assert_called_once()
+    self.assertEqual(1, dispatcher.call_count)
+    self.assertEqual('issue7-signup-success', dispatcher.call_args.args[0])
+    self.assertEqual(1, len([request for request in browser.requests
+        if request[0] == 'GET' and '/protocol/openid-connect/auth?' in request[1]]))
+    self.assertEqual(1, len([request for request in wallet.requests
+        if request == ('POST', locator)]))
+    self.assertFalse(any('wallet-login-unmapped' in str(call) or 'wallet-login-replay' in str(call)
+        for call in identity.call_args_list))
+    final = checkpoints[-1]['signup_case']
+    self.assertEqual({'stage': 'complete',
+        'evidence_provenance': 'harness-application-path-only',
+        'signup_intent_action_http': 200,
+        'signup_proof_http': 202, 'exact_mapped_users': 1, 'callback_http': 302,
+        'callback_replay': True, 'oidc_state_preserved': True,
+        'pkce_token_http': 200}, final)
+    safe = json.dumps(checkpoints[-1])
+    for forbidden in ('private-identity', 'private-subject', 'opaque-code',
+        'challenge', 'signature', 'unused-token'):
+      self.assertNotIn(forbidden, safe)
+    output = [call.args[1] for call in printed.call_args_list
+        if call.args and call.args[0] == 'issue7-signup-success-evidence=']
+    self.assertEqual(1, len(output))
+    self.assertEqual(final, json.loads(output[0])['signup_case'])
 
   def test_fault_diagnostics_are_correlated_bounded_and_sanitized(self):
     request_id = '0123456789abcdef0123456789abcdef'

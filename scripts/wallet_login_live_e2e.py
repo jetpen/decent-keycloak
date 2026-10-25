@@ -35,7 +35,7 @@ ISSUE7_USER_READBACK_FAULT_MODES = {
 }
 SUPPORTED_LIVE_PROFILES = {
     'default', 'expiry', 'provider-not-found-diagnostic',
-    'issue6-single-node', 'issue6-auth-flow',
+    'issue6-single-node', 'issue6-auth-flow', 'issue7-signup-success',
     'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure',
     *ISSUE7_USER_READBACK_FAULT_MODES,
     *issue7_store_recovery.PROFILES,
@@ -777,7 +777,7 @@ def sanitize_live_checkpoint(candidate):
       'rotation_publish', 'callback_code', 'id_token_claims_checked', 'jwks_signature_verified',
       'identical_retry_accepted', 'changed_retry_denied', 'alien_status_denied',
       'state_preserved', 'error_returned', 'authorization_code_returned',
-      'callback_replay', 'local_mapping_persisted', 'credentialed', 'wrong_origin_denied',
+      'callback_replay', 'oidc_state_preserved', 'local_mapping_persisted', 'credentialed', 'wrong_origin_denied',
       'callback_replay_internal_error_page', 'callback_replay_internal_error_reason',
       'callback_replay_internal_error_hostname_matches',
       'callback_replay_internal_error_port_matches',
@@ -832,7 +832,7 @@ def sanitize_live_checkpoint(candidate):
       'local_mapping_persisted',
       'changed_retry_denied', 'alien_status_denied', 'state_preserved', 'error_returned',
       'challenge_get', 'wrong_origin_denied', 'credentialed',
-      'authorization_code_returned', 'callback_replay', 'credentialed',
+      'authorization_code_returned', 'callback_replay', 'oidc_state_preserved', 'credentialed',
       'callback_replay_redirect_uri_matches', 'callback_redirect_uri_matches',
       'initial_status_accepted', 'callback_state_preserved', 'callback_error_returned',
       'callback_code_returned', 'callback_replay_state_preserved',
@@ -1383,9 +1383,12 @@ def sanitize_live_checkpoint(candidate):
       if stage not in signup_stages:
         continue
       safe = {'stage': stage}
+      if value.get('evidence_provenance') == 'harness-application-path-only':
+        safe['evidence_provenance'] = 'harness-application-path-only'
       safe.update({field: item for field, item in value.items()
           if field in {'signup_intent_action_http', 'signup_proof_http',
-              'callback_http', 'pkce_token_http'} and safe_scalar(field, item)})
+              'callback_http', 'pkce_token_http', 'callback_replay',
+          'oidc_state_preserved'} and safe_scalar(field, item)})
       if type(value.get('exact_mapped_users')) is int and 0 <= value['exact_mapped_users'] <= 2:
         safe['exact_mapped_users'] = value['exact_mapped_users']
       if safe:
@@ -4780,6 +4783,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       and replay_query.get('state') == [state] and replay_query.get('error')
       and 'code' not in replay_query,
       'signup callback replay returns no second authorization code')
+  progress('callback', {'callback_replay': True, 'oidc_state_preserved': location_query.get('state') == [state]})
   token_status, _, token_raw = client.request('POST', f'/auth/realms/{REALM}/protocol/openid-connect/token',
       urllib.parse.urlencode({'grant_type':'authorization_code','client_id':CLIENT,'code':code,
           'redirect_uri':REDIRECT,'code_verifier':verifier}).encode(),
@@ -4793,7 +4797,31 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'signup ID token contains exact signed wallet Identity claim')
   return {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status,
-      'callback_http': callback_status, 'local_subject': matched[0].get('id')}
+      'callback_http': callback_status, 'callback_replay': True,
+      'oidc_state_preserved': location_query.get('state') == [state]}
+
+
+def run_issue7_signup_success_profile(client, key, identifier, container,
+    admin_client, image, progress, checkpoint):
+  """Run exactly one ordinary explicit-signup success ceremony and checkpoint its safe facts."""
+  evidence = signup_wallet_flow(client, key, identifier, container, admin_client,
+      progress, image)
+  require(evidence.get('signup_intent_action_http') == 200
+      and evidence.get('signup_proof_http') == 202
+      and evidence.get('exact_mapped_users') == 1
+      and evidence.get('callback_http') in (302, 303)
+      and evidence.get('callback_replay') is True
+      and evidence.get('oidc_state_preserved') is True
+      and evidence.get('pkce_token_http') == 200,
+      'Issue #7 ordinary signup success facts')
+  safe = {'stage': 'complete', 'evidence_provenance': 'harness-application-path-only', **{
+      field: evidence[field] for field in ('signup_intent_action_http',
+          'signup_proof_http', 'exact_mapped_users', 'callback_http',
+          'callback_replay', 'oidc_state_preserved', 'pkce_token_http')}}
+  checkpoint(safe)
+  return safe
+
+
 def run_issue7_single_node_signup_recovery_profile(client, key, identifier, container,
     admin_client, image, progress, checkpoint, profile):
   """Inject one post-create readback fault, then prove fresh signup reuses the account."""
@@ -6196,7 +6224,8 @@ def main():
         resolver_port = free_port()
         key, wrapper, identifier = write_identity(temp, bootstrap, IMAGE)
         issue7_setup_stage('identity_ready')
-        if profile == 'expiry' or fault_mode is not None or store_fault_mode is not None:
+        if (profile == 'expiry' or profile == 'issue7-signup-success'
+            or fault_mode is not None or store_fault_mode is not None):
           unmapped_key = replay_key = None
           unmapped_identifier = replay_identifier = None
         else:
@@ -6307,6 +6336,23 @@ def main():
           }
           evidence = dispatch_live_profile(profile, handlers)
           print('issue7-user-readback-evidence=',
+              json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+          finish_owned_cleanup(registry, resolver_tools)
+          registry = None
+          resolver_tools = None
+          return
+        if profile == 'issue7-signup-success':
+          def signup_success_progress(stage, fields):
+            checkpoint_signup_stage(result, stage, fields, checkpoint)
+          handlers = {profile: lambda: run_issue7_signup_success_profile(
+              Client(), key, identifier, container, client, IMAGE,
+              signup_success_progress,
+              lambda evidence: checkpoint_signup_stage(
+                  result, 'complete', evidence, checkpoint))}
+          evidence = dispatch_live_profile(profile, handlers)
+          result['signup_case'] = evidence
+          checkpoint()
+          print('issue7-signup-success-evidence=',
               json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
           finish_owned_cleanup(registry, resolver_tools)
           registry = None
