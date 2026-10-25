@@ -122,7 +122,7 @@ def read_provider_fault_log_tail(container_id):
   return logs.stdout if logs.returncode == 0 else ''
 
 
-def read_provider_fault_log_window(container_id, cursor):
+def read_provider_fault_log_window(container_id, cursor, *, strict=False):
   """Read a bounded per-run log window; do not serialize raw lines or identifiers."""
   if not isinstance(container_id, str) or re.fullmatch(r'[0-9a-f]{64}', container_id) is None:
     raise ValueError('container ID is invalid')
@@ -131,7 +131,11 @@ def read_provider_fault_log_window(container_id, cursor):
     raise ValueError('invalid UTC log cursor')
   logs = _bounded_command_tail(
       ['podman', 'logs', '--since', cursor, '--tail', '160', container_id])
-  return logs.stdout if logs.returncode == 0 else ''
+  if logs.returncode != 0:
+    if strict:
+      raise RuntimeError('provider fault log window unavailable')
+    return ''
+  return logs.stdout
 
 
 def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
@@ -916,8 +920,7 @@ def sanitize_live_checkpoint(candidate):
           'show_config_timeout', 'show_config_error', 'show_config_nonzero',
           'show_config_fields_complete', 'show_config_fields_missing', 'show_config_conflict',
           'runtime_log_conflict'},
-      'failure_gate': {'proof_post', 'proof_status', 'identical_retry', 'changed_retry',
-          'callback', 'callback_replay', 'status_after_callback', 'pkce'},
+      'failure_gate': issue7_store_recovery.FAILURE_GATES,
   }
 
   runtime_string_fields = {
@@ -2104,7 +2107,7 @@ class BareLocalClient(Client):
       return error.code, error.headers, error.read()
 
 
-def require(condition, stage, code=None, *, failure_gate=None, http_status=None):
+def require(condition, stage, code=None, *, failure_gate=None, failure_stage=None, http_status=None):
   if not condition:
     valid_http_status = type(http_status) is int and 100 <= http_status <= 599
     detail = f' (HTTP {http_status})' if valid_http_status else (
@@ -2112,10 +2115,10 @@ def require(condition, stage, code=None, *, failure_gate=None, http_status=None)
     message = f'acceptance probe failed at {stage}' + detail
     active = _ACTIVE_AUTH_FLOW_ATTEMPT
     failure = active.failure(message, gate=failure_gate) if active is not None else RuntimeError(message)
-    failure_stage, contextual_gate = issue7_store_recovery.FAILURE_CONTEXTS.get(
+    contextual_stage, contextual_gate = issue7_store_recovery.FAILURE_CONTEXTS.get(
         stage, ('signup_flow', 'unclassified'))
     explicit_gate = failure_gate if failure_gate in issue7_store_recovery.FAILURE_GATES else None
-    setattr(failure, 'failure_stage', failure_stage)
+    setattr(failure, 'failure_stage', failure_stage or contextual_stage)
     setattr(failure, 'failure_gate', explicit_gate or contextual_gate)
     setattr(failure, 'failure_category', 'assertion_failed')
     if type(http_status) is int and 100 <= http_status <= 599:
@@ -4655,8 +4658,18 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   if store_fault_mode is not None:
     log_cursor = utc_log_cursor()
   redirects_before_proof = len(wallet.redirects)
-  proof_status, proof_headers, proof_body = wallet.request('POST', signup_locator, proof,
-      {'Content-Type': 'application/json'})
+  try:
+    proof_status, proof_headers, proof_body = wallet.request('POST', signup_locator, proof,
+        {'Content-Type': 'application/json'})
+  except Exception as failure:
+    if store_fault_mode is not None:
+      setattr(failure, 'failure_stage', 'signup_proof')
+      setattr(failure, 'failure_gate', 'proof_post')
+      setattr(failure, 'failure_category', 'runtime_error')
+      issue7_store_recovery.attach_failure_diagnostics(failure, sys.modules[__name__],
+          container=container, log_cursor=log_cursor, mode=store_fault_mode,
+          locator=signup_locator)
+    raise
   redirects_after_proof = list(wallet.redirects[redirects_before_proof:])
   if expect_user_readback_fault:
     fault_logs = read_provider_fault_log_window(container, log_cursor)
@@ -4664,11 +4677,17 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
         fault_logs, expected_request_id=request_id)
   progress('proof', {'signup_proof_http': proof_status})
   if store_fault_mode is not None:
-    return issue7_store_recovery.failure_flow(sys.modules[__name__], mode=store_fault_mode,
-        wallet=wallet, browser=client, locator=signup_locator, status_url=status_url.group(1),
-        csrf=csrf.group(1), proof=proof, proof_response=(proof_status, proof_headers, proof_body),
-        proof_redirects=redirects_after_proof, container=container, log_cursor=log_cursor,
-        admin_client=admin_client, token=admin, identifier=identifier)
+    try:
+      return issue7_store_recovery.failure_flow(sys.modules[__name__], mode=store_fault_mode,
+          wallet=wallet, browser=client, locator=signup_locator, status_url=status_url.group(1),
+          csrf=csrf.group(1), proof=proof, proof_response=(proof_status, proof_headers, proof_body),
+          proof_redirects=redirects_after_proof, container=container, log_cursor=log_cursor,
+          admin_client=admin_client, token=admin, identifier=identifier)
+    except Exception as failure:
+      issue7_store_recovery.attach_failure_diagnostics(failure, sys.modules[__name__],
+          container=container, log_cursor=log_cursor, mode=store_fault_mode,
+          locator=signup_locator)
+      raise
   if expect_user_readback_fault:
     failure_safe = failure_response_has_no_callback_or_code(
         proof_body, proof_headers, redirects_after_proof)

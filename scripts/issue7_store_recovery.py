@@ -20,7 +20,7 @@ MARKERS = {
 FAILURE_STAGES = {'signup_flow', 'signup_proof', 'user_readback'}
 FAILURE_GATES = {'unclassified', 'proof_http_status', 'account_readback', 'proof_post',
     'identical_retry', 'changed_retry', 'proof_status', 'callback', 'callback_replay',
-    'status_after_callback', 'pkce'}
+    'status_after_callback', 'pkce', 'store_correlation'}
 FAILURE_CATEGORIES = {'runtime_error', 'assertion_failed'}
 FAILURE_CONTEXTS = {
     'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code':
@@ -42,6 +42,18 @@ def checkpoint_signup_failure(checkpoint, failure, *, mode_field, mode):
     status_field = ('signup_proof_http' if evidence['failure_gate'] == 'proof_http_status'
         else 'failure_http_status')
     evidence[status_field] = status
+  diagnostics = getattr(failure, 'issue7_diagnostics', None)
+  if isinstance(diagnostics, dict):
+    read_status = diagnostics.get('store_diagnostic_read_status')
+    if read_status in {'observed', 'unavailable'}:
+      evidence['store_diagnostic_read_status'] = read_status
+    selected = diagnostics.get('store_provider_selected')
+    if type(selected) is bool:
+      evidence['store_provider_selected'] = selected
+    for field in ('store_fault_count', 'correlated_store_failure_count'):
+      count = diagnostics.get(field)
+      if type(count) is int and 0 <= count <= 5:
+        evidence[field] = count
   try:
     checkpoint(evidence)
   except Exception:
@@ -55,11 +67,42 @@ def diagnostics(logs, mode, request_id):
   cause = ('Wallet pending transaction unavailable (request=' + request_id
       + ', reason=consume-unavailable)' if mode == 'consume-loss' else
       'Wallet proof acceptance unavailable (request=' + request_id + ', outcome=not_accepted)')
+  operation = 'transaction_remove' if mode == 'consume-loss' else 'accepted_replace'
+  provider_witness = (f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} '
+      f'request={request_id}')
+  fault_witness = f'ISSUE7_TEST_FAULT: {MARKERS[mode]} request={request_id}'
   return {
-      'store_fault_count': min(5, logs.count('ISSUE7_TEST_FAULT: ' + MARKERS[mode])),
+      'store_fault_count': min(5, logs.count(fault_witness)),
       'correlated_store_failure_count': min(5, logs.count(cause)),
-      'store_provider_selected': 'ISSUE7_TEST_PROVIDER: factory selected' in logs,
+      'store_provider_selected': logs.count(provider_witness) == 1,
   }
+
+
+def failure_diagnostic_snapshot(api, *, container, log_cursor, mode, locator):
+  """Read only allowlisted failure facts; raw log text never leaves this helper."""
+  try:
+    handle = urllib.parse.urlsplit(locator).path.rsplit('/', 1)[-1]
+    request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+    logs = api.read_provider_fault_log_window(container, log_cursor, strict=True)
+    if not isinstance(logs, str):
+      raise ValueError('diagnostic log result unavailable')
+  except Exception:
+    return {'store_diagnostic_read_status': 'unavailable',
+        'store_provider_selected': False, 'store_fault_count': 0,
+        'correlated_store_failure_count': 0}
+  return {'store_diagnostic_read_status': 'observed',
+      **diagnostics(logs, mode, request_id)}
+
+
+def attach_failure_diagnostics(failure, api, *, container, log_cursor, mode, locator):
+  try:
+    failure.issue7_diagnostics = failure_diagnostic_snapshot(api, container=container,
+        log_cursor=log_cursor, mode=mode, locator=locator)
+  except Exception:
+    # Diagnostic collection must never replace the signup failure.
+    failure.issue7_diagnostics = {'store_diagnostic_read_status': 'unavailable',
+        'store_provider_selected': False, 'store_fault_count': 0,
+        'correlated_store_failure_count': 0}
 
 
 def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof,
@@ -68,24 +111,30 @@ def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof
   status, headers, body = proof_response
   api.require(status == 503 and api.failure_response_has_no_callback_or_code(
       body, headers, proof_redirects), 'store fault denies proof without body, redirect, callback or code',
-      status, http_status=status)
+      status, failure_stage='signup_proof', failure_gate='proof_http_status', http_status=status)
   browser_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf}
-  for requester, method, url, data, request_headers in (
-      (browser, 'GET', status_url, None, browser_headers),
-      (wallet, 'POST', locator, proof, {'Content-Type': 'application/json'})):
+  for requester, method, url, data, request_headers, gate in (
+      (browser, 'GET', status_url, None, browser_headers, 'proof_status'),
+      (wallet, 'POST', locator, proof, {'Content-Type': 'application/json'}, 'identical_retry')):
     before = len(requester.redirects)
-    polled, response_headers, raw = requester.request(method, url, data, headers=request_headers)
+    try:
+      polled, response_headers, raw = requester.request(method, url, data, headers=request_headers)
+    except Exception as failure:
+      setattr(failure, 'failure_stage', 'signup_proof')
+      setattr(failure, 'failure_gate', gate)
+      setattr(failure, 'failure_category', 'runtime_error')
+      raise
     api.require(polled == 404 and api.failure_response_has_no_callback_or_code(
         raw, response_headers, requester.redirects[before:]),
         'consumed transaction status and retry deny all receipt/callback/code disclosure',
-        polled, http_status=polled)
-  handle = urllib.parse.urlsplit(locator).path.rsplit('/', 1)[-1]
-  request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
-  facts = diagnostics(api.read_provider_fault_log_window(container, log_cursor), mode, request_id)
+        polled, failure_stage='signup_proof', failure_gate=gate, http_status=polled)
+  facts = failure_diagnostic_snapshot(api, container=container,
+      log_cursor=log_cursor, mode=mode, locator=locator)
   api.require(facts['store_provider_selected'] and facts['store_fault_count'] == 1
       and facts['correlated_store_failure_count'] >= 1,
-      'one-shot store fixture and production failure branch correlate to this request')
+      'one-shot store fixture and production failure branch correlate to this request',
+      failure_stage='signup_proof', failure_gate='store_correlation')
   import json
   users = json.loads(api.admin_call(admin_client, token, 'GET',
       f'/auth/admin/realms/{api.REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
@@ -162,7 +211,8 @@ def sanitize(value):
       'recovery_intent': {'signup', 'login'},
       'fault_evidence_provenance': {'wrapper-mediated-application-path'},
       'failure_stage': FAILURE_STAGES, 'failure_gate': FAILURE_GATES,
-      'failure_category': FAILURE_CATEGORIES}
+      'failure_category': FAILURE_CATEGORIES,
+      'store_diagnostic_read_status': {'observed', 'unavailable'}}
   booleans = {'same_local_subject', 'failure_responses_no_callback_or_code',
       'account_retained_after_failure', 'store_provider_selected'}
   counts = {'store_fault_count', 'correlated_store_failure_count', 'exact_mapped_users',
