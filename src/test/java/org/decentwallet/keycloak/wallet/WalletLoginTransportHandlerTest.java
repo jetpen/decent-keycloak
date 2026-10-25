@@ -606,6 +606,49 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void consumeThrowsAfterRemovingPendingFailsClosedAndFreshSignupRecovers() throws Exception {
+    class ThrowAfterRemovalStore extends MemoryStore {
+      boolean failNextConsume;
+      @Override public Map<String, String> remove(String key) {
+        if (failNextConsume && key.startsWith("decent-wallet-login-v1:transaction:")) {
+          failNextConsume = false;
+          super.remove(key);
+          throw new IllegalStateException("injected ambiguous consume loss");
+        }
+        return super.remove(key);
+      }
+    }
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var provider = new ThrowAfterRemovalStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    String identity = "mailto:consume-loss@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var provisionCalls = new AtomicInteger();
+    var accounts = retainedExactIdentityResolver(identity, provisionCalls, () -> provider.failNextConsume = true);
+    var handler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, accounts, true);
+
+    var failed = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+    assertEquals(503, failed.status());
+    assertEquals(1, provisionCalls.get());
+    assertTrue(accounts.hasUniqueEnabledUser(identity));
+    assertTrue(store.load(issued.handle()).isEmpty());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertEquals(404, handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+        issued.csrfToken(), IDP_ORIGIN, BINDING).status());
+
+    var retryBinding = new WalletLoginTransactionStore.Binding(BINDING.realmId(), BINDING.clientId(),
+        "consume-loss-fresh-session", "consume-loss-fresh-tab", BINDING.redirectUri(), BINDING.canonicalOrigin());
+    assertFreshSignupRecovers(store, handler, accounts, identity, keyPair, retryBinding, provisionCalls);
+    assertFalse(store.getAccepted(issued.handle(), BINDING).isPresent());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+  }
+
+  @Test
   void acceptedReceiptWriteFailureLeavesCreatedAccountBeforePendingConsume() throws Exception {
     var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var provider = new FailingAcceptedReceiptStore();

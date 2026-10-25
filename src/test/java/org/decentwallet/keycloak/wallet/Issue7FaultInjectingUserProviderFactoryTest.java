@@ -91,12 +91,13 @@ class Issue7FaultInjectingUserProviderFactoryTest {
   }
 
   @Test
-  void overCapDecoratorEmitsSixtyFiveRowsRepeatingCreatedUserReference() {
+  void overCapDecoratorEmitsSixtyFiveDistinctCandidateIds() {
     UserProvider jpa = mock(UserProvider.class);
     KeycloakSession session = session(jpa);
     RealmModel realm = mock(RealmModel.class);
     UserModel created = mock(UserModel.class);
     when(created.getFirstAttribute("decent_identity_id")).thenReturn("identity-value");
+    when(created.getId()).thenReturn("created-account-id");
     when(jpa.addUser(realm, null, "signup-user", true, true)).thenReturn(created);
 
     UserProvider decorated = factory("over-cap").create(session);
@@ -105,8 +106,10 @@ class Issue7FaultInjectingUserProviderFactoryTest {
         realm, "decent_identity_id", "identity-value").toList();
 
     assertEquals(65, rows.size());
-    assertTrue(rows.stream().allMatch(row -> row == created),
-        "the injected response is 65 repeated result rows, not 65 actual users");
+    assertEquals(65, rows.stream().map(UserModel::getId).distinct().count(),
+        "Keycloak's UserStorageManager deduplicates rows by ID before the mapping helper sees them");
+    assertTrue(rows.stream().noneMatch(row -> row == created),
+        "over-cap rows need distinct synthetic UserModel identities");
     verify(jpa, never()).removeUser(realm, created);
   }
 
