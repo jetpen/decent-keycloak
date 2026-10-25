@@ -9,6 +9,19 @@ README = Path(__file__).parents[1] / "README.md"
 SECURITY_REVIEW = Path(__file__).parents[1] / "docs/security-review.md"
 
 class AcceptanceLedgerTest(unittest.TestCase):
+  def test_issue7_store_recovery_candidate_is_offline_and_ceremonies_are_distinct(self):
+    readme = README.read_text()
+    doc = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
+    self.assertIn('docs/acceptance/issue-7-store-recovery.md', readme)
+    self.assertIn('DO NOT MERGE YET', doc)
+    self.assertIn('Issue #7 remains OPEN', doc)
+    self.assertIn('one signup plus one login', doc)
+    self.assertIn('two signup transactions', doc)
+    self.assertIn('production `main()` with external setup mocked', doc)
+    self.assertIn('No live/container/Registry invocation or image build was performed', doc)
+    self.assertIn('consume-loser interleaving', doc)
+    self.assertIn('292 tests', readme)
+
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
     text = README.read_text()
     self.assertIn("Issue #6 expiry-profile implementation chronology (2026-10-21)", text)

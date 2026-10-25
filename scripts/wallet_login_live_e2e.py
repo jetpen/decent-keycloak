@@ -19,6 +19,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+import issue7_store_recovery
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -37,6 +38,7 @@ SUPPORTED_LIVE_PROFILES = {
     'issue6-single-node', 'issue6-auth-flow',
     'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure',
     *ISSUE7_USER_READBACK_FAULT_MODES,
+    *issue7_store_recovery.PROFILES,
 }
 
 
@@ -806,7 +808,7 @@ def sanitize_live_checkpoint(candidate):
       'issue6_postconsume_receipt_recovery',
       'issue6_postconsume_callback_gate_failure_case',
       'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
-      'issue7_single_node_signup_recovery',
+      'issue7_single_node_signup_recovery', 'issue7_store_recovery',
   }
   signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
@@ -1076,6 +1078,11 @@ def sanitize_live_checkpoint(candidate):
         safe_matrix[case_name] = {'attempts': safe_attempts}
       if safe_matrix:
         projected[key] = safe_matrix
+    if key == 'issue7_store_recovery':
+      safe = issue7_store_recovery.sanitize(value)
+      if safe:
+        projected[key] = safe
+      continue
     if key == 'issue7_single_node_signup_recovery':
       stages = {'setup', 'resolver_tools_starting', 'resolver_tools_started',
           'registry_starting', 'registry_started', 'identity_writing', 'identity_ready',
@@ -2582,7 +2589,10 @@ def recover_keycloak_ownership(cidfile, returned_id, ownership_callback):
 
 def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, image,
     ownership_callback=None, credential_status=None, single_use_object_provider=None,
-    user_readback_fault_mode=None):
+    user_readback_fault_mode=None, store_fault_mode=None):
+  if store_fault_mode is not None and (store_fault_mode not in issue7_store_recovery.PROFILES.values()
+      or user_readback_fault_mode is not None or single_use_object_provider is not None):
+    raise ValueError('unsupported or conflicting store fault mode')
   check = run(['ss', '-ltn', f'( sport = :{KC_PORT} )'], timeout=5)
   require('LISTEN' not in check.stdout, 'disposable Keycloak port available')
   env_fd, env_path = tempfile.mkstemp(prefix='wallet-login-admin-', suffix='.env', dir=SCRATCH)
@@ -2598,7 +2608,9 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, 
         '--env-file', str(env_file),
         '--env', 'KC_BOOTSTRAP_ADMIN_USERNAME=wallet-admin',
     ]
-    if user_readback_fault_mode is not None:
+    if store_fault_mode is not None:
+      cmd.extend(['--env', 'ISSUE7_TEST_FAULT_MODE=' + store_fault_mode, image, 'start-dev'])
+    elif user_readback_fault_mode is not None:
       add_test_user_readback_fault_args(cmd, image, user_readback_fault_mode)
     else:
       cmd.extend([image, 'start-dev'])
@@ -3050,7 +3062,7 @@ def callback_authenticator_lifecycle_log_outcome(log_text, request_id):
 
 
 def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
-    progress_callback=None, admin_access_token=None):
+    progress_callback=None, admin_access_token=None, expected_subject=None):
   def report_progress(stage, **facts):
     if progress_callback is not None:
       progress_callback(stage, facts)
@@ -3420,6 +3432,8 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   require(CLIENT in (aud if isinstance(aud, list) else [aud]), 'ID token audience')
   require(claims.get('nonce') == nonce, 'OIDC nonce binding')
   require(claims.get('sub') and claims.get('sub') != identifier, 'opaque local Keycloak subject')
+  if expected_subject is not None:
+    require(claims.get('sub') == expected_subject, 'fresh login returns retained exact account subject')
   auth_result = {
       'login_page_http': status,
       'proof_post_http': submitted, 'initial_status_http': polled,
@@ -3452,6 +3466,8 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   }
   if prior_locator is not None:
     auth_result['fresh_locator_distinct'] = locator != prior_locator
+  if expected_subject is not None:
+    auth_result['local_subject'] = claims['sub']
   return auth_result
 
 
@@ -4510,7 +4526,11 @@ def signup_form_action(html_body, idp_origin, realm, required_action=False, prof
 
 
 def signup_wallet_flow(client, key, identifier, container, admin_client, progress, image,
-    expect_user_readback_fault=False, reuse_existing=False, expected_fault_mode=None):
+    expect_user_readback_fault=False, reuse_existing=False, expected_fault_mode=None,
+    store_fault_mode=None):
+  if store_fault_mode is not None and (store_fault_mode not in issue7_store_recovery.PROFILES.values()
+      or expect_user_readback_fault or reuse_existing):
+    raise ValueError('unsupported or conflicting signup store fault mode')
   verifier = b64url(secrets.token_bytes(32))
   code_challenge = b64url(hashlib.sha256(verifier.encode('ascii')).digest())
   state = b64url(secrets.token_bytes(24))
@@ -4606,6 +4626,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     handle = urllib.parse.urlsplit(signup_locator).path.rsplit('/', 1)[-1]
     request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
     log_cursor = utc_log_cursor()
+  if store_fault_mode is not None:
+    log_cursor = utc_log_cursor()
   redirects_before_proof = len(wallet.redirects)
   proof_status, proof_headers, proof_body = wallet.request('POST', signup_locator, proof,
       {'Content-Type': 'application/json'})
@@ -4615,6 +4637,12 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     diagnostics = sanitize_user_readback_fault_diagnostics(
         fault_logs, expected_request_id=request_id)
   progress('proof', {'signup_proof_http': proof_status})
+  if store_fault_mode is not None:
+    return issue7_store_recovery.failure_flow(sys.modules[__name__], mode=store_fault_mode,
+        wallet=wallet, browser=client, locator=signup_locator, status_url=status_url.group(1),
+        csrf=csrf.group(1), proof=proof, proof_response=(proof_status, proof_headers, proof_body),
+        proof_redirects=redirects_after_proof, container=container, log_cursor=log_cursor,
+        admin_client=admin_client, token=admin, identifier=identifier)
   if expect_user_readback_fault:
     failure_safe = failure_response_has_no_callback_or_code(
         proof_body, proof_headers, redirects_after_proof)
@@ -6054,6 +6082,12 @@ def main():
   global IMAGE, RUN_CID_DIR
   profile = selected_live_profile()
   fault_mode = ISSUE7_USER_READBACK_FAULT_MODES.get(profile)
+  store_fault_mode = issue7_store_recovery.PROFILES.get(profile)
+  if store_fault_mode is not None:
+    configured_image = os.environ.get('WALLET_IT_STORE_RECOVERY_IMAGE')
+    if not configured_image:
+      raise ValueError('WALLET_IT_STORE_RECOVERY_IMAGE is required for the Issue #7 store profile')
+    IMAGE = configured_image
   if fault_mode is not None:
     configured_image = os.environ.get('WALLET_IT_USER_READBACK_IMAGE')
     if not configured_image:
@@ -6086,6 +6120,11 @@ def main():
         evidence = {**result, **(snapshot or {})}
         evidence_path.write_text(
             json.dumps(sanitize_live_checkpoint(evidence), sort_keys=True), encoding='utf-8')
+      if store_fault_mode is not None:
+        result['issue7_store_recovery'] = {'stage': 'setup', 'scope': 'one-keycloak-node',
+            'store_fault_mode': store_fault_mode,
+            'fault_evidence_provenance': 'wrapper-mediated-application-path'}
+        checkpoint()
       def issue7_setup_stage(stage):
         if fault_mode is None:
           return
@@ -6124,7 +6163,7 @@ def main():
         resolver_port = free_port()
         key, wrapper, identifier = write_identity(temp, bootstrap, IMAGE)
         issue7_setup_stage('identity_ready')
-        if profile == 'expiry' or fault_mode is not None:
+        if profile == 'expiry' or fault_mode is not None or store_fault_mode is not None:
           unmapped_key = replay_key = None
           unmapped_identifier = replay_identifier = None
         else:
@@ -6133,8 +6172,11 @@ def main():
           replay_key, _, replay_identifier = write_identity(
               temp, bootstrap, IMAGE, label='wallet-login-replay')
         issue7_setup_stage('keycloak_starting')
+        start_options = {'user_readback_fault_mode': fault_mode}
+        if store_fault_mode is not None:
+          start_options['store_fault_mode'] = store_fault_mode
         client = start_keycloak(container, password, wrapper, resolver_port, bootstrap, IMAGE,
-            user_readback_fault_mode=fault_mode)
+            **start_options)
         client.privateClientAdminCredential = password
         if not isinstance(client.wallet_container_id, str):
           raise RuntimeError('Keycloak container ID is unavailable')
@@ -6179,6 +6221,26 @@ def main():
         issue7_setup_stage('events_configuring')
         enable_keycloak_login_events(client, token)
         issue7_setup_stage('events_configured')
+        if store_fault_mode is not None:
+          require('issue7-fault-injection' in runtime_provenance.get('single_use_object_provider_ids', []),
+              'dedicated store fault provider is registered')
+          def save_store_checkpoint(evidence):
+            result['issue7_store_recovery'] = evidence
+            checkpoint()
+          def store_progress(stage, fields):
+            current = dict(result['issue7_store_recovery'])
+            current.update(fields)
+            if current.get('stage') != 'recovery':
+              current['stage'] = 'faulted_signup'
+            save_store_checkpoint(current)
+          issue7_store_recovery.run(sys.modules[__name__], Client(), key, identifier, container,
+              client, IMAGE, store_progress, save_store_checkpoint, profile)
+          print('issue7-store-recovery-evidence=',
+              json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
+          finish_owned_cleanup(registry, resolver_tools)
+          registry = None
+          resolver_tools = None
+          return
         if fault_mode is not None:
           require(runtime_provenance['keycloak_version'] == '26.8.0'
               and runtime_provenance['keycloak_nodes'] == 'one',
