@@ -138,6 +138,24 @@ def read_provider_fault_log_window(container_id, cursor, *, strict=False):
   return logs.stdout
 
 
+def sanitize_success_provider_witness(logs, expected_request_id):
+  """Return one allowlisted selected-provider ID only for an exact request marker."""
+  if (not isinstance(logs, str) or not isinstance(expected_request_id, str)
+      or re.fullmatch(r'[0-9a-f]{32}', expected_request_id) is None):
+    return None
+  pattern = re.compile(r'^[^\r\n]*Wallet proof transaction consumed \(request=([0-9a-f]{32}), provider=(infinispan|jpa|remote|unknown)\)$', re.MULTILINE)
+  matches = pattern.findall(logs)
+  correlated = [provider for request_id, provider in matches if request_id == expected_request_id]
+  if len(matches) != 1 or len(correlated) != 1 or correlated[0] == 'unknown':
+    return None
+  return correlated[0]
+
+
+def read_provider_success_log_window(container_id, cursor):
+  """Bounded production success-marker log window; preserve no raw output downstream."""
+  return read_provider_fault_log_window(container_id, cursor)
+
+
 def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
   """Project a byte-bounded log window into allowlisted counts and fault-mode enum."""
   if not isinstance(logs, str):
@@ -1388,6 +1406,9 @@ def sanitize_live_checkpoint(candidate):
       safe = {'stage': stage}
       if value.get('evidence_provenance') == 'harness-application-path-only':
         safe['evidence_provenance'] = 'harness-application-path-only'
+      if (stage == 'complete'
+          and value.get('single_use_object_provider_id') in {'infinispan', 'jpa', 'remote'}):
+        safe['single_use_object_provider_id'] = value['single_use_object_provider_id']
       safe.update({field: item for field, item in value.items()
           if field in {'signup_intent_action_http', 'signup_proof_http',
               'callback_http', 'pkce_token_http', 'callback_replay',
@@ -4606,6 +4627,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'fresh wallet transaction is bound to signup intent')
   parser = LoginPageParser(); parser.feed(signup_text)
   signup_locator = ''.join(parser.locator_parts).strip()
+  provider_request_id = account_policy_request_id(signup_locator)
   status_url = re.search(r'const statusUrl = "([^"]+)";', signup_text)
   csrf = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', signup_text)
   require(status_url is not None and csrf is not None, 'signup transaction browser binding')
@@ -4676,6 +4698,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     diagnostics = sanitize_user_readback_fault_diagnostics(
         fault_logs, expected_request_id=request_id)
   progress('proof', {'signup_proof_http': proof_status})
+  progress('proof', {'provider_request_id': provider_request_id})
   if store_fault_mode is not None:
     try:
       return issue7_store_recovery.failure_flow(sys.modules[__name__], mode=store_fault_mode,
@@ -4815,6 +4838,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   require(claims.get('decent_identity_id') == identifier,
       'signup ID token contains exact signed wallet Identity claim')
   return {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
+      'provider_request_id': provider_request_id,
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status,
       'callback_http': callback_status, 'callback_replay': True,
       'oidc_state_preserved': location_query.get('state') == [state]}
@@ -4823,8 +4847,13 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
 def run_issue7_signup_success_profile(client, key, identifier, container,
     admin_client, image, progress, checkpoint):
   """Run exactly one ordinary explicit-signup success ceremony and checkpoint its safe facts."""
+  log_cursor = utc_log_cursor()
   evidence = signup_wallet_flow(client, key, identifier, container, admin_client,
       progress, image)
+  request_id = evidence.get('provider_request_id')
+  logs = read_provider_success_log_window(container, log_cursor)
+  provider_id = sanitize_success_provider_witness(logs, request_id)
+  require(provider_id is not None, 'Issue #7 request-correlated selected provider witness')
   require(evidence.get('signup_intent_action_http') == 200
       and evidence.get('signup_proof_http') == 202
       and evidence.get('exact_mapped_users') == 1
@@ -4833,7 +4862,8 @@ def run_issue7_signup_success_profile(client, key, identifier, container,
       and evidence.get('oidc_state_preserved') is True
       and evidence.get('pkce_token_http') == 200,
       'Issue #7 ordinary signup success facts')
-  safe = {'stage': 'complete', 'evidence_provenance': 'harness-application-path-only', **{
+  safe = {'stage': 'complete', 'evidence_provenance': 'harness-application-path-only',
+      'single_use_object_provider_id': provider_id, **{
       field: evidence[field] for field in ('signup_intent_action_http',
           'signup_proof_http', 'exact_mapped_users', 'callback_http',
           'callback_replay', 'oidc_state_preserved', 'pkce_token_http')}}

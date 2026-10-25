@@ -713,6 +713,8 @@ final class WalletLoginTransportHandlerTest {
           .filter(message -> message.startsWith("Wallet pending transaction unavailable ")).toList();
       assertEquals(java.util.List.of("Wallet pending transaction unavailable (request=" + expectedRequestId
           + ", reason=consume-unavailable)"), failureSignals);
+      assertTrue(logMessages.stream().noneMatch(message -> message.startsWith(
+          "Wallet proof transaction consumed (")), logMessages.toString());
       assertTrue(logMessages.stream().noneMatch(message -> message.contains(identity)
           || message.contains(issued.handle()) || message.contains("injected consume storage failure")),
           logMessages.toString());
@@ -985,6 +987,43 @@ final class WalletLoginTransportHandlerTest {
     assertEquals(identity, result.identityId());
     assertEquals(Base64.getUrlEncoder().withoutPadding().encodeToString(rawKey(keyPair)), result.publicKey());
     assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
+  }
+
+  @Test
+  void successfulProofEmitsCorrelatedProviderConsumeWitnessWithoutPrivateValues() throws Exception {
+    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:provider-witness@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var handler = new WalletLoginTransportHandler(store,
+        exact -> new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+        WALLET_ORIGIN, IDP_ORIGIN, exact -> true);
+    var logMessages = new java.util.ArrayList<String>();
+    var logCapture = new java.util.logging.Handler() {
+      @Override public void publish(java.util.logging.LogRecord record) { logMessages.add(record.getMessage()); }
+      @Override public void flush() {}
+      @Override public void close() {}
+    };
+    var logger = java.util.logging.LogManager.getLogManager().getLogger(
+        WalletLoginTransportHandler.class.getName());
+    var oldLevel = logger.getLevel();
+    try {
+      logger.addHandler(logCapture);
+      logger.setLevel(java.util.logging.Level.ALL);
+      var accepted = handler.submitProof(issued.handle(), null, null, null, null,
+          "application/json", null, proof, IDP_ORIGIN, WalletLoginTransactionStore.Intent.SIGNUP);
+      assertEquals(202, accepted.status());
+      String requestId = WalletLoginTransportHandler.requestCorrelationId(issued.handle());
+      assertEquals(java.util.List.of("Wallet proof transaction consumed (request=" + requestId
+          + ", provider=unknown)"), logMessages.stream()
+              .filter(message -> message.startsWith("Wallet proof transaction consumed (")).toList());
+      assertTrue(logMessages.stream().noneMatch(message -> message.contains(identity)
+          || message.contains(issued.handle()) || message.contains(new String(proof, StandardCharsets.UTF_8))));
+    } finally {
+      logger.removeHandler(logCapture);
+      logger.setLevel(oldLevel);
+    }
   }
 
   @Test

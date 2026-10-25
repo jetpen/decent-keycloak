@@ -209,6 +209,8 @@ public final class WalletLoginTransportHandler {
       return HttpResult.empty(503);
     }
     if (consumed.isEmpty()) return HttpResult.empty(409);
+    LOG.infof("Wallet proof transaction consumed (request=%s, provider=%s)", requestId,
+        transactions.singleUseObjectProviderId().id());
     String digest = hex(sha256(body));
     try {
       transactions.markAccepted(handle, binding, digest, proof.identityId(),
