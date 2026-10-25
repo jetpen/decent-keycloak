@@ -113,6 +113,83 @@ class StoreRecoveryTest(unittest.TestCase):
         'signup_proof_http': 503}, checkpoints[0])
     self.assertNotIn('private exception details', json.dumps(checkpoints))
 
+  def test_nonzero_log_read_is_distinct_from_observed_empty_window(self):
+    container = 'a' * 64
+    cursor = '2026-10-21T15:04:05.123456Z'
+    with patch.object(probe, '_bounded_command_tail',
+        return_value=probe.subprocess.CompletedProcess([], 1, 'secret provider output')):
+      self.assertEqual('', probe.read_provider_fault_log_window(container, cursor))
+      with self.assertRaisesRegex(RuntimeError, 'provider fault log window unavailable'):
+        probe.read_provider_fault_log_window(container, cursor, strict=True)
+
+  def test_store_failure_checkpoint_preserves_bounded_diagnostic_snapshot(self):
+    failure = RuntimeError('private exception details')
+    setattr(failure, 'issue7_diagnostics', {
+        'store_diagnostic_read_status': 'observed',
+        'store_provider_selected': True,
+        'store_fault_count': 1,
+        'correlated_store_failure_count': 2,
+        'exception': 'private message', 'request_id': 'private'})
+    api = Mock()
+    api.signup_wallet_flow.side_effect = failure
+    checkpoints = []
+
+    with self.assertRaises(RuntimeError):
+      probe.issue7_store_recovery.run(api, None, None, None, None, None, None,
+          None, lambda value: checkpoints.append(probe.sanitize_live_checkpoint(
+              {'issue7_store_recovery': value})['issue7_store_recovery']),
+          'issue7-consume-loss-recovery')
+
+    self.assertEqual({
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'consume-loss',
+        'failure_stage': 'signup_flow', 'failure_gate': 'unclassified',
+        'failure_category': 'runtime_error',
+        'store_diagnostic_read_status': 'observed',
+        'store_provider_selected': True, 'store_fault_count': 1,
+        'correlated_store_failure_count': 2}, checkpoints[0])
+    self.assertNotIn('private', json.dumps(checkpoints))
+
+  def test_diagnostics_require_exact_request_correlated_provider_and_fault_witnesses(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    other_id = 'f' * 32
+    mode = 'consume-loss'
+    provider = f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={request_id}'
+    fault = f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}'
+    production = f'Wallet pending transaction unavailable (request={request_id}, reason=consume-unavailable)'
+    observed = probe.issue7_store_recovery.diagnostics('\n'.join((provider, fault, production)), mode, request_id)
+    self.assertEqual({'store_fault_count': 1, 'correlated_store_failure_count': 1,
+        'store_provider_selected': True}, observed)
+
+    unrelated = '\n'.join((
+        f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={other_id}',
+        f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={other_id}',
+        production))
+    self.assertEqual({'store_fault_count': 0, 'correlated_store_failure_count': 1,
+        'store_provider_selected': False},
+        probe.issue7_store_recovery.diagnostics(unrelated, mode, request_id))
+
+  def test_diagnostics_do_not_accept_factory_or_unrelated_marker_only_evidence(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    logs = ('ISSUE7_TEST_PROVIDER: factory selected\n'
+        f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS["consume-loss"]}\n'
+        f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={"f" * 32}\n'
+        f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS["consume-loss"]} request={"f" * 32}')
+    observed = probe.issue7_store_recovery.diagnostics(logs, 'consume-loss', request_id)
+    self.assertEqual({'store_fault_count': 0, 'correlated_store_failure_count': 0,
+        'store_provider_selected': False}, observed)
+
+  def test_failure_gate_sanitizer_uses_shared_allowlist(self):
+    gates = probe.issue7_store_recovery.FAILURE_GATES
+    accepted = 'store_correlation'
+    self.assertIn(accepted, gates)
+    sanitized = probe.sanitize_live_checkpoint({'issue7_store_recovery': {
+        'failure_gate': accepted}})['issue7_store_recovery']
+    self.assertEqual(accepted, sanitized['failure_gate'])
+    rejected = probe.sanitize_live_checkpoint(
+        {'issue7_store_recovery': {'failure_gate': 'unsupported_gate'}})
+    self.assertNotIn('failure_gate', rejected.get('issue7_store_recovery', {}))
+
   def test_store_profiles_are_explicitly_allowlisted(self):
     for profile in ('issue7-consume-loss-recovery', 'issue7-accepted-receipt-write-recovery',
         'issue7-accepted-receipt-write-false-recovery'):
@@ -130,6 +207,8 @@ class ScriptClient:
   def request(self, method, url, data=None, headers=None, **kwargs):
     self.calls.append((method, url, data, headers))
     response = self.responses.pop(0)
+    if isinstance(response, BaseException):
+      raise response
     if len(response) == 4:
       self.redirects.extend(response[3])
     return response[:3]
@@ -159,8 +238,8 @@ class FailureFlowTest(unittest.TestCase):
       branch = (f'Wallet pending transaction unavailable (request={request_id}, reason=consume-unavailable)'
           if mode == 'consume-loss' else
           f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)')
-      logs = ('ISSUE7_TEST_PROVIDER: factory selected\nISSUE7_TEST_FAULT: '
-          + probe.issue7_store_recovery.MARKERS[mode] + '\n' + branch)
+      logs = (f'ISSUE7_TEST_PROVIDER_OPERATION: operation={"transaction_remove" if mode == "consume-loss" else "accepted_replace"} request={request_id}\n'
+          + f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}\n' + branch)
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
       stack.enter_context(patch.object(probe, 'Client', return_value=wallet))
       stack.enter_context(patch.object(probe, 'admin_token', return_value='token'))
@@ -176,6 +255,67 @@ class FailureFlowTest(unittest.TestCase):
     self.assertEqual([], browser.responses)
     self.assertEqual([], wallet.responses)
     return result
+
+  def test_real_signup_proof_request_exception_still_reads_bounded_fixture_diagnostics(self):
+    failure = RuntimeError('private transport detail')
+    with redirect_stdout(StringIO()):
+      with self.assertRaises(RuntimeError) as caught:
+        self.run_signup('consume-loss', mutation=(0, failure))
+
+    self.assertIs(failure, caught.exception)
+    self.assertEqual('signup_proof', getattr(failure, 'failure_stage', None))
+    self.assertEqual('proof_post', getattr(failure, 'failure_gate', None))
+    self.assertEqual('runtime_error', getattr(failure, 'failure_category', None))
+    checkpoints = []
+    probe.issue7_store_recovery.checkpoint_signup_failure(
+        lambda evidence: checkpoints.append(probe.sanitize_live_checkpoint(
+            {'issue7_store_recovery': evidence})['issue7_store_recovery']),
+        failure, mode_field='store_fault_mode', mode='consume-loss')
+    self.assertEqual(('signup_proof', 'proof_post', 'runtime_error'),
+        (checkpoints[0]['failure_stage'], checkpoints[0]['failure_gate'],
+         checkpoints[0]['failure_category']))
+    diagnostics = getattr(failure, 'issue7_diagnostics')
+    self.assertEqual({
+        'store_diagnostic_read_status': 'observed',
+        'store_provider_selected': True,
+        'store_fault_count': 1,
+        'correlated_store_failure_count': 1}, diagnostics)
+    sanitized = probe.sanitize_live_checkpoint({'issue7_store_recovery': {
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'consume-loss', **diagnostics}})
+    self.assertEqual({
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'consume-loss',
+        'store_diagnostic_read_status': 'observed',
+        'store_provider_selected': True, 'store_fault_count': 1,
+        'correlated_store_failure_count': 1}, sanitized['issue7_store_recovery'])
+    self.assertNotIn('private transport detail', json.dumps(sanitized))
+
+  def test_proof_http_contract_failure_is_classified(self):
+    with redirect_stdout(StringIO()):
+      with self.assertRaises(RuntimeError) as caught:
+        self.run_signup('consume-loss', mutation=(0, (502, {}, b'')))
+    self.assertEqual(('signup_proof', 'proof_http_status', 'assertion_failed'),
+        (caught.exception.failure_stage, caught.exception.failure_gate,
+         caught.exception.failure_category))
+
+  def test_status_and_identical_retry_contract_failures_have_distinct_gates(self):
+    for index, gate in ((1, 'proof_status'), (2, 'identical_retry')):
+      with self.subTest(index=index), redirect_stdout(StringIO()):
+        with self.assertRaises(RuntimeError) as caught:
+          self.run_signup('consume-loss', mutation=(index, (200, {}, b'')))
+      self.assertEqual(('signup_proof', gate, 'assertion_failed'),
+          (caught.exception.failure_stage, caught.exception.failure_gate,
+           caught.exception.failure_category))
+
+  def test_store_correlation_failure_has_explicit_bounded_gate(self):
+    logs = 'ISSUE7_TEST_PROVIDER: factory selected\\nISSUE7_TEST_FAULT: pending consume committed then threw'
+    with redirect_stdout(StringIO()):
+      with self.assertRaises(RuntimeError) as caught:
+        self.run_signup('consume-loss', logs=logs)
+    self.assertEqual(('signup_proof', 'store_correlation', 'assertion_failed'),
+        (caught.exception.failure_stage, caught.exception.failure_gate,
+         caught.exception.failure_category))
 
   def test_real_signup_failure_path_for_each_mode(self):
     for mode in probe.issue7_store_recovery.PROFILES.values():
@@ -357,6 +497,39 @@ class MainCoordinatorTest(unittest.TestCase):
         'failure_category': 'assertion_failed',
         'signup_intent_action_http': 200, 'signup_proof_http': 503}, evidence)
     self.assertNotIn('private exception details', json.dumps(checkpoints))
+
+  def test_production_main_failure_checkpoint_preserves_bounded_diagnostic_snapshot(self):
+    failure = RuntimeError('private exception details')
+    failure.failure_stage = 'signup_proof'
+    failure.failure_gate = 'proof_http_status'
+    failure.failure_category = 'runtime_error'
+    failure.failure_http_status = 503
+    setattr(failure, 'issue7_diagnostics', {
+        'store_diagnostic_read_status': 'unavailable',
+        'store_provider_selected': False,
+        'store_fault_count': 0,
+        'correlated_store_failure_count': 0,
+        'exception': 'private message'})
+
+    def fail_after_progress(*args, **kwargs):
+      args[5]('faulted_signup', {'signup_intent_action_http': 200})
+      raise failure
+
+    checkpoints, *_ = self.run_main(
+        'issue7-accepted-receipt-write-recovery', failed=fail_after_progress,
+        expect_failure=True)
+
+    self.assertEqual({
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'accepted-receipt-write',
+        'fault_evidence_provenance': 'wrapper-mediated-application-path',
+        'failure_stage': 'signup_proof', 'failure_gate': 'proof_http_status',
+        'failure_category': 'runtime_error', 'signup_proof_http': 503,
+        'signup_intent_action_http': 200,
+        'store_diagnostic_read_status': 'unavailable',
+        'store_provider_selected': False, 'store_fault_count': 0,
+        'correlated_store_failure_count': 0}, checkpoints[-1]['issue7_store_recovery'])
+    self.assertNotIn('private', json.dumps(checkpoints))
 
   def test_production_main_does_not_label_unclassified_status_as_signup_proof(self):
     failure = RuntimeError('private exception details')
