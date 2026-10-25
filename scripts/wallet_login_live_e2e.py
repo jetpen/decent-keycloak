@@ -3109,6 +3109,11 @@ def callback_authenticator_lifecycle_log_outcome(log_text, request_id):
   return result
 
 
+def subject_matches_expected(claims, expected_subject):
+  """Compare an ID-token subject without returning the private subject value."""
+  return claims.get('sub') == expected_subject
+
+
 def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
     progress_callback=None, admin_access_token=None, expected_subject=None):
   def report_progress(stage, **facts):
@@ -3481,8 +3486,10 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   require(CLIENT in (aud if isinstance(aud, list) else [aud]), 'ID token audience')
   require(claims.get('nonce') == nonce, 'OIDC nonce binding')
   require(claims.get('sub') and claims.get('sub') != identifier, 'opaque local Keycloak subject')
-  if expected_subject is not None:
-    require(claims.get('sub') == expected_subject, 'fresh login returns retained exact account subject')
+  subject_match = (subject_matches_expected(claims, expected_subject)
+      if expected_subject is not None else None)
+  if subject_match is not None:
+    require(subject_match, 'fresh login returns retained exact account subject')
   auth_result = {
       'login_page_http': status,
       'proof_post_http': submitted, 'initial_status_http': polled,
@@ -3515,8 +3522,8 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   }
   if prior_locator is not None:
     auth_result['fresh_locator_distinct'] = locator != prior_locator
-  if expected_subject is not None:
-    auth_result['local_subject'] = claims['sub']
+  if subject_match is not None:
+    auth_result['local_subject_matches_expected'] = subject_match
   return auth_result
 
 
@@ -4837,11 +4844,15 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   require(claims.get('sub') == matched[0].get('id'), 'signup returns created opaque Keycloak subject')
   require(claims.get('decent_identity_id') == identifier,
       'signup ID token contains exact signed wallet Identity claim')
-  return {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
+  result = {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
       'provider_request_id': provider_request_id,
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status,
       'callback_http': callback_status, 'callback_replay': True,
       'oidc_state_preserved': location_query.get('state') == [state]}
+  if expected_subject is not None:
+    result['local_subject_matches_expected'] = subject_matches_expected(
+        claims, expected_subject)
+  return result
 
 
 def run_issue7_signup_success_profile(client, key, identifier, container,
@@ -4890,7 +4901,7 @@ def run_issue7_single_node_signup_recovery_profile(client, key, identifier, cont
   recovered = signup_wallet_flow(Client(), key, identifier, container, admin_client,
       phase_progress, image, reuse_existing=True)
   same_subject = (failed.get('expected_existing_subject') is not None
-      and recovered.get('local_subject') == failed.get('expected_existing_subject'))
+      and recovered.get('local_subject_matches_expected') is True)
   require(same_subject, 'fresh signup reused the retained exact local account subject')
   evidence = {
       'stage': 'complete',

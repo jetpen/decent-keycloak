@@ -186,7 +186,7 @@ def run(api, client, key, identifier, container, admin_client, image, progress, 
     recovered = api.signup_wallet_flow(api.Client(), key, identifier, container,
         admin_client, progress, image, reuse_existing=True)
     valid = recovered.get('signup_proof_http') == 202 and recovered.get('exact_mapped_users') == 1
-  same_subject = recovered.get('local_subject') == failed['expected_existing_subject']
+  same_subject = recovered.get('local_subject_matches_expected') is True
   api.require(valid and same_subject and recovered.get('callback_http') in {302, 303}
       and recovered.get('pkce_token_http') == 200,
       'fresh recovery completes callback and PKCE for the retained exact subject')

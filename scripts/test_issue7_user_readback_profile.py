@@ -1,5 +1,6 @@
 """Offline contract tests for the Issue #7 user-readback profile."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,13 @@ ROOT = Path(__file__).parents[1]
 
 
 class UserReadbackProfileTest(unittest.TestCase):
+  def test_subject_match_predicate_compares_exact_claim_without_returning_it(self):
+    self.assertTrue(probe.subject_matches_expected({'sub': 'retained-subject'},
+        'retained-subject'))
+    self.assertFalse(probe.subject_matches_expected({'sub': 'different-subject'},
+        'retained-subject'))
+    self.assertFalse(probe.subject_matches_expected({}, 'retained-subject'))
+
   def test_dedicated_signup_success_profile_is_allowlisted_and_selected(self):
     profile = 'issue7-signup-success'
     self.assertIn(profile, probe.SUPPORTED_LIVE_PROFILES)
@@ -174,11 +182,23 @@ class UserReadbackProfileTest(unittest.TestCase):
           return_value=f'Wallet proof transaction consumed (request={request_id}, provider=infinispan)'))
       stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
       stack.enter_context(patch.object(Path, 'write_text', autospec=True, side_effect=capture))
+      actual_signup_results = []
+      real_signup_flow = probe.signup_wallet_flow
+      def observe_signup_flow(*args, **kwargs):
+        result = real_signup_flow(*args, **kwargs)
+        actual_signup_results.append(result)
+        return result
+      signup_flow = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
+          side_effect=observe_signup_flow))
       dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
           wraps=probe.dispatch_live_profile))
       printed = stack.enter_context(patch('builtins.print'))
       probe.main()
     identity.assert_called_once()
+    self.assertEqual(1, signup_flow.call_count)
+    self.assertNotIn('local_subject_matches_expected', actual_signup_results[0])
+    self.assertNotIn('local_subject', actual_signup_results[0])
+    self.assertNotIn('private-subject', json.dumps(actual_signup_results[0]))
     self.assertEqual(1, dispatcher.call_count)
     self.assertEqual('issue7-signup-success', dispatcher.call_args.args[0])
     self.assertEqual(1, len([request for request in browser.requests
@@ -203,6 +223,223 @@ class UserReadbackProfileTest(unittest.TestCase):
         if call.args and call.args[0] == 'issue7-signup-success-evidence=']
     self.assertEqual(1, len(output))
     self.assertEqual(final, json.loads(output[0])['signup_case'])
+
+  def test_production_main_runs_real_readback_failure_and_fresh_signup_for_each_mode(self):
+    profiles = {
+        'issue7-user-readback-empty': 'empty',
+        'issue7-user-readback-throw': 'throw',
+        'issue7-user-readback-overcap': 'over-cap',
+    }
+    for profile, mode in profiles.items():
+      with self.subTest(profile=profile):
+        locators = {
+            1: ('https://idp.example:' + str(probe.KC_PORT) + '/auth/realms/'
+                + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'A' * 43),
+            2: ('https://idp.example:' + str(probe.KC_PORT) + '/auth/realms/'
+                + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'B' * 43),
+        }
+        status_url = ('/auth/realms/' + probe.REALM
+            + '/decent-wallet-login/v1/transactions/status')
+        callback_query = urllib.parse.urlencode({'session_code': 's', 'execution': 'e',
+            'client_id': 'c', 'tab_id': 't', 'client_data': 'd'})
+        callback = (f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}'
+            + '/login-actions/authenticate?' + callback_query)
+        subject = 'private-subject'
+        identifier = 'private-identity'
+        user = {'attributes': {'decent_identity_id': [identifier]},
+            'enabled': True, 'id': subject}
+        events = []
+
+        class ScriptedClient:
+          def __init__(self, name, ceremony, kind):
+            self.name = name
+            self.ceremony = ceremony
+            self.kind = kind
+            self.redirects = []
+            self.privateClientAdminCredential = '[REDACTED]'
+            self.wallet_container_id = None
+            self.requests = []
+            self.state = None
+            self.callback_count = 0
+
+          def request(self, method, path, data=None, headers=None, timeout=10):
+            self.requests.append((method, path, data, headers))
+            parsed = urllib.parse.urlsplit(path)
+            if (self.kind == 'browser' and method == 'GET'
+                and '/protocol/openid-connect/auth?' in path):
+              events.append(self.name + ':auth')
+              self.state = urllib.parse.parse_qs(parsed.query)['state'][0]
+              html = (f'<p id="wallet-locator">{locators[self.ceremony]}</p>'
+                  f'<form method="post" action="/auth/realms/{probe.REALM}/login-actions/'
+                  f'authenticate?session_code=s&amp;execution=e&amp;client_id=c&amp;tab_id=t&amp;client_data=d">'
+                  '<input type="hidden" name="wallet_intent" value="signup"></form>')
+              return 200, {}, html.encode()
+            if (self.kind == 'browser' and method == 'POST'
+                and 'login-actions/authenticate?' in path):
+              events.append(self.name + ':intent')
+              html = (f'<p id="wallet-locator">{locators[self.ceremony]}</p>'
+                  f'<script>const statusUrl = "{status_url}"; const csrfToken = "{"A" * 43}";</script>'
+                  'Creating a new account with this wallet identity.')
+              return 200, {}, html.encode()
+            if self.kind == 'wallet' and method == 'GET' and path == locators[self.ceremony]:
+              events.append(self.name + ':challenge')
+              return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+                  'challenge': 'challenge-' + str(self.ceremony),
+                  'csrf_token': 'A' * 43}).encode()
+            if self.kind == 'wallet' and method == 'POST' and path == locators[self.ceremony]:
+              events.append(self.name + ':proof')
+              if self.ceremony == 1:
+                return 503, {}, b''
+              return 202, {}, b''
+            if self.kind == 'browser' and method == 'GET' and path == status_url:
+              events.append(self.name + ':status')
+              if self.ceremony == 1:
+                return 200, {}, b'{"status":"pending"}'
+              return 200, {}, json.dumps({'status': 'accepted', 'callback': callback}).encode()
+            if (self.kind == 'browser' and method == 'GET'
+                and parsed.path.endswith('/login-actions/authenticate')):
+              events.append(self.name + ':callback')
+              self.callback_count += 1
+              if self.callback_count == 1:
+                return 302, {'Location': probe.REDIRECT + '?' + urllib.parse.urlencode(
+                    {'code': 'opaque-code', 'state': self.state})}, b''
+              return 302, {'Location': probe.REDIRECT + '?' + urllib.parse.urlencode(
+                  {'error': 'invalid_request', 'state': self.state})}, b''
+            if (self.kind == 'browser' and method == 'POST'
+                and parsed.path.endswith('/protocol/openid-connect/token')):
+              events.append(self.name + ':token')
+              return 200, {}, b'{"id_token":"unused-token"}'
+            raise AssertionError((self.name, method, path))
+
+        browser_failed = ScriptedClient('browser-1', 1, 'browser')
+        wallet_failed = ScriptedClient('wallet-1', 1, 'wallet')
+        browser_recovered = ScriptedClient('browser-2', 2, 'browser')
+        wallet_recovered = ScriptedClient('wallet-2', 2, 'wallet')
+        client_factory = Mock(side_effect=[browser_failed, wallet_failed,
+            browser_recovered, wallet_recovered])
+        admin = Mock(wallet_container_id='a' * 64)
+        admin_reads = [
+            (200, {}, b'[]'),
+            (200, {}, json.dumps([user]).encode()),
+            (200, {}, json.dumps([user]).encode()),
+            (200, {}, json.dumps([user]).encode()),
+        ]
+        request_id = hashlib.sha256(('A' * 43).encode('ascii')).hexdigest()[:32]
+        fault_tail = ('ISSUE7_USER_READBACK_PROVIDER: factory selected' + chr(10)
+            + f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}')
+        fault_window = ('ISSUE7_USER_READBACK_PROVIDER: factory selected' + chr(10)
+            + f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}' + chr(10)
+            + 'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted' + chr(10)
+            + f'Wallet account mapping lookup unavailable (request={request_id}, '
+            + 'IdentityMappingUnavailableException)')
+        checkpoints = []
+        original_write_text = Path.write_text
+
+        def capture_checkpoint(path, data, *args, **kwargs):
+          if path.name == 'live-evidence.json':
+            checkpoints.append(json.loads(data))
+          return original_write_text(path, data, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+          key_path = Path(scratch) / 'identity.pem'
+          stack.enter_context(patch.object(probe, 'SCRATCH', scratch))
+          stack.enter_context(patch.object(probe, 'IMAGE', probe.IMAGE))
+          stack.enter_context(patch.object(probe, 'RUN_CID_DIR', None))
+          stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE': profile,
+              'WALLET_IT_USER_READBACK_IMAGE': 'test-image'}, clear=False))
+          stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+              return_value=('test-image', 'sha256:' + 'a' * 64)))
+          stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+          stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
+          stack.enter_context(patch.object(probe, 'start_registry',
+              return_value=('registry', 'bootstrap', 1234)))
+          stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
+          identity = stack.enter_context(patch.object(probe, 'write_identity',
+              return_value=(key_path, Path(scratch) / 'wrapper', identifier)))
+          stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
+          stack.enter_context(patch.object(probe, 'admin_token', return_value='[REDACTED]'))
+          stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
+              'runtime_qualification_status': 'runtime_facts_verified',
+              'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
+          stack.enter_context(patch.object(probe, 'configure_realm'))
+          stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
+          admin_call = stack.enter_context(patch.object(probe, 'admin_call', side_effect=admin_reads))
+          stack.enter_context(patch.object(probe, 'Client', client_factory))
+          stack.enter_context(patch.object(probe.subprocess, 'run',
+              return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
+          stack.enter_context(patch.object(probe, 'verify_id_token', return_value={
+              'sub': subject, 'decent_identity_id': identifier}))
+          stack.enter_context(patch.object(probe, 'read_provider_fault_log_tail',
+              return_value=fault_tail))
+          window = stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
+              return_value=fault_window))
+          sleep = stack.enter_context(patch.object(probe.time, 'sleep'))
+          stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
+          stack.enter_context(patch.object(Path, 'write_text', autospec=True,
+              side_effect=capture_checkpoint))
+          dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
+              wraps=probe.dispatch_live_profile))
+          printed = stack.enter_context(patch('builtins.print'))
+          probe.main()
+
+        identity.assert_called_once()
+        self.assertEqual(4, client_factory.call_count)
+        self.assertEqual(4, admin_call.call_count)
+        self.assertEqual(1, window.call_count)
+        self.assertEqual('issue7-user-readback-' + ('overcap' if mode == 'over-cap' else mode),
+            dispatcher.call_args.args[0])
+        self.assertEqual(1, dispatcher.call_count)
+        self.assertEqual(1, len([request for request in wallet_failed.requests
+            if request[0] == 'POST' and request[1] == locators[1]]))
+        self.assertEqual(1, len([request for request in wallet_recovered.requests
+            if request[0] == 'POST' and request[1] == locators[2]]))
+        self.assertNotEqual(locators[1], locators[2])
+        self.assertEqual([], wallet_failed.redirects)
+        self.assertEqual(1, sum(1 for event in events if event == 'browser-1:status'))
+        self.assertEqual(2, sum(1 for event in events if event == 'browser-2:callback'))
+        self.assertEqual(1, sleep.call_count)
+        sleep.assert_called_once_with(probe.IDENTITY_LOOKUP_COOLDOWN_SECONDS
+            + probe.IDENTITY_LOOKUP_COOLDOWN_MARGIN_SECONDS)
+        self.assertEqual(['GET'] * 4, [call.args[2] for call in admin_call.call_args_list])
+        for call in admin_call.call_args_list:
+          self.assertIn('decent_identity_id', call.args[3])
+          self.assertIn('max=10', call.args[3])
+        self.assertEqual([
+            'browser-1:auth', 'browser-1:intent', 'wallet-1:challenge',
+            'wallet-1:proof', 'browser-1:status', 'browser-2:auth',
+            'browser-2:intent', 'wallet-2:challenge', 'wallet-2:proof',
+            'browser-2:status', 'browser-2:callback', 'browser-2:callback',
+            'browser-2:token'], events)
+        self.assertGreaterEqual(len(checkpoints), 12)
+        evidence = checkpoints[-1]['issue7_single_node_signup_recovery']
+        self.assertEqual('complete', evidence['stage'])
+        self.assertEqual('one-keycloak-node', evidence['scope'])
+        self.assertEqual(mode, evidence['user_readback_fault_mode'])
+        self.assertEqual(mode, evidence['effective_user_readback_fault_mode'])
+        self.assertEqual('wrapper-mediated-application-path', evidence['fault_evidence_provenance'])
+        self.assertTrue(evidence['same_local_subject'])
+        self.assertTrue(evidence['account_retained_after_failure'])
+        self.assertTrue(evidence['failure_responses_no_callback_or_code'])
+        self.assertTrue(evidence['browser_status_pending'])
+        self.assertEqual(503, evidence['provider_fault_http'])
+        self.assertEqual(200, evidence['browser_status_http'])
+        self.assertEqual(1, evidence['post_create_read_fault_count'])
+        self.assertGreaterEqual(evidence['correlated_mapping_failure_count'], 1)
+        self.assertEqual([1, 1], evidence['exact_enabled_local_accounts_after_each_signup'])
+        self.assertEqual(65 if mode == 'over-cap' else 0, evidence['synthetic_candidate_count'])
+        self.assertEqual(202, evidence['fresh_signup_proof_http'])
+        self.assertEqual(302, evidence['fresh_signup_callback_http'])
+        self.assertEqual(200, evidence['fresh_signup_pkce_token_http'])
+        serialized = json.dumps(checkpoints)
+        for forbidden in (identifier, subject, locators[1], locators[2], 'opaque-code',
+            'challenge-1', 'challenge-2', 'unused-token', 'A' * 43,
+            'expected_existing_subject', 'IdentityMappingUnavailableException'):
+          self.assertNotIn(forbidden, serialized)
+        printed_payloads = [call.args[1] for call in printed.call_args_list
+            if call.args and call.args[0] == 'issue7-user-readback-evidence=']
+        self.assertEqual(1, len(printed_payloads))
+        self.assertEqual(evidence, json.loads(printed_payloads[0])[
+            'issue7_single_node_signup_recovery'])
 
   def test_selected_provider_checkpoint_is_complete_only_and_allowlisted(self):
     complete = probe.sanitize_live_checkpoint({'signup_case': {
@@ -367,7 +604,8 @@ class UserReadbackProfileTest(unittest.TestCase):
         'effective_user_readback_fault_mode': 'over-cap', 'correlated_mapping_failure_count': 1,
         'exact_mapped_users': 1, 'expected_existing_subject': 'local-subject'}
     recovered = {'signup_proof_http': 202, 'callback_http': 302,
-        'pkce_token_http': 200, 'exact_mapped_users': 1, 'local_subject': 'local-subject'}
+        'pkce_token_http': 200, 'exact_mapped_users': 1,
+        'local_subject_matches_expected': True}
     with patch.object(probe, 'signup_wallet_flow', side_effect=[failed, recovered]) as signup, \
         patch.object(probe, 'Client', return_value=Mock()), \
         patch.object(probe, 'wait_for_identity_lookup_cooldown') as wait:
@@ -404,7 +642,8 @@ class UserReadbackProfileTest(unittest.TestCase):
         'effective_user_readback_fault_mode': 'over-cap', 'correlated_mapping_failure_count': 1,
         'exact_mapped_users': 1, 'expected_existing_subject': 'local-subject'}
     recovered = {'signup_proof_http': 202, 'callback_http': 302,
-        'pkce_token_http': 200, 'exact_mapped_users': 1, 'local_subject': 'local-subject'}
+        'pkce_token_http': 200, 'exact_mapped_users': 1,
+        'local_subject_matches_expected': True}
     original_write_text = Path.write_text
     checkpoints = []
     def capture(path, data, *args, **kwargs):
