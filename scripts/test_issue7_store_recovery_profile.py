@@ -16,6 +16,103 @@ import wallet_login_live_e2e as probe
 
 
 class StoreRecoveryTest(unittest.TestCase):
+  def test_non_http_return_code_is_not_labeled_or_serialized_as_http(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False, 'packaged Registry command', 503)
+
+    self.assertNotIn('HTTP 503', str(caught.exception))
+    self.assertIn('(code 503)', str(caught.exception))
+    self.assertFalse(hasattr(caught.exception, 'failure_http_status'))
+
+  def test_explicit_gate_does_not_type_an_unlabelled_code_as_http(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False, 'wallet proof POST failed', 503, failure_gate='proof_post')
+
+    self.assertEqual('proof_post', getattr(caught.exception, 'failure_gate', None))
+    self.assertFalse(hasattr(caught.exception, 'failure_http_status'))
+
+  def test_non_integer_diagnostic_detail_is_not_called_a_return_code(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False, 'fresh resolver result', 'unavailable')
+
+    self.assertNotIn('(code unavailable)', str(caught.exception))
+
+  def test_unrelated_http_status_is_not_mislabeled_as_signup_proof(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False, 'signup intent action returned unexpected status', 503, http_status=503)
+
+    self.assertEqual('unclassified', getattr(caught.exception, 'failure_gate', None))
+    self.assertEqual(503, getattr(caught.exception, 'failure_http_status', None))
+
+  def test_explicit_failure_gate_is_preserved(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False, 'wallet proof POST failed', 503,
+          failure_gate='proof_post', http_status=503)
+
+    self.assertEqual('proof_post', getattr(caught.exception, 'failure_gate', None))
+
+  def test_store_failure_checkpoint_does_not_mask_original_exception(self):
+    failure = RuntimeError('original signup failure')
+    api = Mock()
+    api.signup_wallet_flow.side_effect = failure
+
+    def broken_checkpoint(_):
+      raise ValueError('checkpoint write failed')
+
+    with self.assertRaises(RuntimeError) as caught:
+      probe.issue7_store_recovery.run(api, None, None, None, None, None, None,
+          None, broken_checkpoint, 'issue7-consume-loss-recovery')
+
+    self.assertIs(failure, caught.exception)
+    self.assertIn('Issue #7 failure checkpoint could not be written', failure.__notes__)
+
+  def test_issue7_failure_assertion_attaches_only_allowlisted_context(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False,
+          'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code',
+          503, http_status=503)
+
+    failure = caught.exception
+    self.assertEqual('signup_proof', getattr(failure, 'failure_stage', None))
+    self.assertEqual('proof_http_status', getattr(failure, 'failure_gate', None))
+    self.assertEqual('assertion_failed', getattr(failure, 'failure_category', None))
+    self.assertEqual(503, getattr(failure, 'failure_http_status', None))
+    self.assertNotIn('private', str(failure))
+
+  def test_issue7_readback_assertion_gets_its_own_bounded_stage_and_gate(self):
+    with self.assertRaises(RuntimeError) as caught:
+      probe.require(False, 'post-create readback failure retains one exact enabled account')
+
+    self.assertEqual('user_readback', getattr(caught.exception, 'failure_stage', None))
+    self.assertEqual('account_readback', getattr(caught.exception, 'failure_gate', None))
+
+  def test_store_failure_checkpoint_captures_sanitized_stage_gate_and_http_status(self):
+    failure = RuntimeError('private exception details')
+    setattr(failure, 'failure_stage', 'signup_proof')
+    setattr(failure, 'failure_gate', 'proof_http_status')
+    setattr(failure, 'failure_category', 'assertion_failed')
+    setattr(failure, 'failure_http_status', 503)
+    api = Mock()
+    api.signup_wallet_flow.side_effect = failure
+    checkpoints = []
+
+    def checkpoint(value):
+      checkpoints.append(probe.sanitize_live_checkpoint(
+          {'issue7_store_recovery': value})['issue7_store_recovery'])
+
+    with self.assertRaisesRegex(RuntimeError, 'private exception details'):
+      probe.issue7_store_recovery.run(api, None, None, None, None, None, None,
+          None, checkpoint, 'issue7-consume-loss-recovery')
+
+    api.signup_wallet_flow.assert_called_once()
+    self.assertEqual(1, len(checkpoints))
+    self.assertEqual({
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'consume-loss', 'failure_stage': 'signup_proof',
+        'failure_gate': 'proof_http_status', 'failure_category': 'assertion_failed',
+        'signup_proof_http': 503}, checkpoints[0])
+    self.assertNotIn('private exception details', json.dumps(checkpoints))
+
   def test_store_profiles_are_explicitly_allowlisted(self):
     for profile in ('issue7-consume-loss-recovery', 'issue7-accepted-receipt-write-recovery',
         'issue7-accepted-receipt-write-false-recovery'):
@@ -209,8 +306,9 @@ class MainCoordinatorTest(unittest.TestCase):
           'Client': client, 'cleanup_owned_resources': 0,
           'finish_owned_cleanup': None, 'wait_for_identity_lookup_cooldown': None}.items():
         mocks[name] = stack.enter_context(patch.object(probe, name, return_value=value))
+      signup_effect = failed if callable(failed) else ([failed] if receipt else [failed, recovered])
       signup = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
-          side_effect=[failed] if receipt else [failed, recovered]))
+          side_effect=signup_effect))
       login = stack.enter_context(patch.object(probe, 'auth_flow', return_value=recovered))
       calls = Mock()
       calls.attach_mock(signup, 'signup')
@@ -231,6 +329,94 @@ class MainCoordinatorTest(unittest.TestCase):
           mocks['start_keycloak'].call_args.kwargs['store_fault_mode'])
       mocks['write_identity'].assert_called_once()
     return checkpoints, signup, login, calls, mocks
+
+  def test_production_main_preserves_failure_facts_in_final_sanitized_checkpoint(self):
+    failure = RuntimeError('private exception details')
+    setattr(failure, 'failure_stage', 'signup_proof')
+    setattr(failure, 'failure_gate', 'proof_http_status')
+    setattr(failure, 'failure_category', 'assertion_failed')
+    setattr(failure, 'failure_http_status', 503)
+
+    def fail_after_progress(*args, **kwargs):
+      args[5]('faulted_signup', {'signup_intent_action_http': 200})
+      raise failure
+
+    checkpoints, signup, login, calls, mocks = self.run_main(
+        'issue7-accepted-receipt-write-recovery', failed=fail_after_progress, expect_failure=True)
+
+    signup.assert_called_once()
+    login.assert_not_called()
+    mocks['wait_for_identity_lookup_cooldown'].assert_not_called()
+    self.assertGreaterEqual(len(checkpoints), 1)
+    evidence = checkpoints[-1]['issue7_store_recovery']
+    self.assertEqual({
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'accepted-receipt-write',
+        'fault_evidence_provenance': 'wrapper-mediated-application-path',
+        'failure_stage': 'signup_proof', 'failure_gate': 'proof_http_status',
+        'failure_category': 'assertion_failed',
+        'signup_intent_action_http': 200, 'signup_proof_http': 503}, evidence)
+    self.assertNotIn('private exception details', json.dumps(checkpoints))
+
+  def test_production_main_does_not_label_unclassified_status_as_signup_proof(self):
+    failure = RuntimeError('private exception details')
+    setattr(failure, 'failure_stage', 'signup_flow')
+    setattr(failure, 'failure_gate', 'unclassified')
+    setattr(failure, 'failure_category', 'assertion_failed')
+    setattr(failure, 'failure_http_status', 503)
+
+    def fail_after_progress(*args, **kwargs):
+      args[5]('faulted_signup', {'signup_intent_action_http': 200})
+      raise failure
+
+    checkpoints, _, _, _, _ = self.run_main(
+        'issue7-accepted-receipt-write-recovery', failed=fail_after_progress, expect_failure=True)
+    evidence = checkpoints[-1]['issue7_store_recovery']
+
+    self.assertEqual('unclassified', evidence['failure_gate'])
+    self.assertIn('failure_http_status', evidence)
+    self.assertEqual(503, evidence['failure_http_status'])
+    self.assertNotIn('signup_proof_http', evidence)
+
+  def test_user_readback_checkpoint_does_not_mask_original_exception(self):
+    failure = RuntimeError('original readback failure')
+
+    def broken_checkpoint(_):
+      raise ValueError('checkpoint write failed')
+
+    with patch.object(probe, 'signup_wallet_flow', side_effect=failure):
+      with self.assertRaises(RuntimeError) as caught:
+        probe.run_issue7_single_node_signup_recovery_profile(
+            None, None, None, None, None, None, None, broken_checkpoint,
+            'issue7-user-readback-empty')
+
+    self.assertIs(failure, caught.exception)
+    self.assertIn('Issue #7 failure checkpoint could not be written', failure.__notes__)
+
+  def test_user_readback_failure_checkpoint_captures_sanitized_stage_and_status(self):
+    failure = RuntimeError('private exception details')
+    setattr(failure, 'failure_stage', 'signup_proof')
+    setattr(failure, 'failure_gate', 'proof_http_status')
+    setattr(failure, 'failure_category', 'assertion_failed')
+    setattr(failure, 'failure_http_status', 503)
+    checkpoints = []
+
+    def checkpoint(value):
+      checkpoints.append(probe.sanitize_live_checkpoint(
+          {'issue7_single_node_signup_recovery': value})['issue7_single_node_signup_recovery'])
+
+    with patch.object(probe, 'signup_wallet_flow', side_effect=failure):
+      with self.assertRaisesRegex(RuntimeError, 'private exception details'):
+        probe.run_issue7_single_node_signup_recovery_profile(
+            None, None, None, None, None, None, None, checkpoint, 'issue7-user-readback-empty')
+
+    self.assertEqual(1, len(checkpoints))
+    self.assertEqual({
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'user_readback_fault_mode': 'empty', 'failure_stage': 'signup_proof',
+        'failure_gate': 'proof_http_status', 'failure_category': 'assertion_failed',
+        'signup_proof_http': 503}, checkpoints[0])
+    self.assertNotIn('private exception details', json.dumps(checkpoints))
 
   def test_production_main_runs_real_coordinator_through_final_sanitized_checkpoint(self):
     for profile, mode in probe.issue7_store_recovery.PROFILES.items():
@@ -320,6 +506,46 @@ class MainCoordinatorTest(unittest.TestCase):
         'same_local_subject': True, 'fresh_explicit_signup_transactions': 2, 'fresh_login_transactions': 0,
         'recovery_intent': 'signup', 'retry_http': 404, 'store_fault_count': 1,
         'correlated_store_failure_count': 1, 'account_retained_after_failure': True}}, safe)
+
+  def test_readback_failure_metadata_survives_both_checkpoint_projectors(self):
+    issue7 = {'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'failure_stage': 'user_readback', 'failure_gate': 'account_readback',
+        'failure_category': 'assertion_failed'}
+    store_safe = probe.issue7_store_recovery.sanitize(issue7)
+    readback_safe = probe.sanitize_live_checkpoint(
+        {'issue7_single_node_signup_recovery': issue7})['issue7_single_node_signup_recovery']
+    expected = {
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'failure_stage': 'user_readback', 'failure_gate': 'account_readback',
+        'failure_category': 'assertion_failed'}
+    self.assertEqual(expected, store_safe)
+    self.assertEqual(expected, readback_safe)
+
+  def test_unclassified_failure_http_status_survives_both_checkpoint_projectors(self):
+    issue7 = {'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'failure_stage': 'signup_flow', 'failure_gate': 'unclassified',
+        'failure_category': 'assertion_failed', 'failure_http_status': 503}
+    expected = {
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'failure_stage': 'signup_flow', 'failure_gate': 'unclassified',
+        'failure_category': 'assertion_failed', 'failure_http_status': 503}
+    self.assertEqual(expected, probe.issue7_store_recovery.sanitize(issue7))
+    self.assertEqual(expected, probe.sanitize_live_checkpoint(
+        {'issue7_single_node_signup_recovery': issue7})['issue7_single_node_signup_recovery'])
+
+  def test_failed_signup_checkpoint_preserves_allowlisted_stage_gate_and_http_facts(self):
+    safe = probe.sanitize_live_checkpoint({'issue7_store_recovery': {
+        'stage': 'faulted_signup', 'failure_stage': 'signup_proof',
+        'failure_gate': 'proof_http_status', 'failure_category': 'assertion_failed',
+        'signup_intent_action_http': 200, 'signup_proof_http': 503,
+        'fault_evidence_provenance': 'wrapper-mediated-application-path',
+        'exception': 'private message', 'subject': 'private', 'url': 'private',
+        'token': 'private', 'logs': 'private'}})['issue7_store_recovery']
+    self.assertEqual({
+        'stage': 'faulted_signup', 'failure_stage': 'signup_proof',
+        'failure_gate': 'proof_http_status', 'failure_category': 'assertion_failed',
+        'signup_intent_action_http': 200, 'signup_proof_http': 503,
+        'fault_evidence_provenance': 'wrapper-mediated-application-path'}, safe)
 
 
   def test_receipt_projection_never_reports_two_signup_transactions(self):
