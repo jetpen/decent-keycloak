@@ -2,7 +2,7 @@
 
 Refs #7: https://github.com/jetpen/decent-keycloak/issues/7
 
-**Disposition: offline implementation candidate; DO NOT MERGE YET. Issue #7 remains OPEN.**
+**Disposition: scoped offline implementation candidate for human review; Issue #7 remains OPEN. This does not close the issue or qualify runtime behavior.**
 No live/container/Registry invocation or image build was performed for this slice.
 Real Keycloak HTTP, selected runtime SPI, wallet/browser and production-provider recovery
 remain unqualified. Neither passing scripted HTTP tests nor an SPI JAR proves runtime qualification.
@@ -10,13 +10,7 @@ Multi-node integration and distributed provisioning/replay guarantees are out of
 
 ## Preserved ordering and residual states
 
-Current main already implements server-bound explicit signup intent, fresh signed proof and
-current Registry verification, exact enabled local-account create/readback, then pending consume.
-This slice does not replace or change production Java or the #4/#5/#6 flows.
-It extends the existing signup probe and reuses the existing owned-resource lifecycle,
-immutable-image resolution, runtime-baseline checks, cleanup, cooldown and final checkpoint.
-The new helper is `scripts/issue7_store_recovery.py`; the production entry point remains
-`scripts/wallet_login_live_e2e.py`.
+Current `main` already implements server-bound explicit signup intent, fresh signed proof and current Registry verification, exact enabled local-account create/readback, then pending consume. This slice adds scripted offline test coverage and evidence documentation only; it does not change production Java, provider code, the live harness flow, or #4/#5/#6 behavior. The existing profiles/coordinator and owned-resource lifecycle remain responsible for runtime setup, cooldown, checkpoints, and cleanup.
 
 | Opt-in `WALLET_IT_PROFILE` | One-shot test wrapper operation | Recovery |
 |---|---|---|
@@ -79,25 +73,9 @@ Provider enumeration is only availability evidence; actual fixture/production ma
 still required. An immutable image build and selected-SPI smoke start require separate
 runtime authorization before these commands may be executed.
 
-## Source disposition and verification limits
+## Source and verification limits
 
-Protected source worktree `/home/ben/projects/decent-keycloak-issue7-single-node-acceptance`
-was read only. Its frozen parent-verified fingerprint was
-`805456c5502747a43a045936f1460d3b10ef42e8df05f2ec693a9848b0cb9c2b`.
-The clean candidate is based on current-main commit
-`077526d1dccce9d2347a8f3df04468deb779597d`, branch
-`feature/issue-7-store-recovery-main`. Only the store-fault/recovery slice was adapted;
-the old full harness, README, production Java, ready-gate poisoning, concurrent-consume
-barrier/admission bypass, restart profiles and source-only test totals were not imported.
+This candidate is based on current `main` after PR #36 at `dd350bbf59c749a6c8fe5b81e0cc6daabc9e9924`. Its implementation delta is the scripted production-entrypoint regression, ledger assertions, and offline evidence updates. It does not modify the production account/provider Java, test SPI/image packaging, or production request-flow code; the recovery profiles/coordinator are the existing code now exercised by the new orchestration test.
 
-The new Python module tests real signup failure response chains and real fresh LOGIN with
-scripted HTTP, plus production `main()` with external setup mocked while the real store
-coordinator runs through the final sanitized checkpoint for each profile. Negative cases
-cover disclosures in each response/body/Location/redirect chain, missing/wrong causal logs,
-account readback, same-subject mismatch and invalid recovery outcomes/cleanup. Java tests
-exercise one-shot decorator mutation ordering and delegation. These are offline evidence,
-not a claim that actual Keycloak accepted the image/SPI or that a real browser obtained code.
-Behavioral RED was observed for absent profile selection and packaging, intermediate failure
-checkpoint preservation and contradictory receipt transaction-count projection. Additional
-scripted success/failure and Java decorator cases were added as characterization coverage;
-no claim is made that they were all written before implementation.
+
+The Python store-recovery module now includes an all-mode production-entrypoint regression: the production `main()` with external setup mocked selects each configured store profile, executes the real `issue7_store_recovery.run`, and calls the real `signup_wallet_flow` plus either a fresh real signup (consume-loss) or real `auth_flow` (both receipt-write modes) using scripted browser/wallet HTTP and Admin readbacks. It checks scripted browser/wallet request ordering (explicit signup intent, challenge, proof, status and retry); empty 503 and old pending/retry 404 without redirect/callback/code; exact retained enabled-user readback from fixed Admin responses; and serialized evidence from a hand-authored request-correlated log fixture; cooldown; distinct recovery transaction; correct ceremony and accurate transaction counts; same local subject; callback/replay/state/code/PKCE; and final checkpoint/stdout sanitization. The test does not observe current Registry verification, actual local-account creation/readback, pending-store consumption, or provider-emitted fault logs. Those Issue #7 gates remain runtime/provider qualifications. The core flow and coordinator are not mocked. All secrets, private subject/identity, locators, challenges, proof material, codes, tokens and raw logs are excluded from serialized evidence. This is scripted offline application-path evidence only; external setup is mocked and no container, Registry, Keycloak server/provider or live profile was run. Java tests continue to exercise one-shot decorator mutation ordering and delegation. None of this qualifies actual Keycloak acceptance, JPA/provider persistence/atomicity, real Registry/wallet behavior, or runtime/browser/provider selection. The added scenario passed against the unchanged production flow and is characterization of the previously untested orchestration; no product defect or runtime pass is claimed.

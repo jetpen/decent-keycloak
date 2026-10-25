@@ -786,5 +786,246 @@ class PackagingTest(unittest.TestCase):
             'META-INF/services/org.keycloak.models.SingleUseObjectProviderFactory').decode())
 
 
+class ProductionEntrypointRegressionTest(unittest.TestCase):
+  def test_main_runs_real_store_recovery_flows_for_every_profile(self):
+    profiles = probe.issue7_store_recovery.PROFILES
+    for profile, mode in profiles.items():
+      with self.subTest(profile=profile):
+        subject, identifier = 'private-retained-subject', 'private-identity'
+        user = {'id': subject, 'enabled': True,
+            'attributes': {'decent_identity_id': [identifier]}}
+        issuer = f'https://idp.example:{probe.KC_PORT}/auth/realms/{probe.REALM}'
+        first_locator = issuer + '/decent-wallet-login/v1/transactions/' + 'A' * 43
+        second_locator = issuer + '/decent-wallet-login/v1/transactions/' + 'B' * 43
+        status_path = f'/auth/realms/{probe.REALM}/decent-wallet-login/v1/transactions/status'
+        callback_query = 'session_code=s&execution=e&client_id=c&tab_id=t&client_data=d'
+        callback = issuer + '/login-actions/authenticate?' + callback_query
+        events = []
+        security_headers = {'Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff',
+            'Cache-Control':'no-store','Vary':'Origin'}
+
+        def signup_authorization_page(locator):
+          return (f'<p id="wallet-locator">{locator}</p><form method="post" '
+              f'action="/auth/realms/{probe.REALM}/login-actions/authenticate?{callback_query}">'
+              '<input type="hidden" name="wallet_intent" value="signup"></form>')
+
+        class Client:
+          def __init__(self, name, kind):
+            self.name, self.kind = name, kind
+            self.redirects, self.calls = [], []
+            self.wallet_container_id = 'a' * 64
+            self.privateClientAdminCredential = 'private-admin-secret'
+            self.state = None
+            self.callback_count = 0
+            self.page_locator = None
+          def request(self, method, url, data=None, headers=None, **kwargs):
+            self.calls.append((method, url, data, headers))
+            parsed = probe.urllib.parse.urlsplit(url)
+            if self.kind == 'signup-browser' and method == 'GET' and '/protocol/openid-connect/auth?' in url:
+              events.append(self.name + ':auth')
+              self.state = probe.urllib.parse.parse_qs(parsed.query)['state'][0]
+              self.page_locator=first_locator
+              return 200, {}, signup_authorization_page(first_locator).encode()
+            if self.kind == 'signup-browser' and method == 'POST' and 'login-actions/authenticate?' in url:
+              events.append(self.name + ':intent')
+              page = (f'<p id="wallet-locator">{first_locator}</p><script>const statusUrl = "{status_path}"; '
+                  f'const csrfToken = "{"C" * 43}";</script>Creating a new account with this wallet identity.')
+              return 200, {}, page.encode()
+            if self.kind == 'signup-wallet' and method == 'GET':
+              events.append(self.name + ':challenge')
+              return 200, {}, json.dumps({'profile':'decent-wallet-login-v1',
+                  'challenge':'private-challenge-' + self.name, 'csrf_token':'C'*43}).encode()
+            if self.kind == 'signup-wallet' and method == 'POST':
+              events.append(self.name + ':proof')
+              return (503 if sum(call[0] == 'POST' for call in self.calls) == 1 else 404), {}, b''
+            if self.kind == 'signup-browser' and method == 'GET' and url == status_path:
+              events.append(self.name + ':status')
+              return 404, {}, b''
+            if (self.kind in ('recovery-signup-browser','recovery-login-browser') and method == 'GET'
+                and parsed.path.endswith('/login-actions/authenticate')):
+              events.append(self.name + ':callback'); self.callback_count += 1
+              params = {'code':'private-code','state':self.state} if self.callback_count == 1 else {'error':'denied','state':self.state}
+              return 302, {'Location':probe.REDIRECT+'?'+probe.urllib.parse.urlencode(params)}, b''
+            if self.kind == 'recovery-signup-browser':
+              if method == 'GET' and '/protocol/openid-connect/auth?' in url:
+                events.append(self.name + ':auth'); self.state=probe.urllib.parse.parse_qs(parsed.query)['state'][0]
+                self.page_locator=second_locator
+                return 200, {}, signup_authorization_page(second_locator).encode()
+              if method == 'POST' and 'login-actions/authenticate?' in url:
+                events.append(self.name + ':intent')
+                page=(f'<p id="wallet-locator">{second_locator}</p><script>const statusUrl = "{status_path}"; '
+                    f'const csrfToken = "{"D"*43}";</script>Creating a new account with this wallet identity.')
+                return 200, {}, page.encode()
+              if method == 'GET' and url == status_path:
+                events.append(self.name + ':status'); return 200, {}, json.dumps({'status':'accepted','callback':callback}).encode()
+              if method == 'GET' and url == probe.REDIRECT + '?state=' + self.state + '&error=denied':
+                return 302, {'Location':probe.REDIRECT+'?state='+self.state+'&error=denied'}, b''
+              if method == 'POST' and parsed.path.endswith('/protocol/openid-connect/token'):
+                events.append(self.name + ':token'); return 200, {}, b'{"id_token":"private-token"}'
+            if self.kind == 'recovery-wallet':
+              security=dict(security_headers)
+              if method == 'GET':
+                events.append(self.name + ':challenge')
+                return 200, security, json.dumps({'profile':'decent-wallet-login-v1','challenge':'private-recovery-challenge','csrf_token':'D'*43}).encode()
+              if method == 'POST':
+                events.append(self.name + ':proof')
+                post_count=sum(call[0]=='POST' for call in self.calls)
+                return 202, security, (b'{"status":"pending"}' if post_count == 1 else b'{"status":"accepted"}')
+            if self.kind == 'recovery-login-browser':
+              security=dict(security_headers)
+              if method == 'GET' and '/protocol/openid-connect/auth?' in url:
+                events.append(self.name + ':auth'); self.state=probe.urllib.parse.parse_qs(parsed.query)['state'][0]
+                self.page_locator=second_locator
+                page=(f'<p id="wallet-locator">{second_locator}</p>Example Wallet Demo Site '
+                    f'<script>const statusUrl = "{status_path}"; const csrfToken = "{"D"*43}";</script>')
+                return 200, {}, page.encode()
+              if method == 'GET' and url == status_path:
+                events.append(self.name + ':status')
+                return (404, {}, b'') if self.callback_count else (200, security, json.dumps({'status':'accepted','callback':callback}).encode())
+              if method == 'POST' and url == second_locator:
+                return 202, security, b'{"status":"accepted"}'
+              if method == 'POST' and parsed.path.endswith('/protocol/openid-connect/token'):
+                events.append(self.name + ':token'); return 200, security, b'{"id_token":"a.b.c"}'
+              if method == 'GET': return 404, {}, b''
+            if self.kind == 'recovery-login-wallet':
+              security=dict(security_headers)
+              if method == 'GET' and url == second_locator:
+                events.append(self.name + ':challenge')
+                return 200, security, json.dumps({'profile':'decent-wallet-login-v1','challenge':'private-recovery-challenge','csrf_token':'D'*43}).encode()
+              if method == 'GET': return 404, {}, b''
+              if method == 'POST':
+                events.append(self.name + ':proof')
+                if len(data or b'') > 8192: return 413, security, b''
+                post_count=sum(call[0]=='POST' for call in self.calls)
+                if post_count == 1: return 202, security, b'{"status":"pending"}'
+                if post_count == 2: return 202, security, b'{"status":"accepted"}'
+                if post_count == 3: return 409, security, b''
+                return 413, security, b''
+            if self.kind == 'discovery' and method == 'GET': return 404, {}, b''
+            raise AssertionError((self.name, method, url))
+
+        clients = []
+        def make_client():
+          value = clients.pop(0)
+          return value
+        signup_browser=Client('old-browser','signup-browser')
+        signup_wallet=Client('old-wallet','signup-wallet')
+        if mode == 'consume-loss':
+          recovery_browser=Client('fresh-browser','recovery-signup-browser')
+          recovery_wallet=Client('fresh-wallet','recovery-wallet')
+          clients.extend([signup_browser,signup_wallet,recovery_browser,recovery_wallet])
+        else:
+          login_browser=Client('login-browser','recovery-login-browser')
+          alien=Client('alien','discovery')
+          login_wallet=Client('login-wallet','recovery-login-wallet')
+          clients.extend([signup_browser,signup_wallet,login_browser,alien,login_wallet])
+        checkpoints=[]; stdout=StringIO(); original_write=Path.write_text
+        def capture(path, data, *args, **kwargs):
+          if path.name == 'live-evidence.json': checkpoints.append(json.loads(data))
+          return original_write(path,data,*args,**kwargs)
+        request_handle='A'*43
+        request_id=hashlib.sha256(request_handle.encode('ascii')).hexdigest()[:32]
+        operation='transaction_remove' if mode=='consume-loss' else 'accepted_replace'
+        production=(f'Wallet pending transaction unavailable (request={request_id}, reason=consume-unavailable)'
+            if mode=='consume-loss' else f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)')
+        logs=(f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} request={request_id}\n'
+            f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}\n'+production)
+        admin=Mock(wallet_container_id='a'*64)
+        with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+          stack.enter_context(patch.object(probe,'SCRATCH',scratch))
+          stack.enter_context(patch.object(probe,'RUN_CID_DIR',None))
+          stack.enter_context(patch.object(probe,'IMAGE',probe.IMAGE))
+          stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE':profile,'WALLET_IT_STORE_RECOVERY_IMAGE':'offline-image'}, clear=False))
+          finish_cleanup=Mock()
+          start_keycloak = Mock()
+          for name,value in {'resolve_immutable_image':('immutable-image','sha256:test'),
+              '_prepare_resolver_runtime':{},'start_resolver_tools':'resolver-tools',
+              'start_registry':('registry','bootstrap',1234),'free_port':4321,
+              'write_identity':(Path(scratch)/'key.pem',Path(scratch)/'wrapper',identifier),
+              'start_keycloak':admin,'admin_token':'admin-token',
+              'keycloak_runtime_provenance':{'runtime_qualification_status':'runtime_facts_verified',
+                'keycloak_version':'26.8.0','keycloak_nodes':'one','single_use_object_provider_ids':['issue7-fault-injection']},
+              'configure_realm':None,'enable_keycloak_login_events':None,
+              'cleanup_owned_resources':0,'finish_owned_cleanup':None}.items():
+            mocked=stack.enter_context(patch.object(probe,name,return_value=value))
+            if name == 'finish_owned_cleanup': finish_cleanup=mocked
+            if name == 'start_keycloak': start_keycloak=mocked
+          stack.enter_context(patch.object(probe.secrets,'token_bytes',side_effect=lambda n:b'x'*n))
+          stack.enter_context(patch.object(probe,'Client',side_effect=make_client))
+          admin_responses=[(200,{},b'[]'),(200,{},json.dumps([user]).encode())]
+          if mode == 'consume-loss':
+            admin_responses.extend([(200,{},json.dumps([user]).encode()),(200,{},json.dumps([user]).encode())])
+          stack.enter_context(patch.object(probe,'admin_call',side_effect=admin_responses))
+          stack.enter_context(patch.object(probe,'read_provider_fault_log_window',return_value=logs))
+          stack.enter_context(patch.object(probe,'read_provider_fault_log_tail',return_value=''))
+          signing_outputs=iter([b'p'*64,b's'*64,b't'*64])
+          def openssl(command, **kwargs):
+            output=next(signing_outputs) if 'pkeyutl' in command else b's'*64
+            return Mock(returncode=0,stdout=output,stderr=b'')
+          stack.enter_context(patch.object(probe.subprocess,'run',side_effect=openssl))
+          stack.enter_context(patch.object(probe,'run',return_value=Mock(returncode=0,stdout='',stderr='')))
+          if mode == 'consume-loss':
+            verify = {'sub':subject,'decent_identity_id':identifier,'exp':10**12,'iss':issuer,
+                'aud':probe.CLIENT,'nonce':probe.b64url(b'x'*24)}
+            stack.enter_context(patch.object(probe,'verify_id_token',return_value=verify))
+          else:
+            verify = lambda *args, **kwargs: {'sub':subject,'decent_identity_id':identifier,
+                'exp':10**12,'iss':issuer,'aud':probe.CLIENT,'nonce':login_browser.state}
+            stack.enter_context(patch.object(probe,'verify_id_token',side_effect=verify))
+          stack.enter_context(patch.object(probe.time,'sleep'))
+          cooldown=stack.enter_context(patch.object(probe,'wait_for_identity_lookup_cooldown',wraps=probe.wait_for_identity_lookup_cooldown))
+          stack.enter_context(patch.object(Path,'write_text',capture))
+          with redirect_stdout(stdout): probe.main()
+        finish_cleanup.assert_called_once_with('registry','resolver-tools')
+        self.assertIsNotNone(start_keycloak)
+        start_keycloak.assert_called_once()
+        self.assertEqual(mode,start_keycloak.call_args.kwargs['store_fault_mode'])
+        self.assertIsNone(start_keycloak.call_args.kwargs['user_readback_fault_mode'])
+        self.assertEqual('complete',checkpoints[-1]['issue7_store_recovery']['stage'])
+        safe=checkpoints[-1]['issue7_store_recovery']
+        self.assertEqual(mode,safe['store_fault_mode'])
+        self.assertEqual(1,safe['store_fault_count']); self.assertEqual(1,safe['correlated_store_failure_count'])
+        self.assertTrue(safe['store_provider_selected']); self.assertTrue(safe['same_local_subject'])
+        self.assertEqual(503,safe['signup_proof_http'])
+        self.assertEqual(404,safe['browser_status_http']); self.assertEqual(404,safe['retry_http'])
+        self.assertTrue(safe['failure_responses_no_callback_or_code'])
+        self.assertTrue(safe['account_retained_after_failure'])
+        self.assertEqual(1,safe['exact_mapped_users'])
+        self.assertEqual(('signup',0) if mode=='consume-loss' else ('login',1),
+            (safe['recovery_intent'],safe['fresh_login_transactions']))
+        self.assertEqual(2 if mode=='consume-loss' else 1,safe['fresh_explicit_signup_transactions'])
+        self.assertEqual(1,stdout.getvalue().count('issue7-store-recovery-evidence='))
+        evidence_line=next(line.split('=',1)[1].strip() for line in stdout.getvalue().splitlines()
+            if line.startswith('issue7-store-recovery-evidence='))
+        output_payload=json.loads(evidence_line)
+        self.assertEqual(safe,output_payload['issue7_store_recovery'])
+        self.assertEqual(302,safe['callback_http']); self.assertEqual(200,safe['pkce_token_http'])
+        self.assertEqual(1,len([call for call in signup_browser.calls if call[0]=='GET' and '/protocol/openid-connect/auth?' in call[1]]))
+        self.assertEqual(2,sum(call[0]=='POST' and call[1]==first_locator for call in signup_wallet.calls))
+        self.assertEqual(1,sum(call[0]=='GET' and call[1]==first_locator for call in signup_wallet.calls))
+        self.assertEqual([],signup_browser.redirects); self.assertEqual([],signup_wallet.redirects)
+        self.assertEqual(1,sum(call[0]=='GET' and call[1]==status_path for call in signup_browser.calls))
+        recovery_client=recovery_browser if mode == 'consume-loss' else login_browser
+        self.assertNotEqual(first_locator,second_locator)
+        self.assertEqual(second_locator,recovery_client.page_locator)
+        if mode == 'consume-loss':
+          self.assertEqual(1,sum(call[0]=='POST' and call[1]==second_locator for call in recovery_wallet.calls))
+          self.assertNotIn('wallet_intent=login', str(recovery_browser.calls))
+        else:
+          self.assertTrue(login_browser.calls)
+          self.assertNotIn('wallet_intent=signup', str(login_browser.calls))
+        output=stdout.getvalue()+json.dumps(checkpoints)+json.dumps([c for c in events])
+        for secret in (subject,identifier,'private-code','private-token','private-challenge','private-admin-secret',request_id,first_locator,second_locator):
+          self.assertNotIn(secret,output)
+        self.assertIn('old-browser:auth',events); self.assertIn('old-browser:intent',events)
+        self.assertEqual(2,sum(e=='old-wallet:proof' for e in events))
+        self.assertEqual(2,sum(call[0]=='POST' for call in signup_wallet.calls))
+        self.assertEqual(1,sum(e=='old-browser:status' for e in events))
+        self.assertEqual(['old-browser:auth','old-browser:intent','old-wallet:challenge',
+            'old-wallet:proof','old-browser:status','old-wallet:proof'],events[:6])
+        cooldown.assert_called_once_with()
+        self.assertEqual(1,sum(event.endswith(':token') for event in events))
+
+
 if __name__ == '__main__':
   unittest.main()
