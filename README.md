@@ -74,6 +74,7 @@ python3 -m unittest \
   scripts.test_live_gate_order \
   scripts.test_registry_acceptance_matrix \
   scripts.test_issue7_user_readback_profile \
+  scripts.test_issue7_store_recovery_profile \
   scripts.test_acceptance_ledger -q
 python3 -m py_compile scripts/*.py container/*.py
 python3 container/build_resolver_runtime.py
@@ -85,7 +86,9 @@ python3 container/build_resolver_runtime.py
 
 **Historical Issue #7 candidate on PR #17's final tree (superseded by the current-main integration):** README-listed Python acceptance suite 276 tests passed; Java 21 offline Maven package passed 205 tests across 17 suites with 0 failures/errors/skips; focused Issue #7 tests (11), Python compilation, resolver-runtime build/input verification, test-provider JAR contents, and `git diff --check HEAD` passed. No container image build, live profile, Keycloak server, or Registry was run; runtime/provider/JPA and distributed behavior remain unqualified.
 
-**Current Issue #7 candidate (`origin/main` `e3ba52c3102aa87911de598ad7f5d02d06c02445`, branch `feature/issue-7-user-readback-recovery-main`):** README-listed Python acceptance suite passed 276 tests; Java 21 offline Maven package passed 206 tests across 17 suites with 0 failures/errors/skips. Python compilation, resolver source-archive/wheelhouse verification, README/workflow parity (12 modules), production/test-provider JAR inspection, and `git diff --check HEAD` passed; `actionlint` is unavailable. The new consume-after-removal and existing receipt-publication recovery checks use in-memory fakes; strict behavioral RED was not observed for consume recovery because the base already fails closed. No Podman/Docker, live profile, Keycloak server, or Registry ran. Runtime/provider/JPA/HTTP/browser/callback/code and distributed behavior remain unqualified; Issue #7 remains open.
+**Prior Issue #7 user-readback candidate (`origin/main` `e3ba52c3102aa87911de598ad7f5d02d06c02445`, branch `feature/issue-7-user-readback-recovery-main`):** README-listed Python acceptance suite passed 276 tests; Java 21 offline Maven package passed 206 tests across 17 suites with 0 failures/errors/skips. Python compilation, resolver source-archive/wheelhouse verification, README/workflow parity (12 modules), production/test-provider JAR inspection, and `git diff --check HEAD` passed; `actionlint` is unavailable. The new consume-after-removal and existing receipt-publication recovery checks use in-memory fakes; strict behavioral RED was not observed for consume recovery because the base already fails closed. No Podman/Docker, live profile, Keycloak server, or Registry ran. Runtime/provider/JPA/HTTP/browser/callback/code and distributed behavior remain unqualified; Issue #7 remains open.
+
+**Current scoped Issue #7 store-recovery candidate (base `077526d1dccce9d2347a8f3df04468deb779597d`, branch `feature/issue-7-store-recovery-main`):** adds opt-in consume-loss plus accepted-receipt postwrite/precommit-false recovery, without replacing current-main production Java or newer #4/#5/#6 behavior. Receipt failures recover with fresh LOGIN of the retained subject (one signup plus one login); consume-loss uses a fresh explicit SIGNUP. See [the scoped acceptance and source-disposition note](docs/acceptance/issue-7-store-recovery.md). README/CI list the same 13 Python modules. Offline verification: 292 tests in the exact README-listed Python suite; Java 21 `mvn -o clean package` passed 210 tests across 18 suites with zero failures/errors/skips. No new live/container/Registry invocation or image build was performed. **DO NOT MERGE YET**: runtime/SPI/browser qualification and final independent review remain open; Refs #7, no issue closure.
 
 ```bash
 MAVEN_OPTS='-Xmx2g' mvn -q -o clean package
@@ -101,6 +104,7 @@ python3.11 -m unittest \
   scripts.test_live_gate_order \
   scripts.test_registry_acceptance_matrix \
   scripts.test_issue7_user_readback_profile \
+  scripts.test_issue7_store_recovery_profile \
   scripts.test_acceptance_ledger -q
 python3.11 -m py_compile scripts/*.py container/*.py
 python3.11 container/build_resolver_runtime.py
