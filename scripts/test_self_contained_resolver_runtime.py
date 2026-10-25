@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,20 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertEqual(hashlib.sha256((ROOT / 'container/resolver-requirements.lock.txt').read_bytes()).hexdigest(),
         provenance.get('runtime_lock_sha256'))
 
+  def test_runtime_patcher_finds_helper_when_copied_into_flat_build_context(self):
+    import runpy
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+      build_context = Path(temporary_directory)
+      patcher_copy = build_context / 'patch_resolver_runtime.py'
+      overlay_copy = build_context / 'pinned_lookup_outcomes.py'
+      patcher_copy.write_bytes((ROOT / 'container/patch_resolver_runtime.py').read_bytes())
+      overlay_copy.write_bytes((ROOT / 'container/pinned_lookup_outcomes.py').read_bytes())
+
+      patcher = runpy.run_path(str(patcher_copy))
+      self.assertEqual(overlay_copy.resolve(), patcher['OVERLAY'])
+      self.assertEqual(overlay_copy.read_bytes(), patcher['OVERLAY'].read_bytes())
+
   def test_runtime_lock_pins_wheelhouse_archive_and_exact_size(self):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
     wheelhouse = lock.get('wheelhouse')
@@ -36,7 +51,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
   def test_live_harness_checkpoints_evidence_before_failure(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
     self.assertIn("evidence_path = Path(temp_dir) / 'live-evidence.json'", harness)
-    self.assertIn('def checkpoint():', harness)
+    self.assertIn('def checkpoint(snapshot=None):', harness)
     self.assertIn("except Exception as failure:", harness)
     self.assertIn("print('partial_evidence='", harness)
     self.assertIn("checkpoint()", harness)
@@ -60,7 +75,9 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         'disabled_account_case', 'signup_case', 'rotated_identity_case', 'ambiguous_account_case', 'missing_identity_case'):
       self.assertIn(f"result['{case}']", harness)
     self.assertGreaterEqual(harness.count('checkpoint()'), 9)
-    self.assertIn("result['wallet_login'] = auth_flow", harness)
+    self.assertIn("current_result = invoke_current_identity_attempt", harness)
+    self.assertIn("result['wallet_login'] = current_result.pop('wallet_login')", harness)
+    self.assertIn("result['registry_matrix']", harness)
     self.assertNotIn("result.update(auth_flow", harness)
     self.assertIn("json.dumps(sanitize_live_checkpoint(result), sort_keys=True)", harness)
     self.assertNotIn("print('partial_evidence=', result)", harness)
@@ -520,6 +537,11 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
     self.assertIn('COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./', dockerfile)
     self.assertIn('COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py', dockerfile)
+    self.assertIn('COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./', dockerfile)
+    self.assertIn('COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/', dockerfile)
+    self.assertIn('/resolver-build/scripts/test_pinned_dht_peer_outcomes.py', dockerfile)
+    self.assertIn('/resolver-build/scripts/test_pinned_registry_lookup_outcomes.py', dockerfile)
+    self.assertNotIn('/tmp/resolver-tests/', dockerfile)
     self.assertIn('python3.11 verify_resolver_runtime_inputs.py', dockerfile)
     self.assertNotIn('ARG IDENTITY_ARCHIVE_SHA256=', dockerfile)
     self.assertNotIn('ARG REGISTRY_ARCHIVE_SHA256=', dockerfile)
@@ -558,9 +580,25 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       for name in ('identity', 'registry'):
         source = ROOT / 'container/source-archives' / f'{name}.tar.gz'
         (archives / f'{name}.tar.gz').write_bytes(source.read_bytes())
+      for name, filename in (
+          ('pinned_lookup_outcomes', 'pinned_lookup_outcomes.py'),
+          ('runtime_patcher', 'patch_resolver_runtime.py'),
+      ):
+        source = ROOT / 'container' / filename
+        (manifest_directory / filename).write_bytes(source.read_bytes())
+        original_lock.setdefault('repo_overlays', {})[name] = {
+            'file': filename,
+            'sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        }
       manifest = manifest_directory / 'resolver-runtime.lock.json'
       manifest.write_text(json.dumps(original_lock))
       verifier.verify_source_archives(archives, manifest)
+      overlay_path = manifest_directory / 'pinned_lookup_outcomes.py'
+      overlay_bytes = overlay_path.read_bytes()
+      overlay_path.write_bytes(overlay_bytes + b'altered')
+      with self.assertRaisesRegex(RuntimeError, 'resolver overlay checksum mismatch'):
+        verifier.verify_source_archives(archives, manifest)
+      overlay_path.write_bytes(overlay_bytes)
 
       import io
       import tarfile
@@ -688,7 +726,11 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1]
     self.assertIn('COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/', runtime_stage)
     self.assertIn('RUN --network=none /opt/keycloak/bin/kc.sh build', runtime_stage)
-    self.assertIn('--spi-single-use-object--provider=infinispan', runtime_stage)
+    self.assertIn('--db=dev-file', runtime_stage)
+    self.assertIn('--cache=local', runtime_stage)
+    self.assertIn('--spi-single-use-object--provider-default=infinispan', runtime_stage)
+    startup = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text().split('def start_keycloak(', 1)[1].split('def admin_token', 1)[0]
+    self.assertIn("'--cache=local'", startup)
 
   def test_resolver_image_tag_is_resolved_once_to_an_immutable_id_before_containers_start(self):
     sys.path.insert(0, str(ROOT / 'scripts'))
@@ -801,14 +843,19 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     expected_miss = 'Value not found for key /decent-registry/identity/' + expected_key
     wrong_miss = 'Value not found for key /decent-registry/identity/' + 'ab' * 32
 
+    clean_summary = (
+        'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0' + chr(10)
+        + 'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0' + chr(10)
+    )
+
     self.assertEqual('not_found', classify_identity_lookup(
-        expected_miss + chr(10) + 'not found', 1, identifier)[0])
+        clean_summary + expected_miss + chr(10) + 'not found', 1, identifier)[0])
     self.assertEqual('unavailable', classify_identity_lookup(
-        wrong_miss + chr(10) + 'not found', 1, identifier)[0])
+        clean_summary + wrong_miss + chr(10) + 'not found', 1, identifier)[0])
     self.assertEqual('unavailable', classify_identity_lookup(
-        expected_miss + chr(10) + wrong_miss + chr(10) + 'not found', 1, identifier)[0])
+        clean_summary + expected_miss + chr(10) + wrong_miss + chr(10) + 'not found', 1, identifier)[0])
     self.assertEqual('unavailable', classify_identity_lookup(
-        expected_miss + chr(10) + 'not found', 1)[0])
+        clean_summary + expected_miss + chr(10) + 'not found', 1)[0])
 
   def test_rotation_helper_uses_a_real_ephemeral_port_for_independent_reads(self):
     helper = (ROOT / 'scripts/rotation_registry_roundtrip.py').read_text()
@@ -816,14 +863,17 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('port=fresh_readback_port()', helper)
     self.assertNotIn('port=0,', helper)
 
-  def test_rotation_helper_is_packaged_and_registry_cli_smoke_runs_in_runtime_stage(self):
+  def test_rotation_helper_is_packaged_and_registry_cli_smoke_runs_in_builder_stage(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     builder_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[0]
-    runtime_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
+    keycloak_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
         'FROM keycloak-with-resolver AS runtime', 1)[0]
+    runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1].split(
+        'FROM runtime AS issue7-user-readback-test-runtime', 1)[0]
     self.assertIn('COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py', dockerfile)
-    self.assertNotIn('decent-registry --help', builder_stage)
-    self.assertIn("from decent_registry.cli import main; main()' --help", runtime_stage)
+    self.assertIn('/opt/decent-resolver/bin/decent-registry --help', builder_stage)
+    self.assertNotIn('decent-registry --help', keycloak_stage)
+    self.assertNotIn('decent-registry --help', runtime_stage)
     self.assertIn('cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py', dockerfile)
 
   def test_stale_key_rotation_uses_packaged_tools_and_confirms_exact_successor_key(self):
@@ -889,18 +939,27 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('--find-links=/resolver-build/wheelhouse', dockerfile)
     self.assertIn('--require-hashes', dockerfile)
 
-  def test_resolver_builder_does_not_write_buildkit_managed_resolv_conf(self):
+  def test_pinned_resolver_tests_run_in_builder_and_are_absent_from_runtime_layers(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     builder_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[0]
-    self.assertNotIn('/etc/resolv.conf', builder_stage)
-    runtime_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
+    peer_test = '/resolver-build/scripts/test_pinned_dht_peer_outcomes.py'
+    registry_test = '/resolver-build/scripts/test_pinned_registry_lookup_outcomes.py'
+    self.assertIn('RUN --network=none if [ ! -e /etc/resolv.conf ]', builder_stage)
+    self.assertIn('LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python ' + peer_test, builder_stage)
+    self.assertIn('RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python ' + registry_test, builder_stage)
+    self.assertIn("/opt/decent-resolver/bin/decent-identity --help", builder_stage)
+    self.assertIn("/opt/decent-resolver/bin/decent-registry --help", builder_stage)
+    self.assertIn('rm -f /etc/resolv.conf', builder_stage)
+    self.assertLess(builder_stage.index('if [ ! -e /etc/resolv.conf ]'), builder_stage.index(peer_test))
+    self.assertLess(builder_stage.index(registry_test), builder_stage.index('rm -f /etc/resolv.conf'))
+    keycloak_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
         'FROM keycloak-with-resolver AS runtime', 1)[0]
-    self.assertIn('if [ ! -e /etc/resolv.conf ]', runtime_stage)
-    self.assertIn('rm -f /etc/resolv.conf', runtime_stage)
-    self.assertLess(runtime_stage.index('if [ ! -e /etc/resolv.conf ]'),
-        runtime_stage.index("from decent_registry.cli import main; main()' --help"))
-    self.assertGreater(runtime_stage.index('rm -f /etc/resolv.conf'),
-        runtime_stage.index("from decent_registry.cli import main; main()' --help"))
+    runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1].split(
+        'FROM runtime AS issue7-user-readback-test-runtime', 1)[0]
+    for stage in (keycloak_stage, runtime_stage):
+      self.assertNotIn('test_pinned_', stage)
+      self.assertNotIn('/tmp/resolver-tests', stage)
+      self.assertNotIn('/etc/resolv.conf', stage)
 
   def test_live_harness_uses_the_pinned_image_for_registry_node_and_seed_resolver(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()

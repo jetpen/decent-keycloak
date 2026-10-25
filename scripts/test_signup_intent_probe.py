@@ -14,6 +14,41 @@ import wallet_login_live_e2e as probe  # noqa: E402
 
 
 class SignupIntentProbeTest(unittest.TestCase):
+  def test_credential_file_unlink_retries_transient_errors(self):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as scratch:
+      secret = Path(scratch) / 'credential.env'
+      secret.write_text('secret')
+      original = Path.unlink
+      attempts = []
+      def transient(path, *args, **kwargs):
+        if path == secret and len(attempts) == 0:
+          attempts.append(1)
+          raise OSError('transient')
+        return original(path, *args, **kwargs)
+      with patch.object(Path, 'unlink', transient):
+        retained = probe.unlink_with_retries(secret, sleep=lambda _: None)
+      self.assertTrue(retained)
+      self.assertFalse(secret.exists())
+
+  def test_credential_file_unlink_persistent_error_is_sanitized_retained_status(self):
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as scratch:
+      secret = Path(scratch) / 'credential.env'
+      secret.write_text('never-print-this')
+      with patch.object(Path, 'unlink', side_effect=PermissionError('secret-value')):
+        removed = probe.unlink_with_retries(secret, sleep=lambda _: None)
+      evidence = probe.sanitize_live_checkpoint({'resolver_runtime': {
+          'credential_file_retained': not removed}})
+      self.assertFalse(removed)
+      self.assertTrue(secret.exists())
+      self.assertNotIn('never-print-this', repr(evidence))
+      self.assertNotIn('secret-value', repr(evidence))
+
   def test_admin_env_file_launch_failure_is_checked_and_cleanup_runs(self):
     from pathlib import Path
     from unittest.mock import patch
@@ -371,10 +406,15 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertEqual('unavailable', probe.exact_registry_lookup_outcome(
         malformed_key_output, 0, identifier))
     miss_key = hashlib.sha256(identifier.encode('utf-8')).hexdigest()
+    clean_summary = '\n'.join((
+        'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0',
+        'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0'))
     miss_output = '\n'.join((
+        clean_summary,
         'Value not found for key /decent-registry/identity/' + miss_key,
         'not found'))
     handshake_output = '\n'.join((
+        clean_summary,
         'Value not found for key /decent-registry/identity/' + miss_key,
         'failed to upgrade security for peer 12D3KooWBJHhhdqp4zbtGbCX6VyE7hC2ch5uaEvxfwkmSbfo2f3X: handshake failed',
         'not found'))
@@ -566,7 +606,9 @@ class SignupIntentProbeTest(unittest.TestCase):
     end = source.index("\ndef der(", start)
     block = source[start:end]
     self.assertIn("'users': [{", block)
-    self.assertIn("'email': identifier, 'emailVerified': True", block)
+    self.assertIn("'email': 'wallet-owner@example.com', 'emailVerified': True", block)
+    self.assertIn("'attributes': {'decent_identity_id': [identifier]}", block)
+    self.assertNotIn("'email': identifier", block)
     self.assertNotIn("/users', {\n          'username': 'wallet-owner'", block)
 
   def test_prompt_create_is_not_used_and_signup_fixture_runs_in_full_probe(self):

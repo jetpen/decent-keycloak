@@ -63,12 +63,19 @@ public final class WalletLoginTransactionStore {
   private final SingleUseObjectProvider singleUseObjects;
   private final SecureRandom random;
   private final Clock clock;
+  private final WalletLoginAcceptanceGuard acceptanceGuard;
 
   public WalletLoginTransactionStore(SingleUseObjectProvider singleUseObjects,
       SecureRandom random, Clock clock) {
+    this(singleUseObjects, random, clock, WalletLoginAcceptanceGuard.processLocal());
+  }
+
+  WalletLoginTransactionStore(SingleUseObjectProvider singleUseObjects, SecureRandom random,
+      Clock clock, WalletLoginAcceptanceGuard acceptanceGuard) {
     this.singleUseObjects = Objects.requireNonNull(singleUseObjects);
     this.random = Objects.requireNonNull(random);
     this.clock = Objects.requireNonNull(clock);
+    this.acceptanceGuard = Objects.requireNonNull(acceptanceGuard);
   }
 
   public IssuedTransaction issue(Binding binding) {
@@ -175,6 +182,7 @@ public final class WalletLoginTransactionStore {
     }
     validateBinding(binding);
     String receiptKey = acceptedKey(handle);
+    java.time.Instant expiresAt = clock.instant().plusSeconds(TRANSACTION_LIFESPAN_SECONDS);
     Map<String, String> receipt = new HashMap<>();
     receipt.put(NOTE_REALM, binding.realmId());
     receipt.put(NOTE_CLIENT, binding.clientId());
@@ -188,30 +196,73 @@ public final class WalletLoginTransactionStore {
     receipt.put(NOTE_PUBLIC_KEY, publicKey);
     receipt.put(NOTE_STATUS, "accepted");
     receipt.put(NOTE_CSRF, csrfToken);
-    receipt.put(NOTE_RECEIPT_EXPIRES, Long.toString(clock.instant().plusSeconds(TRANSACTION_LIFESPAN_SECONDS).getEpochSecond()));
-    // Publish the one-use callback gate before the visible accepted receipt.
-    // Status polling cannot advertise ACCEPTED until callback consumption is ready.
+    receipt.put(NOTE_RECEIPT_EXPIRES, Long.toString(expiresAt.getEpochSecond()));
     String callbackKey = callbackKey(handle);
-    if (!singleUseObjects.putIfAbsent(callbackKey, TRANSACTION_LIFESPAN_SECONDS)) {
-      throw new IllegalStateException("wallet callback gate already exists");
+    if (!acceptanceGuard.begin(receiptKey, expiresAt, clock.instant())) {
+      throw new IllegalStateException("wallet acceptance publication is already in progress or terminal");
     }
-    if (!singleUseObjects.replace(callbackKey, Map.of(NOTE_STATUS, "pending"))) {
-      singleUseObjects.remove(callbackKey);
-      throw new IllegalStateException("wallet callback gate publication failed");
-    }
+    boolean callbackOwned = false;
+    boolean receiptOwned = false;
+    boolean publicationCollision = false;
+    try {
+      // Publish the callback gate before the visible accepted receipt.
+      if (!singleUseObjects.putIfAbsent(callbackKey, TRANSACTION_LIFESPAN_SECONDS)) {
+        publicationCollision = true;
+        throw new IllegalStateException("wallet callback gate already exists");
+      }
+      callbackOwned = true;
+      if (!singleUseObjects.replace(callbackKey, Map.of(NOTE_STATUS, "pending"))) {
+        throw new IllegalStateException("wallet callback gate publication failed");
+      }
 
-    // Transaction-key removal grants this request the one-winner capability;
-    // only that capability may create the accepted receipt. A duplicate caller
-    // never invokes this method after losing consume().
-    if (!singleUseObjects.putIfAbsent(receiptKey, TRANSACTION_LIFESPAN_SECONDS)) {
-      singleUseObjects.remove(callbackKey);
-      throw new IllegalStateException("wallet transaction receipt already exists");
+      // Transaction-key removal grants this request the one-winner capability;
+      // only that capability may create the accepted receipt. A duplicate caller
+      // never invokes this method after losing consume().
+      if (!singleUseObjects.putIfAbsent(receiptKey, TRANSACTION_LIFESPAN_SECONDS)) {
+        publicationCollision = true;
+        throw new IllegalStateException("wallet transaction receipt already exists");
+      }
+      receiptOwned = true;
+      if (!singleUseObjects.replace(receiptKey, receipt)) {
+        throw new IllegalStateException("wallet transaction receipt publication failed");
+      }
+      acceptanceGuard.markPublished(receiptKey, clock.instant());
+    } catch (RuntimeException failure) {
+      if (publicationCollision) {
+        // A false putIfAbsent is a known collision, not an ambiguous write. Keep
+        // the existing receipt/gate intact and release this attempt's read gate.
+        boolean cleanupSucceeded = !callbackOwned || removeQuietly(callbackKey);
+        if (cleanupSucceeded) acceptanceGuard.release(receiptKey);
+        else acceptanceGuard.markFailed(receiptKey, clock.instant());
+      } else {
+        // Exceptions may follow committed writes. Quarantine this handle, then
+        // compensate only records created by this attempt.
+        acceptanceGuard.markFailed(receiptKey, clock.instant());
+        if (receiptOwned) removeQuietly(receiptKey);
+        if (callbackOwned) removeQuietly(callbackKey);
+      }
+      throw failure;
     }
-    if (!singleUseObjects.replace(receiptKey, receipt)) {
-      singleUseObjects.remove(receiptKey);
-      singleUseObjects.remove(callbackKey);
-      throw new IllegalStateException("wallet transaction receipt publication failed");
+  }
+
+  private boolean removeQuietly(String key) {
+    try {
+      singleUseObjects.remove(key);
+      return true;
+    } catch (RuntimeException ignored) {
+      // The caller keeps this handle quarantined when compensation is uncertain.
+      return false;
     }
+  }
+
+  private boolean acceptancePublicationUnavailable(String handle) {
+    return acceptanceGuard.isUnavailable(acceptedKey(handle), clock.instant());
+  }
+
+  private Map<String, String> readAcceptedReceipt(String handle) {
+    if (acceptancePublicationUnavailable(handle)) return null;
+    Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
+    return acceptancePublicationUnavailable(handle) ? null : receipt;
   }
 
   private static boolean validCallbackGate(Map<String, String> gate) {
@@ -229,11 +280,11 @@ public final class WalletLoginTransactionStore {
 
   public Optional<AcceptedTransaction> takeAccepted(String handle, Binding expectedBinding) {
     if (!validHandle(handle)) return Optional.empty();
-    Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
+    Map<String, String> receipt = readAcceptedReceipt(handle);
     if (!validAcceptedReceipt(receipt, expectedBinding)) return Optional.empty();
     Map<String, String> callbackGate = singleUseObjects.remove(callbackKey(handle));
     if (!validCallbackGate(callbackGate)) return Optional.empty();
-    Map<String, String> retainedReceipt = singleUseObjects.get(acceptedKey(handle));
+    Map<String, String> retainedReceipt = readAcceptedReceipt(handle);
     if (!validAcceptedReceipt(retainedReceipt, expectedBinding)) return Optional.empty();
     return Optional.of(new AcceptedTransaction(retainedReceipt.get(NOTE_IDENTITY),
         retainedReceipt.get(NOTE_PUBLIC_KEY), retainedReceipt.get(NOTE_PROOF_DIGEST),
@@ -242,7 +293,7 @@ public final class WalletLoginTransactionStore {
 
   public Optional<AcceptedTransaction> peekAccepted(String handle) {
     if (!validHandle(handle)) return Optional.empty();
-    Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
+    Map<String, String> receipt = readAcceptedReceipt(handle);
     if (receipt == null || !validAcceptedReceipt(receipt, null)) return Optional.empty();
     return Optional.of(new AcceptedTransaction(receipt.get(NOTE_IDENTITY), receipt.get(NOTE_PUBLIC_KEY),
         receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT))));
@@ -250,21 +301,22 @@ public final class WalletLoginTransactionStore {
 
   public boolean callbackGateAvailable(String handle, Binding expectedBinding) {
     if (!validHandle(handle) || expectedBinding == null) return false;
-    Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
-    return validAcceptedReceipt(receipt, expectedBinding)
-        && validCallbackGate(singleUseObjects.get(callbackKey(handle)));
+    Map<String, String> receipt = readAcceptedReceipt(handle);
+    if (!validAcceptedReceipt(receipt, expectedBinding)) return false;
+    Map<String, String> callbackGate = singleUseObjects.get(callbackKey(handle));
+    return !acceptancePublicationUnavailable(handle) && validCallbackGate(callbackGate);
   }
 
   public boolean acceptedCsrfMatches(String handle, Binding expectedBinding, String csrfToken) {
     if (!validHandle(handle) || expectedBinding == null || !validToken(csrfToken)) return false;
-    Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
+    Map<String, String> receipt = readAcceptedReceipt(handle);
     return validAcceptedReceipt(receipt, expectedBinding)
         && constantTimeEquals(receipt.get(NOTE_CSRF), csrfToken);
   }
 
   public Optional<AcceptedTransaction> getAccepted(String handle, Binding expectedBinding) {
     if (!validHandle(handle)) return Optional.empty();
-    Map<String, String> receipt = singleUseObjects.get(acceptedKey(handle));
+    Map<String, String> receipt = readAcceptedReceipt(handle);
     if (!validAcceptedReceipt(receipt, expectedBinding)) return Optional.empty();
     try {
       return Optional.of(new AcceptedTransaction(receipt.get(NOTE_IDENTITY), receipt.get(NOTE_PUBLIC_KEY),

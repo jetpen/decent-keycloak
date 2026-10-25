@@ -1,45 +1,65 @@
 package org.decentwallet.keycloak.wallet;
 
 import org.keycloak.authentication.Authenticator;
+import org.keycloak.authentication.AuthenticationFlowCallback;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.AuthenticationFlowError;
+import org.keycloak.models.AuthenticationFlowModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 
 
 /** Starts a browser-bound wallet challenge and resumes only its original Keycloak flow. */
-public final class WalletChallengeAuthenticator implements Authenticator {
+public final class WalletChallengeAuthenticator implements Authenticator, AuthenticationFlowCallback {
   private static final org.jboss.logging.Logger LOG =
       org.jboss.logging.Logger.getLogger(WalletChallengeAuthenticator.class);
   private static final String TRUSTED_ORIGINS = "trusted-origins";
   private static final String SIGNUP_INTENT_ATTRIBUTE = "decent_wallet_signup_intent";
   private static final String SIGNUP_AUTH_NOTE = "decent.wallet.intent";
+  private static final String CALLBACK_COMPLETED_NOTE = "decent.wallet.callback.completed";
+  private static final String CALLBACK_EXECUTION_NOTE = "decent.wallet.callback.execution";
+  private static final String CALLBACK_REQUEST_NOTE = "decent.wallet.callback.request";
   static final String IDENTITY_ATTRIBUTE = "decent_identity_id";
+  private final KeycloakSession session;
   private final java.util.function.Supplier<WalletLoginTransactionStore> transactionStores;
 
   public WalletChallengeAuthenticator() {
-    this(() -> null);
+    this(null, () -> null);
   }
 
   WalletChallengeAuthenticator(java.util.function.Supplier<WalletLoginTransactionStore> transactionStores) {
+    this(null, transactionStores);
+  }
+
+  WalletChallengeAuthenticator(KeycloakSession session,
+      java.util.function.Supplier<WalletLoginTransactionStore> transactionStores) {
+    this.session = session;
     this.transactionStores = transactionStores;
   }
 
   @Override
   public void authenticate(AuthenticationFlowContext context) {
-    WalletLoginTransactionStore store = transactionStores.get();
-    if (store == null) {
-      failClosed(context);
-      return;
-    }
     try {
       var auth = context.getAuthenticationSession();
-      var authSession = auth;
-      if (authSession == null) {
+      String callbackRequestId = auth == null ? null : auth.getClientNote(CALLBACK_REQUEST_NOTE);
+      LOG.infof("Wallet challenge authenticator entered (request=%s, callback_completed=%s)",
+          safeCallbackRequestId(callbackRequestId),
+          auth != null && "true".equals(auth.getClientNote(CALLBACK_COMPLETED_NOTE)));
+      if (auth == null) {
         failClosed(context);
         return;
       }
+      if ("true".equals(auth.getClientNote(CALLBACK_COMPLETED_NOTE))) {
+        denyCompletedCallbackReplay(context, auth);
+        return;
+      }
+      WalletLoginTransactionStore store = transactionStores.get();
+      if (store == null) {
+        failClosed(context);
+        return;
+      }
+      var authSession = auth;
       boolean signupIntent = "signup".equals(authSession.getClientNote(SIGNUP_AUTH_NOTE));
       if (signupIntent) authSession.removeClientNote(SIGNUP_AUTH_NOTE);
       if (signupIntent) authSession.setAuthNote(SIGNUP_AUTH_NOTE, "signup");
@@ -80,6 +100,7 @@ public final class WalletChallengeAuthenticator implements Authenticator {
       }
       var binding = new WalletLoginTransactionStore.Binding(
           realm.getId(), client.getId(), rootSessionId, tabId, redirectUri, origin);
+      WalletTerminalAuthenticationSession.pruneOnFreshAuthenticate(realm, authSession);
       var issued = store.issue(binding, signupIntent
           ? WalletLoginTransactionStore.Intent.SIGNUP : WalletLoginTransactionStore.Intent.LOGIN);
       auth.setAuthNote("decent.wallet.handle", issued.handle());
@@ -175,11 +196,19 @@ public final class WalletChallengeAuthenticator implements Authenticator {
         failClosed(context);
         return;
       }
+      String callbackExecutionId = context.getExecution() == null
+          ? null : context.getExecution().getId();
+      if (callbackExecutionId == null) { failClosed(context); return; }
       // Set the already-validated user before the one-use gate; failures here
       // leave the callback retryable and never mark the authentication execution successful.
       auth.setAuthenticatedUser(user);
       var receipt = store.takeAccepted(handle, binding);
-      if (receipt.isEmpty() || !receipt.get().equals(visibleReceipt.get())) { failClosed(context); return; }
+      if (receipt.isEmpty()) { failClosed(context); return; }
+      if (!receipt.get().equals(visibleReceipt.get())) { failClosed(context); return; }
+      auth.setClientNote(CALLBACK_EXECUTION_NOTE, callbackExecutionId);
+      auth.setClientNote(CALLBACK_COMPLETED_NOTE, "true");
+      auth.setClientNote(CALLBACK_REQUEST_NOTE,
+          WalletLoginTransportHandler.requestCorrelationId(handle));
       context.success();
       clearWalletAuthNotes(auth);
     } catch (Exception failure) {
@@ -224,8 +253,77 @@ public final class WalletChallengeAuthenticator implements Authenticator {
     }
   }
 
+  private static String safeCallbackRequestId(String requestId) {
+    return requestId != null && requestId.matches("[0-9a-f]{32}") ? requestId : "unavailable";
+  }
+
+  private static void denyCompletedCallbackReplay(AuthenticationFlowContext context,
+      org.keycloak.sessions.AuthenticationSessionModel auth) {
+    try {
+      String requestId = auth.getClientNote(CALLBACK_REQUEST_NOTE);
+      String redirectUri = auth.getRedirectUri();
+      var client = auth.getClient();
+      boolean redirectUriRegistered = client != null
+          && isSingleExactHttpsRedirect(client.getRedirectUris(), redirectUri);
+      String state = auth.getClientNote(org.keycloak.protocol.oidc.OIDCLoginProtocol.STATE_PARAM);
+      LOG.infof("Wallet callback replay guard entered (request=%s, state_present=%s, "
+              + "redirect_uri_present=%s, redirect_uri_registered=%s, protocol_openid_connect=%s)",
+          requestId != null && requestId.matches("[0-9a-f]{32}") ? requestId : "unavailable",
+          state != null && !state.isBlank(), redirectUri != null && !redirectUri.isBlank(),
+          redirectUriRegistered, "openid-connect".equals(auth.getProtocol()));
+      var event = context.getEvent();
+      event.error(org.keycloak.events.Errors.INVALID_CODE);
+      var protocol = context.getSession().getProvider(org.keycloak.protocol.LoginProtocol.class,
+          auth.getProtocol());
+      if (protocol == null) {
+        failClosed(context);
+        return;
+      }
+      protocol.setRealm(context.getRealm())
+          .setHttpHeaders(context.getHttpRequest().getHttpHeaders())
+          .setUriInfo(context.getUriInfo())
+          .setEventBuilder(event);
+      var response = protocol.sendError(auth,
+          org.keycloak.protocol.LoginProtocol.Error.CANCELLED_BY_USER, null);
+      if (response == null) {
+        failClosed(context);
+        return;
+      }
+      context.forceChallenge(response);
+    } catch (RuntimeException failure) {
+      LOG.error("Wallet callback replay denial failed");
+      failClosed(context);
+    }
+  }
+
   private static void failClosed(AuthenticationFlowContext context) {
     context.failure(AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+  }
+
+  @Override
+  public void onParentFlowSuccess(AuthenticationFlowContext context) {
+    // No additional work is needed when the immediate parent flow succeeds.
+  }
+
+  @Override
+  public void onTopFlowSuccess(AuthenticationFlowModel topFlow) {
+    if (session == null) return;
+    var auth = session.getContext().getAuthenticationSession();
+    if (auth == null || !"true".equals(auth.getClientNote(CALLBACK_COMPLETED_NOTE))) return;
+    String executionId = auth.getClientNote(CALLBACK_EXECUTION_NOTE);
+    if (executionId == null || executionId.isBlank()) {
+      throw new org.keycloak.authentication.AuthenticationFlowException(
+          AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+    }
+    // SessionCodeChecks redirects a stale action URL back to the last execution.
+    // Keep the consumed wallet step re-enterable so authenticate() can return
+    // a state-bound denial instead of silently skipping the completed execution.
+    auth.setAuthNote(org.keycloak.authentication.AuthenticationProcessor.CURRENT_AUTHENTICATION_EXECUTION,
+        executionId);
+    auth.setExecutionStatus(executionId,
+        org.keycloak.sessions.CommonClientSessionModel.ExecutionStatus.CHALLENGED);
+    LOG.infof("Wallet callback execution rearmed (request=%s, execution_id_present=true)",
+        safeCallbackRequestId(auth.getClientNote(CALLBACK_REQUEST_NOTE)));
   }
 
   @Override

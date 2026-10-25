@@ -5,6 +5,8 @@ WORKDIR /resolver-build
 COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py
 COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./
 COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py
+COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./
+COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/
 COPY container/resolver-runtime.lock.json container/registry-lock-constraints.txt container/resolver-requirements.in container/resolver-requirements.lock.txt container/resolver-build-requirements.lock.txt ./
 COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
 COPY container/gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel.rpm
@@ -34,6 +36,10 @@ RUN --network=none python3.11 verify_resolver_runtime_inputs.py --archives . --m
 RUN --network=none python3.11 -m venv --copies /opt/decent-resolver/venv \
  && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --require-hashes -r resolver-build-requirements.lock.txt \
  && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --no-build-isolation --require-hashes -r resolver-requirements.lock.txt
+RUN --network=none /opt/decent-resolver/venv/bin/python patch_resolver_runtime.py \
+ --site-packages "/opt/decent-resolver/venv/lib64/python3.11/site-packages" \
+ --registry-file /opt/decent-resolver/registry-src/src/decent_registry/dht/libp2p_dht.py \
+ && /opt/decent-resolver/venv/bin/python -m compileall -q /opt/decent-resolver/venv/lib64/python3.11/site-packages/libp2p/kad_dht /opt/decent-resolver/registry-src/src
 RUN --network=none mkdir -p /opt/decent-resolver/bin \
  && cat > /opt/decent-resolver/bin/decent-identity <<'EOF'
 #!/bin/sh
@@ -55,6 +61,17 @@ EOF
 RUN --network=none chmod 0755 /opt/decent-resolver/bin/decent-identity /opt/decent-resolver/bin/decent-registry \
  && cp rotation_registry_roundtrip.py /opt/decent-resolver/rotation_registry_roundtrip.py \
  && python3.11 -m compileall -q /opt/decent-resolver/identity-src/src /opt/decent-resolver/registry-src/src
+RUN --network=none if [ ! -e /etc/resolv.conf ]; then \
+      printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf; \
+      created_resolv_conf=1; \
+    else \
+      created_resolv_conf=0; \
+    fi \
+ && LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_dht_peer_outcomes.py \
+ && RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_registry_lookup_outcomes.py \
+ && /opt/decent-resolver/bin/decent-identity --help >/dev/null \
+ && /opt/decent-resolver/bin/decent-registry --help >/dev/null \
+ && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi
 
 FROM quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad AS keycloak-with-resolver
 USER 0
@@ -66,26 +83,13 @@ COPY --from=resolver-builder /usr/lib64/libcrypto.so.3 /usr/lib64/libcrypto.so.3
 COPY --from=resolver-builder /usr/bin/python3.11 /usr/bin/python3.11
 COPY --from=resolver-builder /opt/decent-resolver/lib/libgmp.so.10.4.0 /usr/lib64/libgmp.so.10.4.0
 COPY --from=resolver-builder /usr/include/gmp.h /usr/include/gmp.h
-RUN --network=none if [ ! -e /etc/resolv.conf ]; then \
-      printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf; \
-      created_resolv_conf=1; \
-    else \
-      created_resolv_conf=0; \
-    fi \
- && ln -sf libpython3.11.so.1.0 /usr/lib64/libpython3.11.so \
- && ln -sf libgmp.so.10.4.0 /usr/lib64/libgmp.so.10 \
- && chmod 0755 /usr/lib64/libgmp.so.10.4.0 \
- && python3.11 -c 'import ssl, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 13)' \
- && /opt/decent-resolver/bin/decent-identity --help >/dev/null \
- && PYTHONPATH=/opt/decent-resolver/registry-src/src:/opt/decent-resolver/venv/lib64/python3.11/site-packages:/opt/decent-resolver/venv/lib/python3.11/site-packages LD_LIBRARY_PATH=/opt/decent-resolver/lib python3.11 -c 'from decent_registry.cli import main; main()' --help >/dev/null \
- && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi
 USER 1000
 
 FROM keycloak-with-resolver AS runtime
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
-RUN --network=none /opt/keycloak/bin/kc.sh build --spi-single-use-object--provider=infinispan
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=infinispan
 
 # The fault injector exists only in this separately built test target.
 FROM runtime AS issue7-user-readback-test-runtime
@@ -93,3 +97,19 @@ USER 0
 COPY target/issue7-user-readback-provider.jar /opt/keycloak/providers/
 USER 1000
 RUN --network=none /opt/keycloak/bin/kc.sh build --spi-user--provider-default=issue7-user-readback-fault
+
+# The Issue #6 receipt fault decorator is available only in this isolated test image.
+FROM keycloak-with-resolver AS issue6-postconsume-test-runtime
+COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
+COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
+COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
+COPY target/issue6-postconsume-receipt-failure-provider.jar /opt/keycloak/providers/
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=issue6-postconsume-receipt-failure
+
+# The sibling callback-gate injector is isolated from both production and receipt-failure targets.
+FROM keycloak-with-resolver AS issue6-callback-gate-test-runtime
+COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
+COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
+COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
+COPY target/issue6-postconsume-callback-gate-failure-provider.jar /opt/keycloak/providers/
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=issue6-postconsume-callback-gate-failure

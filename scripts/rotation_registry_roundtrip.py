@@ -154,7 +154,7 @@ async def rotate_and_confirm(args: argparse.Namespace) -> None:
         if attempt < 29:
             await trio.sleep(1)
     if observed is None:
-        raise RuntimeError("separate Identity resolver confirms sequence 2 and current owner key")
+        raise RuntimeError("separate Identity resolver did not confirm expected sequence and owner key")
     args.readback.write_text(f"{observed.seq}\n{observed.owner_public_key_hex}\n", encoding="ascii")
 
 

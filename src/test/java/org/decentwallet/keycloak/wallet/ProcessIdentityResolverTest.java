@@ -11,9 +11,11 @@ final class ProcessIdentityResolverTest {
   void diagnosticLoggerEmitsOnlyBoundedCategoriesAndLineCount() throws Exception {
     String privateMarker = "private@example.invalid";
     String endpointMarker = "/ip4/10.20.30.40/tcp/9000";
-    String raw = "Failed to open TCP stream: all attempts to connect to " + endpointMarker + " failed\n"
-        + "Value not found for key /decent-registry/identity/" + "ab".repeat(32) + "\n"
-        + "unclassified " + privateMarker + " token=must-not-log";
+    String raw = String.join(System.lineSeparator(),
+        "Failed to open TCP stream: all attempts to connect to " + endpointMarker + " failed",
+        "Value not found for key /decent-registry/identity/" + "ab".repeat(32),
+        "DHT_LOOKUP_SUMMARY stage=get_value attempts=2 empty=1 failed=1 timeouts=0 incomplete=0",
+        "unclassified " + privateMarker + " token=must-not-log");
     Path executable = Files.createTempFile("identity-diagnostic-stub-", ".sh");
     var capture = new ResolverLogCapture();
     var old = java.util.logging.Logger.getLogger(ProcessIdentityResolver.class.getName());
@@ -30,14 +32,14 @@ final class ProcessIdentityResolverTest {
           () -> resolver.resolveExact("mailto:alice@example.org"));
 
       assertTrue(capture.message.startsWith("[WALLET-RESOLVER-DIAG] "), capture.message);
-      assertTrue(capture.message.contains("reason=registry_miss|dial_warning|unknown"), capture.message);
-      assertTrue(capture.message.contains("lines=3"), capture.message);
+      assertTrue(capture.message.contains("reason=registry_miss|dial_warning|dht_lookup_unavailable|unknown"), capture.message);
+      assertTrue(capture.message.contains("lines=4"), capture.message);
       assertFalse(capture.message.contains(privateMarker));
       assertFalse(capture.message.contains(endpointMarker));
       assertFalse(capture.message.contains("must-not-log"));
       assertFalse(capture.message.contains(raw));
       assertTrue(java.util.regex.Pattern.matches(
-          "\\[WALLET-RESOLVER-DIAG] exit=0, reason=[a-z_|]+, lines=3, capped=false",
+          "\\[WALLET-RESOLVER-DIAG] exit=0, reason=[a-z_|]+, lines=4, capped=false, dht=get_value:2/1/1/0/0",
           capture.message));
     } finally {
       old.removeHandler(capture);
@@ -356,12 +358,23 @@ final class ProcessIdentityResolverTest {
   void identityMissMustNameTheRequestedRegistryObjectKey() {
     String identity = "mailto:alice@example.org";
     String expectedObjectKey = "4aa8889aa1e3f193844b32d36e58b50a8817304b9e15d798d460d00bff828a29";
-    String exactMiss = "Value not found for key /decent-registry/identity/" + expectedObjectKey
+    String cleanSummaries = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0\n"
+        + "DHT_LOOKUP_SUMMARY stage=remote_identity attempts=2 empty=2 failed=0 timeouts=0 incomplete=0\n";
+    String exactMiss = cleanSummaries + "Value not found for key /decent-registry/identity/" + expectedObjectKey
         + "\nnot found\n";
 
     assertEquals(expectedObjectKey, ProcessIdentityResolver.exactRegistryObjectKeyHex(identity));
     assertTrue(ProcessIdentityResolver.isConfirmedIdentityNotFound(exactMiss, expectedObjectKey));
+    assertFalse(ProcessIdentityResolver.isConfirmedIdentityNotFound(
+        "Value not found for key /decent-registry/identity/" + expectedObjectKey + "\nnot found\n",
+        expectedObjectKey));
     assertFalse(ProcessIdentityResolver.isConfirmedIdentityNotFound(exactMiss, "ab".repeat(32)));
+    String mixedOutcome = "DHT_LOOKUP_SUMMARY stage=get_value attempts=2 empty=1 failed=1 timeouts=0 incomplete=0\n"
+        + cleanSummaries.substring(cleanSummaries.indexOf("DHT_LOOKUP_SUMMARY stage=remote_identity"))
+        + "Value not found for key /decent-registry/identity/" + expectedObjectKey + "\nnot found\n";
+    assertFalse(ProcessIdentityResolver.isConfirmedIdentityNotFound(mixedOutcome, expectedObjectKey));
+    assertEquals("dht_lookup_unavailable", ProcessIdentityResolver.diagnosticReason(
+        "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=0 failed=1 timeouts=0 incomplete=0"));
   }
 
   @Test

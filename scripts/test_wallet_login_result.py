@@ -17,6 +17,12 @@ import wallet_login_live_e2e as live  # noqa: E402
 
 class IdentityLookupClassificationTest(unittest.TestCase):
 
+  def test_checkpoint_preserves_dht_lookup_unavailable_resolver_diagnostic(self):
+    candidate = {'resolver_runtime': {
+        'diagnostic_categories': ['ok:dht_lookup_unavailable']}}
+
+    self.assertEqual(candidate, sanitize_live_checkpoint(candidate))
+
   def _run_missing_identity_probe(self, redirect_during=None):
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -128,7 +134,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     end = source.index('def signup_wallet_flow(', start)
     body = source[start:end]
     self.assertIn("helper = project / 'scripts/rotation_registry_roundtrip.py'", body)
-    self.assertIn('separate Identity resolver confirms seq 2 and exact successor key', body)
+    self.assertIn("readback[0] == str(expected_sequence)", body)
+    self.assertIn("separate Identity resolver confirms sequence {expected_sequence} and exact successor key", body)
     helper = Path(__file__).with_name('rotation_registry_roundtrip.py').read_text()
     self.assertIn('draft_identity_bundle(', helper)
     self.assertIn('predecessor_state_hash=predecessor_hash', helper)
@@ -367,13 +374,16 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertTrue(live._response_has_acceptance_evidence(
         {}, b'{"code":"redacted"}', terminal_http_status=401))
 
-  def test_issue4_live_profile_requires_clean_provider_not_found(self):
+  def test_provider_not_found_diagnostic_profile_is_explicitly_separate(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
     main = source[source.index('def main():'):]
-    self.assertIn("'issue4-not-found'", main)
-    self.assertIn('issue4_missing_identity_is_qualified', main)
+    self.assertIn("'provider-not-found-diagnostic'", main)
+    self.assertNotIn("'issue4-not-found'", main)
+    self.assertIn('provider_missing_identity_is_qualified', main)
+    self.assertNotIn('issue4_missing_identity_is_qualified', main)
+    self.assertNotIn('Issue #4 clean provider-level terminal', main)
 
-  def test_issue4_qualification_requires_exact_clean_miss_and_provider_denial(self):
+  def test_provider_not_found_diagnostic_requires_exact_clean_miss_and_denial(self):
     accepted = {
         'cli_resolution': 'not_found',
         'cli_output_categories': ['registry_miss', 'not_found'],
@@ -383,7 +393,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'redirects_safe': True,
         'no_acceptance_or_callback': True,
     }
-    self.assertTrue(live.issue4_missing_identity_is_qualified(accepted))
+    self.assertTrue(live.provider_missing_identity_is_qualified(accepted))
     for change in (
         {'cli_resolution': 'unavailable'},
         {'cli_output_categories': ['dial_warning', 'registry_miss', 'not_found']},
@@ -393,7 +403,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         {'no_acceptance_or_callback': False},
     ):
       with self.subTest(change=change):
-        self.assertFalse(live.issue4_missing_identity_is_qualified({**accepted, **change}))
+        self.assertFalse(live.provider_missing_identity_is_qualified({**accepted, **change}))
 
   def test_live_e2e_probe_reports_registry_and_account_misses_distinctly(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
@@ -445,20 +455,20 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     end = source.index('def classify_oidc_action_error(', start)
     namespace = {'run': lambda *args, **kwargs: None, 're': __import__('re')}
     exec(source[start:end], namespace)
-    record = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|dial_warning|unknown, lines=64, capped=true'
+    record = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|dial_warning|unknown, lines=64, capped=true, dht=get_value:1/1/0/0/0|remote_identity:2/2/0/0/0'
     prefixed_record = ('2026-10-17 11:23:45,678 DEBUG [org.decentwallet.keycloak.wallet.ProcessIdentityResolver] '
-        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=3, reason=history_unavailable, lines=1, capped=false')
-    secrets = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|mailto:private@example.invalid, lines=4, capped=false'
+        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=3, reason=history_unavailable, lines=1, capped=false, dht=none')
+    secrets = '[WALLET-RESOLVER-DIAG] exit=0, reason=registry_miss|mailto:private@example.invalid, lines=4, capped=false, dht=none'
     self.assertEqual(['ok:registry_miss|dial_warning|unknown'],
         namespace['sanitized_resolver_diagnostic_lines'](record))
     nonzero_record = ('2026-10-17 11:23:45,678 DEBUG [org.decentwallet.keycloak.wallet.ProcessIdentityResolver] '
-        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=7, reason=nonzero_exit, lines=0, capped=false')
+        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=7, reason=nonzero_exit, lines=0, capped=false, dht=none')
     process_start_record = ('2026-10-17 11:23:45,678 DEBUG [org.decentwallet.keycloak.wallet.ProcessIdentityResolver] '
-        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=-1, reason=process_start, lines=0, capped=false')
+        '(executor-thread-2) [WALLET-RESOLVER-DIAG] exit=-1, reason=process_start, lines=0, capped=false, dht=none')
     self.assertEqual(['ok:process_start'],
         namespace['sanitized_resolver_diagnostic_lines'](process_start_record))
     failure_records = [
-        f'[WALLET-RESOLVER-DIAG] exit=-1, reason=unknown|{category}, lines=1, capped=false'
+        f'[WALLET-RESOLVER-DIAG] exit=-1, reason=unknown|{category}, lines=1, capped=false, dht=none'
         for category in ('timeout', 'interrupted', 'termination_interrupted', 'output_overflow')]
     self.assertEqual([f'ok:unknown|{category}' for category in
         ('timeout', 'interrupted', 'termination_interrupted', 'output_overflow')],
@@ -474,8 +484,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     end = source.index('def classify_oidc_action_error(', start)
     namespace = {'run': lambda *args, **kwargs: None, 're': __import__('re')}
     exec(source[start:end], namespace)
-    oversized = '[WALLET-RESOLVER-DIAG] exit=999, reason=unknown, lines=65, capped=true'
-    invalid_negative = '[WALLET-RESOLVER-DIAG] exit=-2, reason=process_start, lines=0, capped=false'
+    oversized = '[WALLET-RESOLVER-DIAG] exit=999, reason=unknown, lines=65, capped=true, dht=none'
+    invalid_negative = '[WALLET-RESOLVER-DIAG] exit=-2, reason=process_start, lines=0, capped=false, dht=none'
     self.assertEqual(['invalid'], namespace['sanitized_resolver_diagnostic_lines'](oversized))
     self.assertEqual(['invalid'], namespace['sanitized_resolver_diagnostic_lines'](invalid_negative))
 
@@ -569,9 +579,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
   def test_unavailable_categories_preserve_history_and_traceback_reason(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
-    start = source.index('def classify_identity_lookup(')
+    start = source.index('def parse_dht_lookup_summary_line(')
     end = source.index('def parse_exact_identity_result(', start)
-    namespace = {}
+    namespace = {'re': __import__('re')}
     exec(source[start:end], namespace)
 
     for diagnostic, expected_category in (
@@ -591,9 +601,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     ))
 
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
-    start = source.index('def classify_identity_lookup(')
-    end = source.index('\n\ndef parse_exact_identity_result', start)
-    namespace = {}
+    start = source.index('def parse_dht_lookup_summary_line(')
+    end = source.index('def parse_exact_identity_result(', start)
+    namespace = {'re': __import__('re')}
     exec(source[start:end], namespace)
     resolution, categories = namespace['classify_identity_lookup'](output, 1)
 
@@ -602,9 +612,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
   def test_well_formed_registry_miss_with_handshake_failure_stays_unavailable(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
-    start = source.index('def classify_identity_lookup(')
-    end = source.index('\ndef parse_exact_identity_result', start)
-    namespace = {}
+    start = source.index('def parse_dht_lookup_summary_line(')
+    end = source.index('def parse_exact_identity_result(', start)
+    namespace = {'re': __import__('re')}
     exec(source[start:end], namespace)
     output = '\n'.join((
         'Value not found for key /decent-registry/identity/' + 'ab' * 32,
@@ -646,6 +656,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     identifier = 'mailto:alice@example.org'
     expected_key = '4aa8889aa1e3f193844b32d36e58b50a8817304b9e15d798d460d00bff828a29'
     output = chr(10).join((
+        'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0',
+        'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0',
         'Value not found for key /decent-registry/identity/' + expected_key,
         'not found',
     ))
@@ -654,6 +666,21 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
     self.assertEqual('not_found', resolution)
     self.assertEqual(['registry_miss', 'not_found'], categories)
+
+  def test_exact_miss_requires_clean_summaries_from_both_lookup_stages(self):
+    identifier = 'mailto:alice@example.org'
+    expected_key = '4aa8889aa1e3f193844b32d36e58b50a8817304b9e15d798d460d00bff828a29'
+    registry_miss = 'Value not found for key /decent-registry/identity/' + expected_key
+    clean_remote = 'DHT_LOOKUP_SUMMARY stage=remote_identity attempts=2 empty=2 failed=0 timeouts=0 incomplete=0'
+    cases = (
+        (chr(10).join((registry_miss, 'not found')), 'missing summaries'),
+        (chr(10).join(('DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0', registry_miss, 'not found')), 'missing fallback summary'),
+        (chr(10).join(('DHT_LOOKUP_SUMMARY stage=get_value attempts=2 empty=1 failed=1 timeouts=0 incomplete=0', clean_remote, registry_miss, 'not found')), 'mixed peer outcome'),
+        (chr(10).join(('DHT_LOOKUP_SUMMARY stage=get_value attempts=0 empty=0 failed=0 timeouts=0 incomplete=0', clean_remote, registry_miss, 'not found')), 'zero peer attempts'),
+    )
+    for output, label in cases:
+      with self.subTest(label=label):
+        self.assertEqual('unavailable', classify_identity_lookup(output, 1, identifier)[0])
 
   def test_registry_miss_for_another_identity_key_is_unavailable(self):
     identifier = 'mailto:alice@example.org'
@@ -906,7 +933,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       def fake_run(args, **_kwargs):
         calls.append(args)
         if args[:3] == ['podman', 'inspect', '--format']:
-          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) == 1:
             return SimpleNamespace(returncode=0, stdout=container_id + '\n')
           return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + container_id)
         return SimpleNamespace(returncode=0, stdout='')
@@ -918,6 +945,35 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       self.assertFalse(cid_file.exists())
       self.assertEqual([['podman', 'rm', '--force', container_id]],
           [call for call in calls if call[:2] == ['podman', 'rm']])
+
+  def test_owned_container_cleanup_accepts_podman_removed_cid_file(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'd' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      inspect_count = 0
+      def fake_run(args, **_kwargs):
+        nonlocal inspect_count
+        if args[:3] == ['podman', 'inspect', '--format']:
+          inspect_count += 1
+          if inspect_count == 1:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1,
+              stdout='Error: no such object: "' + container_id + '"')
+        cid_file.unlink(missing_ok=True)
+        return SimpleNamespace(returncode=0, stdout='')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': True, 'retained_cid': False}, status)
+      self.assertFalse(cid_file.exists())
 
   def test_owned_container_cleanup_refuses_inspect_id_mismatch(self):
     from types import SimpleNamespace
@@ -973,9 +1029,12 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     import wallet_login_live_e2e as probe
 
     main_source = inspect.getsource(probe.main)
-    self.assertIn('cleanup_errors = cleanup_owned_resources(registry, resolver_tools)', main_source)
-    self.assertIn('if cleanup_errors:', main_source)
-    self.assertIn('owned container cleanup incomplete', main_source)
+    cleanup_source = inspect.getsource(probe.finish_owned_cleanup)
+    failure_cleanup_source = inspect.getsource(probe.cleanup_after_failure)
+    self.assertIn('finish_owned_cleanup(registry, resolver_tools)', main_source)
+    self.assertIn('owned container cleanup incomplete', cleanup_source)
+    self.assertIn('interruption_collector', inspect.getsource(probe.cleanup_owned_resources))
+    self.assertIn('cleanup_owned_resources(registry_node, resolver_tools, cleanup_interruptions)', failure_cleanup_source)
 
   def test_cleanup_reports_sanitized_resource_categories_without_container_ids(self):
     from contextlib import redirect_stdout
@@ -1025,8 +1084,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'keycloak_version': 'unavailable', 'keycloak_nodes': 'unknown',
         'database_mode_configured': 'dev-file', 'database_mode_effective': 'unavailable',
         'cache_mode_configured': 'local', 'cache_mode_effective': 'unavailable',
-        'cache_stack_effective': None, 'single_use_object_provider_path': 'unavailable',
-        'single_use_object_provider_ids': [],
+        'cache_stack_effective': None, 'single_use_object_provider_configured': 'unavailable',
+        'single_use_object_provider_path': 'unavailable', 'single_use_object_provider_ids': [],
+        'runtime_command_fields_present': [],
         'runtime_qualification_status': 'open_runtime_facts_unavailable',
     }
     with tempfile.TemporaryDirectory() as scratch:
@@ -1049,7 +1109,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value=facts))
         stack.enter_context(patch.object(probe, 'record_resolver_diagnostics', return_value=[]))
         stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=0))
-        with self.assertRaisesRegex(RuntimeError, 'effective Keycloak runtime provenance verified'):
+        with self.assertRaisesRegex(RuntimeError,
+            'pinned Keycloak version and single-node baseline verified'):
           probe.main()
 
       evidence = output.getvalue()
@@ -1063,17 +1124,29 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'kc.db = dev-file (PersistedConfigSource)\n'
         'kc.cache = local (SysPropConfigSource)\n'
         'kc.cache-stack = jdbc-ping (ConfigSource)\n'
-        'kc.spi-single-use-object--provider = infinispan (PersistedConfigSource)\n'
+        'kc.spi-single-use-object--provider-default = infinispan (classpath application.properties)\n'
         'kc.db = postgres (EnvVarConfigSource)\n'
         'kc.hostname = idp.example (SysPropConfigSource)\n'
         'kc.cache=unsafe value (sensitive-source)\n')
     self.assertEqual({'cache_mode_effective': 'local', 'cache_stack_effective': 'jdbc-ping',
-        'single_use_object_provider_path': 'infinispan'}, facts)
+        'single_use_object_provider_configured': 'infinispan'}, facts)
     self.assertNotIn('PersistedConfigSource', json.dumps(facts))
     self.assertNotIn('idp.example', json.dumps(facts))
     self.assertEqual({}, probe.parse_keycloak_show_config(
-        'kc.spi-single-use-object--provider = infinispan\n'
-        'kc.spi-single-use-object--provider = jpa\n'))
+        'kc.spi-single-use-object--provider-default = infinispan\n'
+        'kc.spi-single-use-object--provider-default = jpa\n'))
+
+  def test_runtime_cache_mode_requires_unambiguous_applied_infinispan_configuration(self):
+    import wallet_login_live_e2e as probe
+    prefix = 'INFO boot\nDEBUG Infinispan configuration:\n'
+    self.assertEqual('local', probe.parse_infinispan_runtime_cache_mode(
+        prefix + '<local-cache name="sessions"/><local-cache name="realms"/>'))
+    self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
+        prefix + '<local-cache name="sessions"/><distributed-cache name="sessions"/>'))
+    self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
+        prefix + '<local-cache name="sessions"/>\nInfinispan configuration: <local-cache/>'))
+    self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
+        '<local-cache name="sessions"/>'))
 
   def test_runtime_provenance_reads_allowlisted_config_but_does_not_infer_selected_provider(self):
     from types import SimpleNamespace
@@ -1088,26 +1161,33 @@ class IdentityLookupClassificationTest(unittest.TestCase):
                 'jpa': {'order': 1, 'operationalInfo': {}}}}}}).encode())
 
     with patch.object(probe, 'run', side_effect=[
-        SimpleNamespace(returncode=0, stdout='a' * 64 + '\n'),
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]\n'),
         SimpleNamespace(returncode=0, stdout=(
-            'kc.db = dev-file (PersistedConfigSource)\n'
-            'kc.cache = local (SysPropConfigSource)\n'
-            'kc.spi-single-use-object--provider = infinispan (PersistedConfigSource)\n'))]) as mocked_run:
+            'kc.db = dev-file (Persisted)\n'
+            'kc.cache = local (Persisted)\n'
+            'kc.spi-single-use-object--provider-default = ******* (Persisted)\n')),
+        SimpleNamespace(returncode=0, stdout='Infinispan configuration:\n<local-cache name="sessions"/>')]) as mocked_run:
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
-    self.assertEqual(2, mocked_run.call_count)
-    self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], mocked_run.call_args_list[0].args[0])
-    self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config', '--all'],
+    self.assertEqual(3, mocked_run.call_count)
+    self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}', 'a' * 64], mocked_run.call_args_list[0].args[0])
+    self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config',
+        '--db=dev-file', '--cache=local', '--spi-single-use-object--provider-default=infinispan'],
         mocked_run.call_args_list[1].args[0])
+    self.assertEqual(['podman', 'logs', 'a' * 64], mocked_run.call_args_list[2].args[0])
     self.assertEqual('26.8.0', facts['keycloak_version'])
     self.assertEqual('one', facts['keycloak_nodes'])
     self.assertEqual('dev-file', facts['database_mode_effective'])
     self.assertEqual('local', facts['cache_mode_effective'])
+    self.assertEqual('infinispan_configuration_log', facts['cache_mode_effective_evidence'])
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts['runtime_command_fields_present'])
     self.assertEqual(['infinispan', 'jpa'], facts['single_use_object_provider_ids'])
-    self.assertEqual('infinispan', facts['single_use_object_provider_path'])
-    self.assertEqual('show_config_fields_complete', facts['keycloak_config_read_status'])
-    self.assertEqual(['cache_mode_effective', 'database_mode_effective',
-        'single_use_object_provider_path'], facts['keycloak_config_fields_present'])
-    self.assertEqual('runtime_facts_verified', facts['runtime_qualification_status'])
+    self.assertEqual('unavailable', facts['single_use_object_provider_path'])
+    self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
+    self.assertEqual(['cache_mode_effective', 'database_mode_effective'],
+        facts['keycloak_config_fields_present'])
+    self.assertEqual('open_runtime_facts_unavailable', facts['runtime_qualification_status'])
     rendered = json.dumps(probe.sanitize_live_checkpoint({'resolver_runtime': facts}))
     self.assertNotIn('opaque-token', rendered)
     self.assertNotIn('PersistedConfigSource', rendered)
@@ -1124,14 +1204,21 @@ class IdentityLookupClassificationTest(unittest.TestCase):
                 'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
 
     with patch.object(probe, 'run', side_effect=[
-        SimpleNamespace(returncode=0, stdout='a' * 64 + chr(10)),
-        SimpleNamespace(returncode=17, stdout='private show-config output')]):
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]' + chr(10)),
+        SimpleNamespace(returncode=17, stdout='private show-config output'),
+        SimpleNamespace(returncode=0, stdout='')]):
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
 
     self.assertEqual('show_config_nonzero', facts.get('keycloak_config_read_status'))
     self.assertEqual([], facts.get('keycloak_config_fields_present'))
     self.assertNotIn('private show-config output', json.dumps(facts))
+    self.assertEqual('dev-file', facts['database_mode_configured'])
+    self.assertEqual('local', facts['cache_mode_configured'])
     self.assertEqual('unavailable', facts['database_mode_effective'])
+    self.assertEqual('unavailable', facts['cache_mode_effective'])
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts['runtime_command_fields_present'])
 
   def test_runtime_provenance_reports_show_config_timeout(self):
     import subprocess
@@ -1144,8 +1231,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'}}).encode())
 
     with patch.object(probe, 'run', side_effect=[
-        SimpleNamespace(returncode=0, stdout='a' * 64 + chr(10)),
-        subprocess.TimeoutExpired('show-config', 8)]):
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]' + chr(10)),
+        subprocess.TimeoutExpired('show-config', 8),
+        SimpleNamespace(returncode=0, stdout='')]):
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
 
     self.assertEqual('show_config_timeout', facts.get('keycloak_config_read_status'))
@@ -1185,14 +1273,56 @@ class IdentityLookupClassificationTest(unittest.TestCase):
                 'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
 
     with patch.object(probe, 'run', return_value=SimpleNamespace(
-        returncode=0, stdout='b' * 64 + '\\n')) as mocked_run:
+        returncode=0, stdout='b' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]\\n')) as mocked_run:
       facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
     mocked_run.assert_called_once_with(
-        ['podman', 'inspect', '--format', '{{.Id}}', 'a' * 64], timeout=8)
+        ['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}', 'a' * 64], timeout=8)
     self.assertEqual('unknown', facts['keycloak_nodes'])
     self.assertEqual('container_id_unverified', facts['keycloak_config_read_status'])
     self.assertEqual('unavailable', facts['database_mode_effective'])
     self.assertEqual('open_runtime_facts_unavailable', facts['runtime_qualification_status'])
+
+  def test_runtime_provenance_keeps_command_inputs_separate_from_effective_readbacks(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import json
+    import wallet_login_live_e2e as probe
+
+    class InfoClient:
+      def request(self, *_args, **_kwargs):
+        return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'},
+            'providers': {'single-use-object': {'providers': {
+                'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
+
+    container_id = 'a' * 64
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout=container_id + '|["start-dev","--db=postgres","--cache=local","--spi-single-use-object--provider-default=infinispan"]\n'),
+        SimpleNamespace(returncode=0,
+            stdout='kc.db = postgres (classpath application.properties)\n', stderr=''),
+        SimpleNamespace(returncode=0, stdout='')]):
+      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
+
+    self.assertEqual('postgres', facts['database_mode_configured'])
+    self.assertEqual('local', facts['cache_mode_configured'])
+    self.assertEqual('postgres', facts['database_mode_effective'])
+    self.assertEqual('unavailable', facts['cache_mode_effective'])
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts['runtime_command_fields_present'])
+    self.assertEqual(['database_mode_effective'], facts['keycloak_config_fields_present'])
+    self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
+    self.assertEqual('open_runtime_facts_unavailable', facts['runtime_qualification_status'])
+
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout=container_id + '|["start-dev","--db=postgres","--cache=local","--spi-single-use-object--provider-default=infinispan"]\n'),
+        SimpleNamespace(returncode=0, stdout=(
+            'kc.db = mysql (classpath application.properties)\n'
+            'kc.cache = local (classpath application.properties)\n'), stderr=''),
+        SimpleNamespace(returncode=0, stdout='')]):
+      conflicting = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
+    self.assertEqual('unavailable', conflicting['database_mode_effective'])
+    self.assertEqual('local', conflicting['cache_mode_effective'])
+    self.assertEqual('show_config_conflict', conflicting['keycloak_config_read_status'])
 
   def test_runtime_checkpoint_projects_allowlisted_facts_without_raw_or_provider_class_data(self):
     candidate = {'resolver_runtime': {
@@ -1202,12 +1332,16 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
         'database_mode_configured': 'dev-file', 'database_mode_effective': 'dev-file',
         'cache_mode_configured': 'local', 'cache_mode_effective': 'local',
+        'cache_mode_effective_evidence': 'infinispan_configuration_log',
         'cache_stack_effective': 'jdbc-ping',
+        'single_use_object_provider_configured': 'infinispan',
         'single_use_object_provider_path': 'infinispan',
         'single_use_object_provider_ids': ['infinispan', 'jpa'],
+        'runtime_command_fields_present': ['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
         'keycloak_config_read_status': 'show_config_fields_complete',
         'keycloak_config_fields_present': ['cache_mode_effective',
-            'database_mode_effective', 'single_use_object_provider_path'],
+            'database_mode_effective', 'single_use_object_provider_configured'],
         'runtime_qualification_status': 'runtime_facts_verified',
         'raw_show_config': 'marker-raw-config', 'selected_provider_class': 'marker-class',
         'admin_token': 'marker-token'}}
@@ -1216,11 +1350,15 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertEqual('26.8.0', facts.get('keycloak_version'))
     self.assertEqual('one', facts.get('keycloak_nodes'))
     self.assertEqual('jdbc-ping', facts.get('cache_stack_effective'))
+    self.assertEqual('infinispan_configuration_log', facts.get('cache_mode_effective_evidence'))
     self.assertEqual(['infinispan', 'jpa'], facts.get('single_use_object_provider_ids'))
+    self.assertEqual(['cache_mode_configured', 'database_mode_configured',
+        'single_use_object_provider_configured'],
+        facts.get('runtime_command_fields_present'))
     self.assertEqual('runtime_facts_verified', facts.get('runtime_qualification_status'))
     self.assertEqual('show_config_fields_complete', facts.get('keycloak_config_read_status'))
     self.assertEqual(['cache_mode_effective', 'database_mode_effective',
-        'single_use_object_provider_path'], facts.get('keycloak_config_fields_present'))
+        'single_use_object_provider_configured'], facts.get('keycloak_config_fields_present'))
     rendered = json.dumps(projected)
     self.assertNotIn('marker-raw-config', rendered)
     self.assertNotIn('marker-class', rendered)
