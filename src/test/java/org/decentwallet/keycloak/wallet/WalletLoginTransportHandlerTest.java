@@ -71,6 +71,104 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void wrapperReadbackFaultsLeaveSignupPendingAndFreshExplicitSignupRecoversRetainedAccount() throws Exception {
+    for (String mode : java.util.List.of("empty", "throw")) {
+      var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+      String identity = "mailto:wrapper-readback-" + mode + "@example.org";
+      var transactionProvider = new MemoryStore();
+      var store = new WalletLoginTransactionStore(transactionProvider,
+          new java.security.SecureRandom(), Clock.systemUTC());
+      var firstBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+          "wrapper-fault-root-" + mode, "wrapper-fault-tab-" + mode,
+          BINDING.redirectUri(), IDP_ORIGIN);
+      var first = store.issue(firstBinding, WalletLoginTransactionStore.Intent.SIGNUP);
+      byte[] firstProof = signedProof(first.challenge(), identity, keyPair);
+
+      var realm = mock(org.keycloak.models.RealmModel.class);
+      var jpaUsers = mock(org.keycloak.models.UserProvider.class);
+      var created = mock(org.keycloak.models.UserModel.class);
+      var mappedIdentity = new AtomicReference<String>();
+      var createCalls = new AtomicInteger();
+      when(created.getId()).thenReturn("retained-wrapper-account-" + mode);
+      when(created.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE))
+          .thenAnswer(ignored -> mappedIdentity.get());
+      when(created.isEnabled()).thenReturn(true);
+      org.mockito.Mockito.doAnswer(invocation -> {
+        assertEquals(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, invocation.getArgument(0));
+        mappedIdentity.set(invocation.getArgument(1));
+        return null;
+      }).when(created).setSingleAttribute(org.mockito.ArgumentMatchers.anyString(),
+          org.mockito.ArgumentMatchers.anyString());
+      when(jpaUsers.addUser(realm, null, "wallet-" + java.util.HexFormat.of().formatHex(
+          java.security.MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8))),
+          true, true)).thenAnswer(ignored -> {
+            createCalls.incrementAndGet();
+            return created;
+          });
+      when(jpaUsers.searchForUserByUserAttributeStream(realm,
+          WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identity)).thenAnswer(ignored ->
+              identity.equals(mappedIdentity.get()) ? java.util.stream.Stream.of(created)
+                  : java.util.stream.Stream.empty());
+      var session = mock(org.keycloak.models.KeycloakSession.class);
+      when(session.getProvider(org.keycloak.models.UserProvider.class, "jpa")).thenReturn(jpaUsers);
+      var wrappedUsers = new Issue7FaultInjectingUserProviderFactory(mode).create(session);
+      assertNotSame(jpaUsers, wrappedUsers, "the fault-injecting UserProvider wrapper must be selected");
+
+      WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+        @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+          return WalletLoginAccountMapping.hasUniqueEnabledMapping(wrappedUsers, realm, exactIdentityId);
+        }
+        @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+          return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(wrappedUsers, realm, exactIdentityId);
+        }
+        @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+          return WalletLoginAccountMapping.ensureEnabledUser(wrappedUsers, realm, exactIdentityId, true);
+        }
+      };
+      var handler = new WalletLoginTransportHandler(store, exact ->
+          new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)),
+          WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+      var failed = handler.submitProof(first.handle(), null, null, null, null,
+          "application/json", null, firstProof, IDP_ORIGIN, WalletLoginTransactionStore.Intent.SIGNUP);
+      assertEquals(503, failed.status(), mode);
+      assertTrue(failed.body().isEmpty(), mode);
+      assertTrue(store.load(first.handle()).isPresent(), mode);
+      assertTrue(store.getAccepted(first.handle(), firstBinding).isEmpty(), mode);
+      assertFalse(store.callbackGateAvailable(first.handle(), firstBinding), mode);
+      assertEquals(identity, mappedIdentity.get(), mode);
+      assertEquals(1, createCalls.get(), mode);
+      org.mockito.Mockito.verify(created).setEnabled(true);
+      assertTrue(WalletLoginAccountMapping.hasUniqueEnabledMapping(wrappedUsers, realm, identity), mode);
+      assertEquals("retained-wrapper-account-" + mode,
+          WalletLoginAccountMapping.findUniqueEnabledUser(wrappedUsers, realm, identity).getId(), mode);
+      org.mockito.Mockito.verify(jpaUsers, org.mockito.Mockito.never()).removeUser(
+          org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.any());
+      org.mockito.Mockito.verify(session).getProvider(org.keycloak.models.UserProvider.class, "jpa");
+
+      // A fresh root session has an independent per-binding admission scope.
+      var retryBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+          "wrapper-retry-root-" + mode, "wrapper-retry-tab-" + mode,
+          BINDING.redirectUri(), IDP_ORIGIN);
+      var retry = store.issue(retryBinding, WalletLoginTransactionStore.Intent.SIGNUP);
+      byte[] retryProof = signedProof(retry.challenge(), identity, keyPair);
+      var recovered = handler.submitProof(retry.handle(), null, null, null, null,
+          "application/json", null, retryProof, IDP_ORIGIN, WalletLoginTransactionStore.Intent.SIGNUP);
+      assertEquals(202, recovered.status(), mode);
+      assertEquals(1, createCalls.get(), "fresh exact enabled-account readback must avoid a second addUser");
+      assertEquals("retained-wrapper-account-" + mode,
+          WalletLoginAccountMapping.findUniqueEnabledUser(wrappedUsers, realm, identity).getId(), mode);
+      assertTrue(store.load(first.handle()).isPresent(), "the failed transaction remains pending");
+      assertTrue(store.getAccepted(first.handle(), firstBinding).isEmpty());
+      assertFalse(store.callbackGateAvailable(first.handle(), firstBinding));
+      assertTrue(store.getAccepted(retry.handle(), retryBinding).isPresent());
+      assertTrue(store.callbackGateAvailable(retry.handle(), retryBinding));
+      org.mockito.Mockito.verify(jpaUsers, org.mockito.Mockito.never()).removeUser(
+          org.mockito.ArgumentMatchers.eq(realm), org.mockito.ArgumentMatchers.any());
+    }
+  }
+
+  @Test
   void emptyJsonApiResponsesDeclareMediaTypeForKeycloakFilters() {
     assertEquals("application/json; charset=utf-8",
         WalletLoginTransportHandler.HttpResult.empty(413).headers().get("Content-Type"));
