@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -713,7 +714,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertEqual('unavailable', resolution)
 
 
-  def test_owned_container_cleanup_removes_only_verified_full_cid(self):
+  def test_owned_container_cleanup_accepts_missing_cid_after_exact_absence_readback(self):
     from types import SimpleNamespace
     from unittest.mock import patch
     import wallet_login_live_e2e as probe
@@ -728,9 +729,216 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       def fake_run(args, **_kwargs):
         calls.append(args)
         if args[:3] == ['podman', 'inspect', '--format']:
-          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) == 1:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
             return SimpleNamespace(returncode=0, stdout=container_id + '\n')
           return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + container_id)
+        cid_file.unlink()
+        return SimpleNamespace(returncode=0, stdout='')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': True, 'retained_cid': False}, status)
+      self.assertFalse(cid_file.exists())
+      inspections = [call for call in calls if call[:2] == ['podman', 'inspect']]
+      self.assertEqual(3, len(inspections))
+      self.assertTrue(all(call[-1] == container_id for call in inspections))
+
+  def test_owned_container_cleanup_accepts_nonzero_rm_only_after_exact_absence(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'b' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      calls = []
+      def fake_run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ['podman', 'inspect', '--format']:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + container_id)
+        return SimpleNamespace(returncode=125, stdout='opaque rm failure')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': True, 'retained_cid': False}, status)
+      self.assertFalse(cid_file.exists())
+      self.assertEqual(3, len([call for call in calls if call[:2] == ['podman', 'inspect']]))
+
+  def test_owned_container_cleanup_rejects_absence_for_different_container_id(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'a' * 64
+    unrelated_id = 'b' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      calls = []
+      def fake_run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ['podman', 'inspect', '--format']:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + unrelated_id)
+        return SimpleNamespace(returncode=0, stdout='')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': False, 'retained_cid': True}, status)
+      self.assertTrue(cid_file.exists())
+      inspections = [call for call in calls if call[:2] == ['podman', 'inspect']]
+      self.assertEqual(3, len(inspections))
+      self.assertTrue(all(call[-1] == container_id for call in inspections))
+
+  def test_owned_container_cleanup_rejects_generic_not_found_output(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'c' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      calls = []
+      def fake_run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ['podman', 'inspect', '--format']:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1, stdout='Error: resource not found')
+        return SimpleNamespace(returncode=0, stdout='')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': False, 'retained_cid': True}, status)
+      self.assertTrue(cid_file.exists())
+      self.assertEqual(3, len([call for call in calls if call[:2] == ['podman', 'inspect']]))
+
+  def test_owned_container_cleanup_retains_cid_when_nonzero_rm_postcondition_is_unknown(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'c' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      calls = []
+      def fake_run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ['podman', 'inspect', '--format']:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=2, stdout='inspection unavailable')
+        return SimpleNamespace(returncode=125, stdout='opaque rm failure')
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': False, 'retained_cid': True}, status)
+      self.assertTrue(cid_file.exists())
+      self.assertEqual(3, len([call for call in calls if call[:2] == ['podman', 'inspect']]))
+
+  def test_owned_container_cleanup_keeps_cid_for_unconfirmed_postcondition(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'd' * 64
+    postconditions = (
+        SimpleNamespace(returncode=0, stdout=container_id + '\n'),
+        SimpleNamespace(returncode=0, stdout=('e' * 64) + '\n'),
+        SimpleNamespace(returncode=1, stdout='inspection unavailable'),
+        subprocess.TimeoutExpired(['podman', 'inspect'], 15),
+    )
+    for postcondition in postconditions:
+      with self.subTest(postcondition=type(postcondition).__name__), tempfile.TemporaryDirectory() as scratch:
+        cid_dir = Path(scratch) / 'run-owned'
+        cid_dir.mkdir(mode=0o700)
+        cid_file = cid_dir / 'keycloak.cid'
+        cid_file.write_text(container_id, encoding='ascii')
+        calls = []
+        def fake_run(args, **_kwargs):
+          calls.append(args)
+          if args[:3] == ['podman', 'inspect', '--format']:
+            count = len([call for call in calls if call[:2] == ['podman', 'inspect']])
+            if count <= 2:
+              return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+            if isinstance(postcondition, BaseException):
+              raise postcondition
+            return postcondition
+          return SimpleNamespace(returncode=125, stdout='opaque rm failure')
+
+        with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+          status = probe.remove_owned_container(cid_file)
+
+        self.assertEqual({'removed': False, 'retained_cid': True}, status)
+        self.assertTrue(cid_file.exists())
+
+  def test_owned_container_cleanup_accepts_absence_after_rm_timeout(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'f' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      calls = []
+      def fake_run(args, **_kwargs):
+        calls.append(args)
+        if args[:3] == ['podman', 'inspect', '--format']:
+          if len([call for call in calls if call[:2] == ['podman', 'inspect']]) <= 2:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1, stdout='Error: no such container: ' + container_id)
+        raise subprocess.TimeoutExpired(args, 20)
+
+      with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
+        status = probe.remove_owned_container(cid_file)
+
+      self.assertEqual({'removed': True, 'retained_cid': False}, status)
+      self.assertFalse(cid_file.exists())
+      self.assertEqual(3, len([call for call in calls if call[:2] == ['podman', 'inspect']]))
+
+  def test_owned_container_cleanup_removes_only_verified_full_cid(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    container_id = 'a' * 64
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'run-owned'
+      cid_dir.mkdir(mode=0o700)
+      cid_file = cid_dir / 'keycloak.cid'
+      cid_file.write_text(container_id, encoding='ascii')
+      calls = []
+      inspect_count = 0
+      def fake_run(args, **_kwargs):
+        nonlocal inspect_count
+        calls.append(args)
+        if args[:3] == ['podman', 'inspect', '--format']:
+          inspect_count += 1
+          if inspect_count <= 2:
+            return SimpleNamespace(returncode=0, stdout=container_id + '\n')
+          return SimpleNamespace(returncode=1, stdout='', stderr='Error: no such container: ' + container_id)
         return SimpleNamespace(returncode=0, stdout='')
 
       with patch.object(probe, 'RUN_CID_DIR', cid_dir), patch.object(probe, 'run', side_effect=fake_run):
@@ -757,10 +965,9 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         nonlocal inspect_count
         if args[:3] == ['podman', 'inspect', '--format']:
           inspect_count += 1
-          if inspect_count == 1:
+          if inspect_count <= 2:
             return SimpleNamespace(returncode=0, stdout=container_id + '\n')
-          return SimpleNamespace(returncode=1,
-              stdout='Error: no such object: "' + container_id + '"')
+          return SimpleNamespace(returncode=1, stdout='', stderr='Error: no such object: "' + container_id + '"')
         cid_file.unlink(missing_ok=True)
         return SimpleNamespace(returncode=0, stdout='')
 

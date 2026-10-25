@@ -1315,19 +1315,32 @@ def remove_owned_container(cid_file):
   if RUN_CID_DIR is None or path.parent != Path(RUN_CID_DIR):
     return {'removed': False, 'retained_cid': True}
   try:
-    container_id = verified_container_id(path)
-    removed = run(['podman', 'rm', '--force', container_id], timeout=20)
-    if removed.returncode != 0:
+    container_id = _inspect_cid(cid_file)
+    if container_id is None or _inspect_cid(cid_file) != container_id:
       return {'removed': False, 'retained_cid': True}
-    after = run(['podman', 'inspect', '--format', '{{.Id}}', container_id], timeout=15)
-    after_output = str(getattr(after, 'stdout', '') or '') + '\n' + str(getattr(after, 'stderr', '') or '')
-    if after.returncode == 0 or container_id not in after_output or not re.search(
-        r'(?:no such|not found|does not exist|no container.*found)', after_output, re.IGNORECASE):
+    try:
+      run(['podman', 'rm', '--force', container_id], timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+      pass
+    try:
+      after = run(['podman', 'inspect', '--format', '{{.Id}}', container_id], timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+      return {'removed': False, 'retained_cid': True}
+    absence_marker = re.compile(
+        r'(?:no such (?:container|object)|(?:container|object)\b.*\b'
+        r'(?:not found|does not exist)|no (?:container|object)\b.*\bfound)',
+        re.IGNORECASE)
+    absence_confirmed = (after.returncode != 0 and any(
+        container_id in line and absence_marker.search(line) is not None
+        for line in subprocess_output_text(after).splitlines()))
+    if not absence_confirmed:
       return {'removed': False, 'retained_cid': True}
   except (OSError, RuntimeError, subprocess.TimeoutExpired):
     return {'removed': False, 'retained_cid': True}
   try:
-    path.unlink(missing_ok=True)
+    Path(cid_file).unlink()
+  except FileNotFoundError:
+    return {'removed': True, 'retained_cid': False}
   except OSError:
     return {'removed': True, 'retained_cid': True}
   if path.exists():
