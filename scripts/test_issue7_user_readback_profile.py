@@ -42,10 +42,14 @@ class UserReadbackProfileTest(unittest.TestCase):
       return {'signup_intent_action_http': 200, 'signup_proof_http': 202,
           'exact_mapped_users': 1, 'callback_http': 302, 'callback_replay': True,
           'oidc_state_preserved': True, 'pkce_token_http': 200,
+          'provider_request_id': '0' * 32,
           'local_subject': 'private-subject', 'code': 'private-code',
           'exception': 'private exception', 'logs': 'private log'}
     progress_events, checkpoints = [], []
-    with patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup):
+    with ExitStack() as stack:
+      stack.enter_context(patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup))
+      stack.enter_context(patch.object(probe, 'read_provider_success_log_window',
+          return_value='Wallet proof transaction consumed (request=' + '0' * 32 + ', provider=infinispan)'))
       evidence = probe.run_issue7_signup_success_profile(
           Mock(), Path('key'), 'private-identity', 'container', Mock(), 'ordinary-image',
           lambda stage, fields: progress_events.append((stage, fields)), checkpoints.append)
@@ -165,6 +169,9 @@ class UserReadbackProfileTest(unittest.TestCase):
           return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
       stack.enter_context(patch.object(probe, 'verify_id_token', return_value={
           'sub': 'private-subject', 'decent_identity_id': 'private-identity'}))
+      request_id = probe.account_policy_request_id(locator)
+      stack.enter_context(patch.object(probe, 'read_provider_success_log_window',
+          return_value=f'Wallet proof transaction consumed (request={request_id}, provider=infinispan)'))
       stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
       stack.enter_context(patch.object(Path, 'write_text', autospec=True, side_effect=capture))
       dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
@@ -183,6 +190,7 @@ class UserReadbackProfileTest(unittest.TestCase):
     final = checkpoints[-1]['signup_case']
     self.assertEqual({'stage': 'complete',
         'evidence_provenance': 'harness-application-path-only',
+        'single_use_object_provider_id': 'infinispan',
         'signup_intent_action_http': 200,
         'signup_proof_http': 202, 'exact_mapped_users': 1, 'callback_http': 302,
         'callback_replay': True, 'oidc_state_preserved': True,
@@ -195,6 +203,52 @@ class UserReadbackProfileTest(unittest.TestCase):
         if call.args and call.args[0] == 'issue7-signup-success-evidence=']
     self.assertEqual(1, len(output))
     self.assertEqual(final, json.loads(output[0])['signup_case'])
+
+  def test_selected_provider_checkpoint_is_complete_only_and_allowlisted(self):
+    complete = probe.sanitize_live_checkpoint({'signup_case': {
+        'stage': 'complete', 'single_use_object_provider_id': 'infinispan'}})
+    self.assertEqual('infinispan', complete['signup_case'].get('single_use_object_provider_id'))
+    partial = probe.sanitize_live_checkpoint({'signup_case': {
+        'stage': 'proof', 'single_use_object_provider_id': 'infinispan'}})
+    self.assertNotIn('single_use_object_provider_id', partial['signup_case'])
+    unallowlisted = probe.sanitize_live_checkpoint({'signup_case': {
+        'stage': 'complete', 'single_use_object_provider_id': 'test-fake'}})
+    self.assertNotIn('single_use_object_provider_id', unallowlisted['signup_case'])
+
+  def test_success_provider_witness_requires_one_correlated_allowlisted_marker(self):
+    request_id = '0123456789abcdef0123456789abcdef'
+    marker = f'Wallet proof transaction consumed (request={request_id}, provider=infinispan)'
+    parse = getattr(probe, 'sanitize_success_provider_witness', lambda *_: None)
+    self.assertEqual('infinispan', parse(marker, request_id))
+    self.assertIsNone(parse('', request_id))
+    self.assertEqual('jpa', parse(marker.replace('infinispan', 'jpa'), request_id))
+    self.assertIsNone(parse(marker + '\n' + marker.replace('infinispan', 'jpa'), request_id))
+    self.assertIsNone(parse(marker.replace(request_id, 'f' * 32), request_id))
+    self.assertIsNone(parse(marker + '\n' + marker, request_id))
+    self.assertIsNone(parse(marker + ' private-identity private-handle proof', request_id))
+
+  def test_success_profile_rejects_missing_provider_witness_and_checkpoints_projection(self):
+    def ordinary_signup(*args, **kwargs):
+      args[5]('intent', {'signup_intent_action_http': 200})
+      args[5]('proof', {'signup_proof_http': 202, 'provider_request_id': '0' * 32})
+      args[5]('account', {'exact_mapped_users': 1})
+      args[5]('callback', {'callback_http': 302, 'callback_replay': True,
+          'oidc_state_preserved': True})
+      args[5]('token', {'pkce_token_http': 200})
+      return {'signup_intent_action_http': 200, 'signup_proof_http': 202,
+          'exact_mapped_users': 1, 'callback_http': 302, 'callback_replay': True,
+          'oidc_state_preserved': True, 'pkce_token_http': 200,
+          'provider_request_id': '0' * 32, 'provider_log': 'unrelated marker'}
+    checkpoints = []
+    with ExitStack() as stack:
+      stack.enter_context(patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup))
+      stack.enter_context(patch.object(probe, 'read_provider_success_log_window', return_value='', create=True))
+      with self.assertRaisesRegex(RuntimeError, 'provider witness'):
+        probe.run_issue7_signup_success_profile(
+            Mock(), Path('key'), 'private-identity', 'a' * 64, Mock(), 'image',
+            lambda *_: None, checkpoints.append)
+    self.assertEqual([], checkpoints)
+    self.assertNotIn('private-identity', json.dumps(checkpoints))
 
   def test_fault_diagnostics_are_correlated_bounded_and_sanitized(self):
     request_id = '0123456789abcdef0123456789abcdef'

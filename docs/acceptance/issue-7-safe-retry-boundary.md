@@ -24,6 +24,24 @@ is single-process application characterization only: the in-memory providers do 
 Keycloak runtime, JPA/provider persistence or atomicity, Registry/HTTP/browser callbacks, or OIDC
 code issuance. The empty handler response establishes only that this code path exposes no code.
 
+## Ordinary signup selected-provider witness (offline preparation)
+
+The ordinary `issue7-signup-success` profile now requires a request-correlated
+`Wallet proof transaction consumed` log event containing the selected SingleUseObjectProvider ID.
+The production event is emitted only after the pending transaction was removed and validated; it
+uses the request-correlation helper and the provider identity observed from the concrete provider
+instance used by the transaction store. The harness reads a bounded per-run log window and accepts
+exactly one marker for that request with a recognized provider ID. Missing, unknown, duplicate,
+conflicting, or unrelated-only markers fail closed. The final checkpoint projects the provider ID
+only for a completed success profile and omits the request ID and raw log contents.
+
+Offline tests cover the production handler log, parser correlation/allowlisting, final checkpoint
+projection, and the production entrypoint with scripted HTTP plus external setup mocked. This is
+preparation for future one-node qualification, not evidence that Keycloak selected a particular
+provider at runtime: no image build or live profile was run for this slice. The combined success
+checkpoint must still satisfy exact account, callback/replay, state, and PKCE assertions; the
+consume marker alone does not establish accepted receipt publication or code issuance.
+
 ## Receipt-publication failure
 
 The existing `WalletLoginTransportHandlerTest.acceptedReceiptWriteFailureLeavesCreatedAccountBeforePendingConsume` test uses an in-memory fake that rejects accepted-receipt publication after consume. It asserts no accepted receipt/callback gate or old-transaction recovery is exposed and that a fresh explicit signup reuses the retained account. This also does not qualify provider persistence or real callback/code behavior.
