@@ -207,7 +207,7 @@ class UserReadbackProfileTest(unittest.TestCase):
     client.request.return_value = (200, {}, '{}')
     image_original = probe.IMAGE
     cid_original = probe.RUN_CID_DIR
-    with tempfile.TemporaryDirectory(dir=probe.SCRATCH) as scratch:
+    with tempfile.TemporaryDirectory() as scratch:
       with ExitStack() as stack:
         stack.enter_context(patch.object(probe, 'SCRATCH', scratch))
         stack.enter_context(patch.object(probe, 'IMAGE', image_original))
