@@ -333,9 +333,13 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn("signup_result = signup_wallet_flow", harness)
     self.assertIn("checkpoint()", harness)
     signup_flow = harness.split('def signup_wallet_flow(', 1)[1].split('def missing_identity_flow(', 1)[0]
-    proof_position = signup_flow.index("proof_status, proof_headers, proof_body = wallet.request('POST'")
-    failure_position = signup_flow.index("require(proof_status == 503")
-    self.assertLess(proof_position, failure_position)
+    proof_position = signup_flow.index("proof_status, proof_headers, proof_body = signup_boundary(")
+    request_position = signup_flow.index("lambda: wallet.request('POST', signup_locator", proof_position)
+    progress_position = signup_flow.index("progress('proof', {'signup_proof_http': proof_status})", request_position)
+    failure_position = signup_flow.index("require(proof_status == 503", progress_position)
+    self.assertLess(proof_position, request_position)
+    self.assertLess(request_position, progress_position)
+    self.assertLess(progress_position, failure_position)
     self.assertIn("progress('proof', {'signup_proof_http': proof_status})", signup_flow)
     self.assertNotIn("print('signup_proof_http=", signup_flow)
 

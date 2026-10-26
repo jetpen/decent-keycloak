@@ -20,9 +20,14 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('scripted offline application-path evidence only', doc)
     self.assertIn('hand-authored request-correlated log fixture', doc)
     self.assertIn('does not observe current Registry verification', doc)
-    self.assertIn('hand-authored fixture', readme)
-    self.assertIn('do not establish actual provider fault/log/store behavior', readme)
-    self.assertIn('327 tests', readme)
+    self.assertIn('These diagnostics are offline application-path characterization only; fixtures do not establish actual provider behavior.', readme)
+    self.assertIn('actual Keycloak/UserProvider/JPA runtime behavior remains unqualified', readme)
+    self.assertIn('bounded last-confirmed signup progress', readme)
+    self.assertIn('status alone never selects a gate', readme)
+    self.assertIn('selection requires one allowlisted production marker correlated to the exact request ID', readme)
+    self.assertIn('338 Python tests', readme)
+    self.assertIn('browser status-poll `proof_status` failures use generic `failure_http_status`', readme)
+    self.assertIn('exact proof-POST `proof_http_status` gate', readme)
 
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
     text = README.read_text()

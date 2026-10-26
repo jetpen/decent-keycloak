@@ -113,6 +113,28 @@ class StoreRecoveryTest(unittest.TestCase):
         'signup_proof_http': 503}, checkpoints[0])
     self.assertNotIn('private exception details', json.dumps(checkpoints))
 
+  def test_status_poll_failure_checkpoint_uses_generic_http_status(self):
+    failure = RuntimeError('private status poll failure')
+    setattr(failure, 'failure_stage', 'signup_proof')
+    setattr(failure, 'failure_gate', 'proof_status')
+    setattr(failure, 'failure_category', 'assertion_failed')
+    setattr(failure, 'failure_http_status', 422)
+    checkpoints = []
+
+    def checkpoint(value):
+      checkpoints.append(probe.sanitize_live_checkpoint(
+          {'issue7_store_recovery': value})['issue7_store_recovery'])
+
+    probe.issue7_store_recovery.checkpoint_signup_failure(checkpoint, failure,
+        mode_field='store_fault_mode', mode='consume-loss')
+    self.assertEqual([{
+        'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+        'store_fault_mode': 'consume-loss', 'failure_stage': 'signup_proof',
+        'failure_gate': 'proof_status', 'failure_category': 'assertion_failed',
+        'failure_http_status': 422}], checkpoints)
+    self.assertNotIn('signup_proof_http', checkpoints[0])
+    self.assertNotIn('private status poll failure', json.dumps(checkpoints))
+
   def test_nonzero_log_read_is_distinct_from_observed_empty_window(self):
     container = 'a' * 64
     cursor = '2026-10-21T15:04:05.123456Z'
@@ -532,6 +554,30 @@ class MainCoordinatorTest(unittest.TestCase):
         'store_provider_selected': False, 'store_fault_count': 0,
         'correlated_store_failure_count': 0}, checkpoints[-1]['issue7_store_recovery'])
     self.assertNotIn('private', json.dumps(checkpoints))
+
+  def test_signup_success_profile_failure_callback_preserves_failure_stage_and_action_fact(self):
+    failure = RuntimeError('private binding detail')
+    failure.failure_stage = 'signup_intent'
+    failure.failure_gate = 'transaction_binding'
+    failure.failure_category = 'runtime_error'
+    result = {'signup_case': {'stage': 'intent', 'signup_intent_action_http': 200}}
+    failure_checkpoint = lambda evidence: result.update(signup_case=evidence)
+    success_checkpoint = lambda evidence: probe.checkpoint_signup_stage(
+        result, 'complete', evidence, lambda: None)
+    progress = lambda stage, fields: probe.checkpoint_signup_stage(
+        result, stage, fields, lambda: None)
+
+    def fail_after_intent(*args, **kwargs):
+      args[5]('intent', {'signup_intent_action_http': 200})
+      raise failure
+    with patch.object(probe, 'signup_wallet_flow', side_effect=fail_after_intent):
+      with self.assertRaisesRegex(RuntimeError, 'private binding detail'):
+        probe.run_issue7_signup_success_profile(None, None, None, None, None, None,
+            progress, success_checkpoint, failure_checkpoint)
+
+    self.assertEqual('intent', result['signup_case']['stage'])
+    self.assertEqual(200, result['signup_case']['signup_intent_action_http'])
+    self.assertEqual('transaction_binding', result['signup_case']['failure_gate'])
 
   def test_production_main_does_not_label_unclassified_status_as_signup_proof(self):
     failure = RuntimeError('private exception details')

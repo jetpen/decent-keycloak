@@ -1,4 +1,5 @@
 """Offline contract tests for the Issue #7 user-readback profile."""
+import ast
 import json
 import hashlib
 import os
@@ -35,6 +36,156 @@ class UserReadbackProfileTest(unittest.TestCase):
     self.assertIn(profile, probe.SUPPORTED_LIVE_PROFILES)
     with patch.dict(os.environ, {'WALLET_IT_PROFILE': profile}):
       self.assertEqual(profile, probe.selected_live_profile())
+
+  def test_success_coordinator_checkpoints_sanitized_failure_without_masking_it(self):
+    primary = RuntimeError('private unrelated status 503 provider=remote request=private-id')
+    setattr(primary, 'failure_stage', 'signup_intent')
+    setattr(primary, 'failure_gate', 'transaction_binding')
+    setattr(primary, 'failure_category', 'runtime_error')
+    setattr(primary, 'failure_http_status', 503)
+    checkpoints = []
+    def fail_after_intent(*args, **kwargs):
+      args[5]('intent', {'signup_intent_action_http': 200})
+      raise primary
+    with patch.object(probe, 'signup_wallet_flow', side_effect=fail_after_intent), patch.object(
+        probe, 'read_provider_success_log_window', side_effect=AssertionError('must not read')):
+      with self.assertRaises(RuntimeError) as caught:
+        probe.run_issue7_signup_success_profile(Mock(), Path('key'), 'private-identity',
+            'container', Mock(), 'image', lambda *_: None, checkpoints.append)
+    self.assertIs(primary, caught.exception)
+    self.assertEqual(1, len(checkpoints))
+    sanitized = probe.sanitize_live_checkpoint({'signup_case': checkpoints[0]})['signup_case']
+    self.assertEqual({'stage': 'intent', 'provider_operation_witness': 'unavailable',
+        'failure_stage': 'signup_intent',
+        'failure_gate': 'transaction_binding', 'failure_category': 'runtime_error',
+        'failure_http_status': 503, 'signup_intent_action_http': 200}, sanitized)
+    serialized = json.dumps(sanitized)
+    for forbidden in ('private unrelated', 'provider=remote', 'private-id', 'private-identity'):
+      self.assertNotIn(forbidden, serialized)
+
+  def test_status_poll_failure_uses_generic_field_and_preserves_proof_http(self):
+    primary = RuntimeError('synthetic status poll failure')
+    setattr(primary, 'failure_stage', 'signup_proof')
+    setattr(primary, 'failure_gate', 'proof_status')
+    setattr(primary, 'failure_category', 'assertion_failed')
+    setattr(primary, 'failure_http_status', 503)
+    checkpoints = []
+    def fail_after_status_poll(*args, **kwargs):
+      args[5]('proof', {'signup_proof_http': 202})
+      raise primary
+    with patch.object(probe, 'signup_wallet_flow', side_effect=fail_after_status_poll):
+      with self.assertRaises(RuntimeError) as caught:
+        probe.run_issue7_signup_success_profile(Mock(), Path('key'), 'fixture-identity',
+            'container', Mock(), 'image', lambda *_: None, checkpoints.append)
+    self.assertIs(primary, caught.exception)
+    self.assertEqual(1, len(checkpoints))
+    evidence = probe.sanitize_live_checkpoint({'signup_case': checkpoints[0]})['signup_case']
+    self.assertEqual({'stage': 'proof', 'provider_operation_witness': 'unavailable',
+        'failure_stage': 'signup_proof', 'failure_gate': 'proof_status',
+        'failure_category': 'assertion_failed', 'failure_http_status': 503,
+        'signup_proof_http': 202}, evidence)
+
+
+  def test_proof_post_failure_uses_proof_http_field_for_exact_gate(self):
+    primary = RuntimeError('synthetic proof POST failure')
+    setattr(primary, 'failure_stage', 'signup_proof')
+    setattr(primary, 'failure_gate', 'proof_http_status')
+    setattr(primary, 'failure_category', 'assertion_failed')
+    setattr(primary, 'failure_http_status', 503)
+    checkpoints = []
+    def fail_after_proof_post(*args, **kwargs):
+      args[5]('proof', {'signup_proof_http': 503})
+      raise primary
+    with patch.object(probe, 'signup_wallet_flow', side_effect=fail_after_proof_post):
+      with self.assertRaises(RuntimeError) as caught:
+        probe.run_issue7_signup_success_profile(Mock(), Path('key'), 'fixture-identity',
+            'container', Mock(), 'image', lambda *_: None, checkpoints.append)
+    self.assertIs(primary, caught.exception)
+    evidence = probe.sanitize_live_checkpoint({'signup_case': checkpoints[0]})['signup_case']
+    self.assertEqual({'stage': 'proof', 'provider_operation_witness': 'unavailable',
+        'failure_stage': 'signup_proof', 'failure_gate': 'proof_http_status',
+        'failure_category': 'assertion_failed', 'signup_proof_http': 503}, evidence)
+    self.assertNotIn('failure_http_status', evidence)
+
+  def test_unknown_failure_is_unclassified_and_checkpoint_error_does_not_mask(self):
+    primary = RuntimeError('private unknown failure')
+    setattr(primary, 'failure_stage', 'private-stage')
+    setattr(primary, 'failure_gate', 'private-gate')
+    setattr(primary, 'failure_category', 'private-category')
+    setattr(primary, 'failure_http_status', 700)
+    checkpoints = []
+    def failing_checkpoint(evidence):
+      checkpoints.append(evidence)
+      raise OSError('private checkpoint failure')
+    with patch.object(probe, 'signup_wallet_flow', side_effect=primary):
+      with self.assertRaises(RuntimeError) as caught:
+        probe.run_issue7_signup_success_profile(Mock(), Path('key'), 'identity',
+            'container', Mock(), 'image', lambda *_: None, failing_checkpoint)
+    self.assertIs(primary, caught.exception)
+    self.assertEqual(['Issue #7 signup failure checkpoint could not be written'],
+        caught.exception.__notes__)
+    self.assertEqual(1, len(checkpoints))
+    evidence = probe.sanitize_live_checkpoint({'signup_case': checkpoints[0]})['signup_case']
+    self.assertEqual({'stage': 'unclassified', 'provider_operation_witness': 'unavailable',
+        'failure_stage': 'unclassified', 'failure_gate': 'unclassified',
+        'failure_category': 'runtime_error'}, evidence)
+    for forbidden in ('private unknown failure', 'private-stage', 'private-gate', 'private-category'):
+      self.assertNotIn(forbidden, json.dumps(evidence))
+
+  def test_signup_intent_response_decode_failure_gets_known_boundary(self):
+    locator = ('https://idp.example:' + str(probe.KC_PORT)
+        + '/auth/realms/' + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'A' * 43)
+    callback_query = urllib.parse.urlencode({'session_code': 's', 'execution': 'e',
+        'client_id': 'c', 'tab_id': 't', 'client_data': 'd'})
+
+    class ScriptedClient:
+      def __init__(self):
+        self.redirects = []
+        self.requests = []
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        self.requests.append((method, path))
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          page = (f'<p id="wallet-locator">{locator}</p><form method="post" '
+              f'action="/auth/realms/{probe.REALM}/login-actions/authenticate?{callback_query}">'
+              '<input type="hidden" name="wallet_intent" value="signup"></form>')
+          return 200, {}, page.encode()
+        if method == 'POST' and 'login-actions/authenticate?' in path:
+          return 200, {}, b'\xff'
+        raise AssertionError((method, path))
+
+    client = ScriptedClient()
+    progress = []
+    with self.assertRaises(UnicodeDecodeError) as caught:
+      probe.signup_wallet_flow(client, Path('key'), 'fixture-identity', 'container',
+          Mock(), lambda stage, fields: progress.append((stage, fields)), 'image')
+    self.assertEqual('signup_intent', getattr(caught.exception, 'failure_stage', None))
+    self.assertEqual('signup_intent_response_decode', getattr(caught.exception, 'failure_gate', None))
+    self.assertEqual('runtime_error', getattr(caught.exception, 'failure_category', None))
+    self.assertEqual([('intent', {'signup_intent_action_http': 200})], progress)
+    self.assertEqual(['GET', 'POST'], [method for method, _ in client.requests])
+
+  def test_signup_failure_contexts_cover_known_require_and_boundary_calls(self):
+    tree = ast.parse(Path(probe.__file__).read_text(encoding='utf-8'))
+    flow = next(node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == 'signup_wallet_flow')
+    contexts = {**probe.issue7_store_recovery.FAILURE_CONTEXTS,
+        **probe.SIGNUP_FAILURE_CONTEXTS}
+    gates = probe.issue7_store_recovery.FAILURE_GATES
+    stages = probe.issue7_store_recovery.FAILURE_STAGES
+    for node in ast.walk(flow):
+      if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+          and node.func.id == 'require' and len(node.args) > 1
+          and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)):
+        self.assertIn(node.args[1].value, contexts)
+      if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+          and node.func.id == 'signup_boundary' and len(node.args) > 1
+          and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+          and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)):
+        self.assertIn(node.args[0].value, stages)
+        self.assertIn(node.args[1].value, gates)
+    for stage, gate in contexts.values():
+      self.assertIn(stage, stages)
+      self.assertIn(gate, gates)
 
   def test_success_coordinator_runs_one_unfaulted_signup_and_sanitizes_evidence(self):
     calls = []
@@ -223,6 +374,98 @@ class UserReadbackProfileTest(unittest.TestCase):
         if call.args and call.args[0] == 'issue7-signup-success-evidence=']
     self.assertEqual(1, len(output))
     self.assertEqual(final, json.loads(output[0])['signup_case'])
+
+  def test_production_main_checkpoints_real_signup_intent_failure_after_200(self):
+    locator = ('https://idp.example:' + str(probe.KC_PORT)
+        + '/auth/realms/' + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'A' * 43)
+    callback_query = urllib.parse.urlencode({'session_code': 's', 'execution': 'e',
+        'client_id': 'c', 'tab_id': 't', 'client_data': 'd'})
+
+    class IntentFailureClient:
+      def __init__(self):
+        self.redirects = []
+        self.privateClientAdminCredential = '[REDACTED]'
+        self.wallet_container_id = None
+        self.requests = []
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        self.requests.append((method, path))
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          page = (f'<p id="wallet-locator">{locator}</p><form method="post" '
+              f'action="/auth/realms/{probe.REALM}/login-actions/authenticate?{callback_query}">'
+              '<input type="hidden" name="wallet_intent" value="signup"></form>')
+          return 200, {}, page.encode()
+        if method == 'POST' and 'login-actions/authenticate?' in path:
+          return 200, {}, b'<p>unrelated [REDACTED] status 503 provider=remote request=opaque-fixture-id</p>'
+        raise AssertionError((method, path))
+
+    browser = IntentFailureClient()
+    admin = Mock(wallet_container_id='a' * 64, privateClientAdminCredential='[REDACTED]')
+    checkpoints = []
+    original_write = Path.write_text
+    def capture(path, data, *args, **kwargs):
+      if path.name == 'live-evidence.json':
+        checkpoints.append(json.loads(data))
+      return original_write(path, data, *args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      key_path = Path(scratch) / 'identity.pem'
+      for name, value in {'SCRATCH': scratch, 'IMAGE': 'original-image',
+          'RUN_CID_DIR': None}.items():
+        stack.enter_context(patch.object(probe, name, value))
+      stack.enter_context(patch.dict(os.environ,
+          {'WALLET_IT_PROFILE': 'issue7-signup-success'}, clear=False))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('ordinary-image', 'sha256:' + 'a' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
+      stack.enter_context(patch.object(probe, 'start_registry', return_value=('registry', 'bootstrap', 1234)))
+      stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
+      stack.enter_context(patch.object(probe, 'write_identity',
+          return_value=(key_path, Path(scratch) / 'wrapper', 'fixture-identity')))
+      stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='[REDACTED]'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
+          'runtime_qualification_status': 'runtime_facts_verified',
+          'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
+      stack.enter_context(patch.object(probe, 'configure_realm'))
+      stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
+      stack.enter_context(patch.object(probe, 'admin_call', return_value=(200, {}, b'[]')))
+      stack.enter_context(patch.object(probe, 'Client', return_value=browser))
+      stack.enter_context(patch.object(probe.subprocess, 'run',
+          return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
+      stack.enter_context(patch.object(probe, 'record_resolver_diagnostics', return_value=[]))
+      provider_log = stack.enter_context(patch.object(probe,
+          'read_provider_success_log_window', side_effect=AssertionError('no request-correlated operation')))
+      stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
+      stack.enter_context(patch.object(probe, 'cleanup_after_failure'))
+      stack.enter_context(patch.object(Path, 'write_text', autospec=True, side_effect=capture))
+      real_signup_flow = probe.signup_wallet_flow
+      signup_flow = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
+          wraps=real_signup_flow))
+      dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
+          wraps=probe.dispatch_live_profile))
+      printed = stack.enter_context(patch('builtins.print'))
+      with self.assertRaises(RuntimeError):
+        probe.main()
+
+    self.assertEqual(1, signup_flow.call_count)
+    self.assertEqual(1, dispatcher.call_count)
+    self.assertEqual('issue7-signup-success', dispatcher.call_args.args[0])
+    self.assertEqual(['GET', 'POST'], [method for method, _ in browser.requests])
+    self.assertEqual(2, len(browser.requests))
+    provider_log.assert_not_called()
+    final = checkpoints[-1]['signup_case']
+    self.assertEqual({'stage': 'intent', 'signup_intent_action_http': 200,
+        'failure_stage': 'signup_intent', 'failure_gate': 'transaction_binding',
+        'failure_category': 'assertion_failed',
+        'provider_operation_witness': 'unavailable'}, final)
+    for forbidden in ('failure_http_status', 'signup_proof_http', 'callback', 'callback_http',
+        'authorization_code', 'single_use_object_provider_id', 'provider_id', 'code'):
+      self.assertNotIn(forbidden, final)
+    serialized = json.dumps(checkpoints) + repr(printed.call_args_list)
+    for forbidden in ('[REDACTED]', 'unrelated', 'status 503', 'provider=remote',
+        'opaque-fixture-id', 'fixture-identity', 'session_code=', 'client_data='):
+      self.assertNotIn(forbidden, serialized)
 
   def test_production_main_runs_real_readback_failure_and_fresh_signup_for_each_mode(self):
     profiles = {
@@ -440,6 +683,17 @@ class UserReadbackProfileTest(unittest.TestCase):
         self.assertEqual(1, len(printed_payloads))
         self.assertEqual(evidence, json.loads(printed_payloads[0])[
             'issue7_single_node_signup_recovery'])
+
+  def test_ordinary_failure_projection_preserves_status_poll_and_prior_proof_http(self):
+    projected = probe.sanitize_live_checkpoint({'signup_case': {
+        'stage': 'proof', 'signup_intent_action_http': 200,
+        'failure_stage': 'signup_proof', 'failure_gate': 'proof_status',
+        'failure_category': 'assertion_failed', 'failure_http_status': 422,
+        'signup_proof_http': 202}})['signup_case']
+    self.assertEqual({'stage': 'proof', 'signup_intent_action_http': 200,
+        'failure_stage': 'signup_proof', 'failure_gate': 'proof_status',
+        'failure_category': 'assertion_failed', 'failure_http_status': 422,
+        'signup_proof_http': 202}, projected)
 
   def test_selected_provider_checkpoint_is_complete_only_and_allowlisted(self):
     complete = probe.sanitize_live_checkpoint({'signup_case': {

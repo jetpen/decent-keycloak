@@ -679,6 +679,52 @@ def checkpoint_signup_stage(result, stage, fields, checkpoint):
   checkpoint()
 
 
+def checkpoint_signup_failure(result, failure, checkpoint):
+  """Merge bounded failure facts into the last confirmed ordinary-signup checkpoint."""
+  current = dict(result.get('signup_case', {}))
+  stage = current.get('stage')
+  if stage not in {'intent', 'proof', 'account', 'callback', 'token'}:
+    stage = 'unclassified'
+  failure_stage = getattr(failure, 'failure_stage', None)
+  failure_gate = getattr(failure, 'failure_gate', None)
+  failure_category = getattr(failure, 'failure_category', None)
+  evidence = {**current, 'stage': stage,
+      'provider_operation_witness': 'unavailable',
+      'failure_stage': failure_stage if failure_stage in issue7_store_recovery.FAILURE_STAGES
+          else 'unclassified',
+      'failure_gate': failure_gate if failure_gate in issue7_store_recovery.FAILURE_GATES
+          else 'unclassified',
+      'failure_category': failure_category if failure_category in issue7_store_recovery.FAILURE_CATEGORIES
+          else 'runtime_error'}
+  status = getattr(failure, 'failure_http_status', None)
+  if type(status) is int and 100 <= status <= 599:
+    status_field = ('signup_proof_http' if evidence['failure_gate'] in
+        issue7_store_recovery.SIGNUP_PROOF_HTTP_GATES else 'failure_http_status')
+    evidence[status_field] = status
+  try:
+    checkpoint(evidence)
+  except Exception:
+    try:
+      failure.add_note('Issue #7 signup failure checkpoint could not be written')
+    except Exception:
+      pass
+
+
+def signup_boundary(stage, gate, operation):
+  """Attach exact allowlisted context when a known signup operation raises."""
+  try:
+    return operation()
+  except Exception as failure:
+    for field, value in (('failure_stage', stage), ('failure_gate', gate),
+        ('failure_category', 'runtime_error')):
+      if getattr(failure, field, None) is None:
+        try:
+          setattr(failure, field, value)
+        except Exception:
+          pass
+    raise
+
+
 def merge_issue7_checkpoint(result, evidence_key, evidence, checkpoint):
   current = dict(result.get(evidence_key, {}))
   current.update(evidence)
@@ -839,7 +885,7 @@ def sanitize_live_checkpoint(candidate):
       'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
       'issue7_single_node_signup_recovery', 'issue7_store_recovery',
   }
-  signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete'}
+  signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete', 'unclassified'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
       'stale_proof_pending', 'current_proof', 'current_attempt', 'current_accepted', 'callback', 'complete', 'mapping'}
   expiry_stages = {'started', 'transaction_created', 'expired_proof_submitted',
@@ -1404,6 +1450,21 @@ def sanitize_live_checkpoint(candidate):
       if stage not in signup_stages:
         continue
       safe = {'stage': stage}
+      failure_stages = issue7_store_recovery.FAILURE_STAGES
+      failure_gates = issue7_store_recovery.FAILURE_GATES
+      failure_categories = issue7_store_recovery.FAILURE_CATEGORIES
+      if value.get('failure_stage') in failure_stages:
+        safe['failure_stage'] = value['failure_stage']
+      if value.get('failure_gate') in failure_gates:
+        safe['failure_gate'] = value['failure_gate']
+      if value.get('failure_category') in failure_categories:
+        safe['failure_category'] = value['failure_category']
+      if value.get('provider_operation_witness') == 'unavailable':
+        safe['provider_operation_witness'] = 'unavailable'
+      if (type(value.get('failure_http_status')) is int
+          and 100 <= value['failure_http_status'] <= 599
+          and value.get('failure_gate') not in issue7_store_recovery.SIGNUP_PROOF_HTTP_GATES):
+        safe['failure_http_status'] = value['failure_http_status']
       if value.get('evidence_provenance') == 'harness-application-path-only':
         safe['evidence_provenance'] = 'harness-application-path-only'
       if (stage == 'complete'
@@ -2128,6 +2189,45 @@ class BareLocalClient(Client):
       return error.code, error.headers, error.read()
 
 
+SIGNUP_FAILURE_CONTEXTS = {
+    'signup login page': ('signup_intent', 'signup_authorization_request'),
+    'login wallet page locator before signup choice': ('signup_intent', 'transaction_binding'),
+    'wallet signup choice posts explicit intent to Keycloak execution':
+        ('signup_intent', 'transaction_binding'),
+    'Keycloak action records signup intent and restarts wallet flow':
+        ('signup_intent', 'signup_intent_action_request'),
+    'fresh wallet transaction is bound to signup intent':
+        ('signup_intent', 'transaction_binding'),
+    'signup transaction browser binding': ('signup_intent', 'transaction_binding'),
+    'signup native challenge GET': ('signup_proof', 'signup_challenge'),
+    'signup Ed25519 proof signed': ('signup_proof', 'proof_prepare'),
+    'signup proof provisions exact account before pending consume':
+        ('signup_proof', 'proof_http_status'),
+    'no exact Keycloak account exists before signup proof':
+        ('account_readback', 'account_readback'),
+    'signup has exactly one enabled exact account and a retry reuses the same subject':
+        ('account_readback', 'account_readback'),
+    'signup initiating browser observes bound acceptance':
+        ('signup_proof', 'proof_status'),
+    'signup browser acceptance is bound to the initiating session':
+        ('signup_proof', 'proof_status'),
+    'callback, OIDC state, and no-code replay': ('callback', 'callback'),
+    'signup acceptance includes callback URL': ('callback', 'callback'),
+    'signup callback preserves OIDC state': ('callback', 'callback'),
+    'signup callback replay returns no second authorization code':
+        ('callback', 'callback_replay'),
+    'signup authorization code exchanges with PKCE': ('token', 'token_exchange'),
+    'signup returns created opaque Keycloak subject': ('token', 'pkce'),
+    'signup ID token contains exact signed wallet Identity claim': ('token', 'pkce'),
+    'fresh explicit signup starts with one exact retained enabled account':
+        ('account_readback', 'account_readback'),
+    'failed signup browser status remains pending and exposes no callback or code':
+        ('signup_proof', 'proof_status'),
+    'faulted signup has selected mode, one provider read fault, and request-correlated mapping failure':
+        ('signup_proof', 'store_correlation'),
+}
+
+
 def require(condition, stage, code=None, *, failure_gate=None, failure_stage=None, http_status=None):
   if not condition:
     valid_http_status = type(http_status) is int and 100 <= http_status <= 599
@@ -2136,8 +2236,8 @@ def require(condition, stage, code=None, *, failure_gate=None, failure_stage=Non
     message = f'acceptance probe failed at {stage}' + detail
     active = _ACTIVE_AUTH_FLOW_ATTEMPT
     failure = active.failure(message, gate=failure_gate) if active is not None else RuntimeError(message)
-    contextual_stage, contextual_gate = issue7_store_recovery.FAILURE_CONTEXTS.get(
-        stage, ('signup_flow', 'unclassified'))
+    contextual_stage, contextual_gate = SIGNUP_FAILURE_CONTEXTS.get(stage,
+        issue7_store_recovery.FAILURE_CONTEXTS.get(stage, ('signup_flow', 'unclassified')))
     explicit_gate = failure_gate if failure_gate in issue7_store_recovery.FAILURE_GATES else None
     setattr(failure, 'failure_stage', failure_stage or contextual_stage)
     setattr(failure, 'failure_gate', explicit_gate or contextual_gate)
@@ -4600,10 +4700,14 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'scope': 'openid', 'state': state, 'nonce': nonce,
       'code_challenge': code_challenge, 'code_challenge_method': 'S256',
   })
-  status, _, page = client.request('GET', f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}')
-  require(status == 200, 'signup login page', status, http_status=status)
-  text = page.decode('utf-8', errors='strict')
-  parser = LoginPageParser(); parser.feed(text)
+  status, _, page = signup_boundary('signup_intent', 'signup_authorization_request',
+      lambda: client.request('GET', f'/auth/realms/{REALM}/protocol/openid-connect/auth?{query}'))
+  require(status == 200, 'signup login page', status, http_status=status,
+      failure_stage='signup_intent', failure_gate='signup_authorization_request')
+  text = signup_boundary('signup_intent', 'signup_login_page_decode',
+      lambda: page.decode('utf-8', errors='strict'))
+  parser = LoginPageParser()
+  signup_boundary('signup_intent', 'signup_login_page_parse', lambda: parser.feed(text))
   locator = ''.join(parser.locator_parts).strip()
   require(locator.startswith(f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/decent-wallet-login/v1/transactions/'),
       'login wallet page locator before signup choice')
@@ -4624,45 +4728,65 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'action_path': urllib.parse.urlsplit(action_path).path,
       'query_names': sorted(urllib.parse.parse_qs(parsed_action.query).keys()),
       'has_session_cookie': bool(auth_cookie), 'cookie_count': len(auth_cookie.split(';')) if auth_cookie else 0}))
-  action_status, action_response_headers, signup_page = client.request('POST', action_path, action_data,
-      {'Content-Type': 'application/x-www-form-urlencoded'})
-  if action_status != 200:
-    logs = run(['podman', 'logs', '--tail', '100', container], timeout=15)
-    print('signup-action-diagnostics:', json.dumps(
-        sanitize_signup_action_diagnostics(signup_page, logs.stdout), sort_keys=True))
+  action_status, action_response_headers, signup_page = signup_boundary(
+      'signup_intent', 'signup_intent_action_request',
+      lambda: client.request('POST', action_path, action_data,
+          {'Content-Type': 'application/x-www-form-urlencoded'}))
   progress('intent', {'signup_intent_action_http': action_status})
+  if action_status != 200:
+    try:
+      log_text = run(['podman', 'logs', '--tail', '100', container], timeout=15).stdout
+    except Exception:
+      log_text = ''
+    print('signup-action-diagnostics:', json.dumps(
+        sanitize_signup_action_diagnostics(signup_page, log_text), sort_keys=True))
   require(action_status == 200, 'Keycloak action records signup intent and restarts wallet flow',
-      action_status, http_status=action_status)
-  signup_text = signup_page.decode('utf-8', errors='strict')
+      action_status, http_status=action_status,
+      failure_stage='signup_intent', failure_gate='signup_intent_action_request')
+  signup_text = signup_boundary('signup_intent', 'signup_intent_response_decode',
+      lambda: signup_page.decode('utf-8', errors='strict'))
   require('Creating a new account with this wallet identity.' in signup_text,
-      'fresh wallet transaction is bound to signup intent')
-  parser = LoginPageParser(); parser.feed(signup_text)
+      'fresh wallet transaction is bound to signup intent',
+      failure_stage='signup_intent', failure_gate='transaction_binding')
+  parser = LoginPageParser()
+  signup_boundary('signup_intent', 'signup_intent_response_parse', lambda: parser.feed(signup_text))
   signup_locator = ''.join(parser.locator_parts).strip()
-  provider_request_id = account_policy_request_id(signup_locator)
+  provider_request_id = signup_boundary('signup_intent', 'transaction_binding',
+      lambda: account_policy_request_id(signup_locator))
   status_url = re.search(r'const statusUrl = "([^"]+)";', signup_text)
   csrf = re.search(r'const csrfToken = "([A-Za-z0-9_-]{43})";', signup_text)
   require(status_url is not None and csrf is not None, 'signup transaction browser binding')
   if status_url is None or csrf is None:
     raise RuntimeError('acceptance probe failed at signup transaction binding')
   wallet = Client()
-  challenge_status, _, challenge_raw = wallet.request('GET', signup_locator)
-  require(challenge_status == 200, 'signup native challenge GET', http_status=challenge_status)
-  envelope = json.loads(challenge_raw)
-  signing_input = json.dumps({'challenge': envelope['challenge'], 'identity_id': identifier,
-      'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode()
+  challenge_status, _, challenge_raw = signup_boundary('signup_proof',
+      'signup_challenge_request', lambda: wallet.request('GET', signup_locator))
+  require(challenge_status == 200, 'signup native challenge GET', http_status=challenge_status,
+      failure_stage='signup_proof', failure_gate='signup_challenge')
+  envelope = signup_boundary('signup_proof', 'signup_challenge_decode',
+      lambda: json.loads(challenge_raw))
+  signing_input = signup_boundary('signup_proof', 'proof_prepare', lambda: json.dumps({
+      'challenge': envelope['challenge'], 'identity_id': identifier,
+      'profile': envelope['profile']}, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode())
   with tempfile.TemporaryDirectory(prefix='wallet-signing-', dir=key.parent) as signing_dir:
     payload = write_private_signing_input(signing_dir, 'signup', signing_input)
     try:
-      signature = subprocess.run(['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key), '-in', str(payload)],
-          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+      signature = signup_boundary('signup_proof', 'proof_prepare', lambda: subprocess.run(
+          ['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(key), '-in', str(payload)],
+          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False))
     finally:
       payload.unlink(missing_ok=True)
-  require(signature.returncode == 0 and len(signature.stdout) == 64, 'signup Ed25519 proof signed')
+  require(signature.returncode == 0 and len(signature.stdout) == 64, 'signup Ed25519 proof signed',
+      failure_stage='signup_proof', failure_gate='proof_prepare')
   proof = json.dumps({'profile': envelope['profile'], 'challenge': envelope['challenge'],
       'identity_id': identifier, 'signature': b64url(signature.stdout)}, separators=(',', ':')).encode()
-  admin = admin_token(admin_client, AdminPassword(admin_client.privateClientAdminCredential))
-  exact_users_before_proof = json.loads(admin_call(admin_client, admin, 'GET',
+  admin = signup_boundary('account_readback', 'account_readback', lambda: admin_token(
+      admin_client, AdminPassword(admin_client.privateClientAdminCredential)))
+  exact_users_raw = signup_boundary('account_readback', 'account_readback', lambda: admin_call(
+      admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
+  exact_users_before_proof = signup_boundary('account_readback', 'account_readback',
+      lambda: json.loads(exact_users_raw))
   existing_exact_users = [user for user in exact_users_before_proof
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
   if reuse_existing:
@@ -4692,8 +4816,9 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     log_cursor = utc_log_cursor()
   redirects_before_proof = len(wallet.redirects)
   try:
-    proof_status, proof_headers, proof_body = wallet.request('POST', signup_locator, proof,
-        {'Content-Type': 'application/json'})
+    proof_status, proof_headers, proof_body = signup_boundary('signup_proof', 'proof_post',
+        lambda: wallet.request('POST', signup_locator, proof,
+            {'Content-Type': 'application/json'}))
   except Exception as failure:
     if store_fault_mode is not None:
       setattr(failure, 'failure_stage', 'signup_proof')
@@ -4743,7 +4868,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     status_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
     status_redirects_before = len(client.redirects)
-    polled, _, status_body = client.request('GET', status_url.group(1), headers=status_headers)
+    polled, _, status_body = signup_boundary('signup_proof', 'proof_status',
+        lambda: client.request('GET', status_url.group(1), headers=status_headers))
     status_redirects_safe = len(client.redirects) == status_redirects_before
     pending = browser_status_is_pending(polled, status_body) and status_redirects_safe
     progress('proof', {'signup_proof_http': proof_status, 'browser_status_http': polled,
@@ -4770,9 +4896,12 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
         'correlated_mapping_failure_count': diagnostics['correlated_mapping_failure_count'],
         'expected_existing_subject': matched[0]['id']}
   require(proof_status == 202, 'signup proof provisions exact account before pending consume',
-      proof_status, http_status=proof_status)
-  exact_users = json.loads(admin_call(admin_client, admin, 'GET',
+      proof_status, http_status=proof_status,
+      failure_stage='signup_proof', failure_gate='proof_http_status')
+  exact_users_raw = signup_boundary('account_readback', 'account_readback', lambda: admin_call(
+      admin_client, admin, 'GET',
       f'/auth/admin/realms/{REALM}/users?q=decent_identity_id:{urllib.parse.quote(identifier)}&max=10')[2])
+  exact_users = signup_boundary('account_readback', 'account_readback', lambda: json.loads(exact_users_raw))
   matched = [user for user in exact_users
       if user.get('attributes', {}).get('decent_identity_id') == [identifier]]
   progress('account', {'exact_mapped_users': len(matched)})
@@ -4781,29 +4910,35 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'signup has exactly one enabled exact account and a retry reuses the same subject')
   browser_headers = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty', 'X-Decent-CSRF': csrf.group(1)}
-  polled, _, polled_raw = client.request('GET', status_url.group(1), headers=browser_headers)
+  polled, _, polled_raw = signup_boundary('signup_proof', 'proof_status',
+      lambda: client.request('GET', status_url.group(1), headers=browser_headers))
   require(polled == 200, 'signup initiating browser observes bound acceptance',
-      polled, http_status=polled)
-  status_body = json.loads(polled_raw)
+      polled, http_status=polled, failure_stage='signup_proof', failure_gate='proof_status')
+  status_body = signup_boundary('signup_proof', 'proof_status', lambda: json.loads(polled_raw))
   require(status_body.get('status') == 'accepted',
-      'signup browser acceptance is bound to the initiating session')
-  status_callback = signup_callback_from_status(status_body,
-      f'https://idp.example:{KC_PORT}/auth', REALM)
-  if status_callback is None:
-    raise RuntimeError('signup acceptance lacks callback URL')
-  callback_method, callback_path, callback_data = signup_callback_submission(
-      status_body, f'https://idp.example:{KC_PORT}/auth', REALM)
-  callback_status, headers, callback_body = client.request(callback_method, callback_path,
-      callback_data, {'Content-Type': 'application/x-www-form-urlencoded'})
+      'signup browser acceptance is bound to the initiating session',
+      failure_stage='signup_proof', failure_gate='proof_status')
+  status_callback = signup_boundary('callback', 'callback', lambda: signup_callback_from_status(
+      status_body, f'https://idp.example:{KC_PORT}/auth', REALM))
+  require(status_callback is not None, 'signup acceptance includes callback URL',
+      failure_stage='callback', failure_gate='callback')
+  callback_method, callback_path, callback_data = signup_boundary('callback', 'callback',
+      lambda: signup_callback_submission(status_body, f'https://idp.example:{KC_PORT}/auth', REALM))
+  callback_status, headers, callback_body = signup_boundary('callback', 'callback', lambda:
+      client.request(callback_method, callback_path, callback_data,
+          {'Content-Type': 'application/x-www-form-urlencoded'}))
   if callback_status == 200:
-    callback_html = callback_body.decode('utf-8', errors='replace')
+    callback_html = signup_boundary('callback', 'callback',
+        lambda: callback_body.decode('utf-8', errors='replace'))
     profile_values = {'email': signup_contact_email(identifier),
         'firstName': 'Wallet', 'lastName': 'Account'}
-    profile_path, profile_data = signup_form_action(callback_html,
-        f'https://idp.example:{KC_PORT}/auth', REALM, True, profile_values)
-    callback_status, headers, callback_body = client.request('POST', profile_path, profile_data,
-        {'Content-Type': 'application/x-www-form-urlencoded'})
-  callback_html = callback_body.decode('utf-8', errors='replace')
+    profile_path, profile_data = signup_boundary('callback', 'callback', lambda: signup_form_action(
+        callback_html, f'https://idp.example:{KC_PORT}/auth', REALM, True, profile_values))
+    callback_status, headers, callback_body = signup_boundary('callback', 'callback', lambda:
+        client.request('POST', profile_path, profile_data,
+            {'Content-Type': 'application/x-www-form-urlencoded'}))
+  callback_html = signup_boundary('callback', 'callback',
+      lambda: callback_body.decode('utf-8', errors='replace'))
   debug_logs = None
   if callback_status == 400:
     debug_logs = run(['podman', 'logs', '--tail', '100', container], timeout=15)
@@ -4826,28 +4961,37 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
             'status', 'content_type', 'location_path', 'forms', 'field_errors')}, sort_keys=True))
   progress('callback', {'callback_http': callback_status})
   require(callback_status in (302, 303) and code,
-      'callback, OIDC state, and no-code replay', callback_status, http_status=callback_status)
+      'callback, OIDC state, and no-code replay', callback_status, http_status=callback_status,
+      failure_stage='callback', failure_gate='callback')
   location_query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
-  require(location_query.get('state') == [state], 'signup callback preserves OIDC state')
-  replay_status, replay_headers, _ = client.request('GET', status_callback)
+  require(location_query.get('state') == [state], 'signup callback preserves OIDC state',
+      failure_stage='callback', failure_gate='callback')
+  replay_status, replay_headers, _ = signup_boundary('callback', 'callback_replay',
+      lambda: client.request('GET', status_callback))
   replay_location = urllib.parse.urlsplit(replay_headers.get('Location', ''))
   replay_query = urllib.parse.parse_qs(replay_location.query)
   require(replay_status == 302 and replay_location.path == urllib.parse.urlsplit(REDIRECT).path
       and replay_query.get('state') == [state] and replay_query.get('error')
       and 'code' not in replay_query,
-      'signup callback replay returns no second authorization code')
+      'signup callback replay returns no second authorization code',
+      failure_stage='callback', failure_gate='callback_replay')
   progress('callback', {'callback_replay': True, 'oidc_state_preserved': location_query.get('state') == [state]})
-  token_status, _, token_raw = client.request('POST', f'/auth/realms/{REALM}/protocol/openid-connect/token',
+  token_status, _, token_raw = signup_boundary('token', 'token_exchange', lambda: client.request(
+      'POST', f'/auth/realms/{REALM}/protocol/openid-connect/token',
       urllib.parse.urlencode({'grant_type':'authorization_code','client_id':CLIENT,'code':code,
           'redirect_uri':REDIRECT,'code_verifier':verifier}).encode(),
-      {'Content-Type':'application/x-www-form-urlencoded'})
+      {'Content-Type':'application/x-www-form-urlencoded'}))
   progress('token', {'pkce_token_http': token_status})
   require(token_status == 200, 'signup authorization code exchanges with PKCE', token_status,
-      http_status=token_status)
-  claims = verify_id_token(client, json.loads(token_raw)['id_token'], key.parent)
-  require(claims.get('sub') == matched[0].get('id'), 'signup returns created opaque Keycloak subject')
+      http_status=token_status, failure_stage='token', failure_gate='token_exchange')
+  token_payload = signup_boundary('token', 'pkce', lambda: json.loads(token_raw))
+  claims = signup_boundary('token', 'pkce',
+      lambda: verify_id_token(client, token_payload['id_token'], key.parent))
+  require(claims.get('sub') == matched[0].get('id'), 'signup returns created opaque Keycloak subject',
+      failure_stage='token', failure_gate='pkce')
   require(claims.get('decent_identity_id') == identifier,
-      'signup ID token contains exact signed wallet Identity claim')
+      'signup ID token contains exact signed wallet Identity claim',
+      failure_stage='token', failure_gate='pkce')
   result = {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
       'provider_request_id': provider_request_id,
       'exact_mapped_users': len(matched), 'pkce_token_http': token_status,
@@ -4860,11 +5004,22 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
 
 
 def run_issue7_signup_success_profile(client, key, identifier, container,
-    admin_client, image, progress, checkpoint):
+    admin_client, image, progress, checkpoint, failure_checkpoint=None):
   """Run exactly one ordinary explicit-signup success ceremony and checkpoint its safe facts."""
   log_cursor = utc_log_cursor()
-  evidence = signup_wallet_flow(client, key, identifier, container, admin_client,
-      progress, image)
+  last_confirmed = {}
+  def record_progress(stage, fields):
+    last_confirmed.update({'stage': stage, **fields})
+    progress(stage, fields)
+  try:
+    evidence = signup_wallet_flow(client, key, identifier, container, admin_client,
+        record_progress, image)
+  except Exception as failure:
+    if failure_checkpoint is None:
+      checkpoint_signup_failure({'signup_case': last_confirmed}, failure, checkpoint)
+    else:
+      checkpoint_signup_failure({'signup_case': last_confirmed}, failure, failure_checkpoint)
+    raise
   request_id = evidence.get('provider_request_id')
   logs = read_provider_success_log_window(container, log_cursor)
   provider_id = sanitize_success_provider_witness(logs, request_id)
@@ -6408,11 +6563,15 @@ def main():
         if profile == 'issue7-signup-success':
           def signup_success_progress(stage, fields):
             checkpoint_signup_stage(result, stage, fields, checkpoint)
+          def signup_success_failure(evidence):
+            result['signup_case'] = evidence
+            checkpoint()
           handlers = {profile: lambda: run_issue7_signup_success_profile(
               Client(), key, identifier, container, client, IMAGE,
               signup_success_progress,
               lambda evidence: checkpoint_signup_stage(
-                  result, 'complete', evidence, checkpoint))}
+                  result, 'complete', evidence, checkpoint),
+              signup_success_failure)}
           evidence = dispatch_live_profile(profile, handlers)
           result['signup_case'] = evidence
           checkpoint()

@@ -81,10 +81,10 @@ class SignupIntentProbeTest(unittest.TestCase):
   def test_admin_credential_holder_is_used_for_signup_readback_and_callback_diagnostics(self):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     flow = source[source.index("def signup_wallet_flow("):source.index("def missing_identity_flow")]
-    self.assertIn("admin_token(admin_client, AdminPassword(admin_client.privateClientAdminCredential))", flow)
+    self.assertRegex(flow, r"admin = signup_boundary\(\s*'account_readback', 'account_readback', lambda: admin_token\(\s*admin_client, AdminPassword\(admin_client\.privateClientAdminCredential\)\)\)")
     self.assertIn("recent_login_error_categories(admin_client, safe_token)", flow)
     self.assertNotIn("AdminPassword(client.privateClientAdminCredential)", flow)
-    self.assertIn("admin_call(admin_client, admin, 'GET'", flow)
+    self.assertRegex(flow, r"exact_users_raw = signup_boundary\(\s*'account_readback', 'account_readback', lambda: admin_call\(\s*admin_client, admin, 'GET'")
     self.assertIn("admin_client, admin, 'GET'", flow)
     self.assertIn("signup_result = signup_wallet_flow(signup_browser, signup_key, signup_identifier,", source)
 
@@ -164,7 +164,8 @@ class SignupIntentProbeTest(unittest.TestCase):
     end = source.index("\ndef missing_identity_flow", start)
     body = source[start:end]
     self.assertIn("polled == 200", body)
-    self.assertIn("signup_callback_from_status(status_body,", body)
+    self.assertIn("lambda: signup_callback_from_status(", body)
+    self.assertIn("status_body,", body)
     self.assertIn("callback_body.decode('utf-8', errors='replace')", body)
     self.assertIn("callback, OIDC state, and no-code replay", body)
     self.assertNotIn("callback_url = f'https://idp.example:{KC_PORT}/auth/realms/{REALM}/login-actions/authenticate'", body)
@@ -528,7 +529,7 @@ class SignupIntentProbeTest(unittest.TestCase):
         "len(matched) == 1 and matched[0].get('enabled')",
         "polled == 200",
         "status_body.get('status') == 'accepted'",
-        "signup_callback_from_status(status_body,",
+        "lambda: signup_callback_from_status(",
         "callback_body.decode('utf-8', errors='replace')",
         "token_status == 200",
         "claims.get('sub') == matched[0].get('id')",
@@ -550,8 +551,8 @@ class SignupIntentProbeTest(unittest.TestCase):
     end = source.index("\ndef missing_identity_flow", start)
     body = source[start:end]
     self.assertIn("action_match = re.search(r'<form method=", body)
-    self.assertIn("callback_method, callback_path, callback_data = signup_callback_submission", body)
-    self.assertIn("profile_path, profile_data = signup_form_action", body)
+    self.assertIn("lambda: signup_callback_submission(status_body,", body)
+    self.assertIn("lambda: signup_form_action(", body)
     self.assertIn("signup_contact_email(identifier)", body)
     self.assertIn("callback_status not in (302, 303) or not code", body)
 
