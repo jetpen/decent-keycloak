@@ -17,11 +17,17 @@ MARKERS = {
     'accepted-receipt-write': 'accepted receipt write committed then threw',
     'accepted-receipt-write-false': 'accepted receipt write returned false before commit',
 }
-FAILURE_STAGES = {'signup_flow', 'signup_proof', 'user_readback'}
+FAILURE_STAGES = {'signup_flow', 'signup_intent', 'signup_proof', 'account_readback',
+    'user_readback', 'callback', 'token', 'unclassified'}
 FAILURE_GATES = {'unclassified', 'proof_http_status', 'account_readback', 'proof_post',
     'identical_retry', 'changed_retry', 'proof_status', 'callback', 'callback_replay',
-    'status_after_callback', 'pkce', 'store_correlation'}
+    'status_after_callback', 'pkce', 'store_correlation', 'transaction_binding',
+    'signup_challenge', 'signup_intent', 'signup_authorization_request',
+    'signup_login_page_decode', 'signup_login_page_parse', 'signup_intent_action_request',
+    'signup_intent_response_decode', 'signup_intent_response_parse',
+    'signup_challenge_request', 'signup_challenge_decode', 'proof_prepare', 'token_exchange'}
 FAILURE_CATEGORIES = {'runtime_error', 'assertion_failed'}
+SIGNUP_PROOF_HTTP_GATES = {'proof_http_status'}
 FAILURE_CONTEXTS = {
     'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code':
         ('signup_proof', 'proof_http_status'),
@@ -39,7 +45,7 @@ def checkpoint_signup_failure(checkpoint, failure, *, mode_field, mode):
   }
   status = getattr(failure, 'failure_http_status', None)
   if type(status) is int and 100 <= status <= 599:
-    status_field = ('signup_proof_http' if evidence['failure_gate'] == 'proof_http_status'
+    status_field = ('signup_proof_http' if evidence['failure_gate'] in SIGNUP_PROOF_HTTP_GATES
         else 'failure_http_status')
     evidence[status_field] = status
   diagnostics = getattr(failure, 'issue7_diagnostics', None)
