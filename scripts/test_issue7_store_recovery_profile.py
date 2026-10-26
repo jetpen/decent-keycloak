@@ -144,6 +144,22 @@ class StoreRecoveryTest(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, 'provider fault log window unavailable'):
         probe.read_provider_fault_log_window(container, cursor, strict=True)
 
+  def test_unreadable_failure_log_window_projects_explicit_unavailable_witness(self):
+    api = Mock()
+    api.read_provider_fault_log_window.side_effect = OSError('private log read failure')
+    locator = ('https://idp.example/auth/realms/test/decent-wallet-login/v1/transactions/'
+        + 'A' * 43)
+    snapshot = probe.issue7_store_recovery.failure_diagnostic_snapshot(api,
+        container='a' * 64, log_cursor='2026-10-21T15:04:05.123456Z',
+        mode='consume-loss', locator=locator)
+    self.assertEqual('unavailable', snapshot['store_diagnostic_read_status'])
+    self.assertEqual({'fixture_factory_witness': 'unavailable',
+        'fixture_operation_witness': 'unavailable',
+        'fixture_mutation_outcome': 'unavailable'}, {
+            key: snapshot[key] for key in ('fixture_factory_witness',
+                'fixture_operation_witness', 'fixture_mutation_outcome')})
+    self.assertNotIn('private log read failure', json.dumps(snapshot))
+
   def test_store_failure_checkpoint_preserves_bounded_diagnostic_snapshot(self):
     failure = RuntimeError('private exception details')
     setattr(failure, 'issue7_diagnostics', {
@@ -193,13 +209,44 @@ class StoreRecoveryTest(unittest.TestCase):
 
   def test_diagnostics_do_not_accept_factory_or_unrelated_marker_only_evidence(self):
     request_id = '1234567890abcdef1234567890abcdef'
-    logs = ('ISSUE7_TEST_PROVIDER: factory selected\n'
+    logs = ('ISSUE7_TEST_PROVIDER: factory create invoked\n'
         f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS["consume-loss"]}\n'
         f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={"f" * 32}\n'
         f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS["consume-loss"]} request={"f" * 32}')
     observed = probe.issue7_store_recovery.diagnostics(logs, 'consume-loss', request_id)
     self.assertEqual({'store_fault_count': 0, 'correlated_store_failure_count': 0,
         'store_provider_selected': False}, observed)
+
+  def test_fixture_witness_projection_distinguishes_selected_reached_and_outcome(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    logs = (f'ISSUE7_TEST_PROVIDER: factory create invoked\n'
+        f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={request_id}\n'
+        f'ISSUE7_TEST_FAULT: pending consume committed then threw request={request_id}')
+    result = probe.issue7_store_recovery.fixture_witness(logs, 'consume-loss', request_id)
+    self.assertEqual({'fixture_factory_witness': 'observed',
+        'fixture_operation_witness': 'observed',
+        'fixture_mutation_outcome': 'committed_then_threw'}, result)
+
+  def test_fixture_witness_fails_closed_for_missing_duplicate_unrelated_and_unknown_markers(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    selected_only = 'ISSUE7_TEST_PROVIDER: factory create invoked'
+    operation = f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={request_id}'
+    fault = f'ISSUE7_TEST_FAULT: pending consume committed then threw request={request_id}'
+    unavailable = {'fixture_factory_witness': 'unavailable',
+        'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
+    for logs, expected in (('', unavailable),
+        (selected_only, {**unavailable, 'fixture_factory_witness': 'observed'}),
+        (selected_only + '\n' + selected_only, unavailable),
+        (selected_only + '\n' + operation + '\n' + operation + '\n' + fault, unavailable),
+        (selected_only + '\n' + operation,
+            {**unavailable, 'fixture_factory_witness': 'observed',
+                'fixture_operation_witness': 'observed'}),
+        (f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={"f"*32}\n'
+            + f'ISSUE7_TEST_FAULT: pending consume committed then threw request={"f"*32}',
+            unavailable), (selected_only + '\nISSUE7_TEST_UNKNOWN: unexplained', unavailable)):
+      with self.subTest(logs=logs):
+        self.assertEqual(expected,
+            probe.issue7_store_recovery.fixture_witness(logs, 'consume-loss', request_id))
 
   def test_failure_gate_sanitizer_uses_shared_allowlist(self):
     gates = probe.issue7_store_recovery.FAILURE_GATES
@@ -260,8 +307,10 @@ class FailureFlowTest(unittest.TestCase):
       branch = (f'Wallet pending transaction unavailable (request={request_id}, reason=consume-unavailable)'
           if mode == 'consume-loss' else
           f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)')
-      logs = (f'ISSUE7_TEST_PROVIDER_OPERATION: operation={"transaction_remove" if mode == "consume-loss" else "accepted_replace"} request={request_id}\n'
-          + f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}\n' + branch)
+      logs = '\n'.join((probe.issue7_store_recovery.FACTORY_CREATE_MARKER,
+          f'ISSUE7_TEST_PROVIDER_OPERATION: operation={"transaction_remove" if mode == "consume-loss" else "accepted_replace"} request={request_id}',
+          f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}',
+          branch))
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
       stack.enter_context(patch.object(probe, 'Client', return_value=wallet))
       stack.enter_context(patch.object(probe, 'admin_token', return_value='token'))
@@ -301,7 +350,10 @@ class FailureFlowTest(unittest.TestCase):
         'store_diagnostic_read_status': 'observed',
         'store_provider_selected': True,
         'store_fault_count': 1,
-        'correlated_store_failure_count': 1}, diagnostics)
+        'correlated_store_failure_count': 1,
+        'fixture_factory_witness': 'observed',
+        'fixture_operation_witness': 'observed',
+        'fixture_mutation_outcome': 'committed_then_threw'}, diagnostics)
     sanitized = probe.sanitize_live_checkpoint({'issue7_store_recovery': {
         'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
         'store_fault_mode': 'consume-loss', **diagnostics}})
@@ -310,7 +362,10 @@ class FailureFlowTest(unittest.TestCase):
         'store_fault_mode': 'consume-loss',
         'store_diagnostic_read_status': 'observed',
         'store_provider_selected': True, 'store_fault_count': 1,
-        'correlated_store_failure_count': 1}, sanitized['issue7_store_recovery'])
+        'correlated_store_failure_count': 1,
+        'fixture_factory_witness': 'observed',
+        'fixture_operation_witness': 'observed',
+        'fixture_mutation_outcome': 'committed_then_threw'}, sanitized['issue7_store_recovery'])
     self.assertNotIn('private transport detail', json.dumps(sanitized))
 
   def test_proof_http_contract_failure_is_classified(self):
@@ -320,6 +375,24 @@ class FailureFlowTest(unittest.TestCase):
     self.assertEqual(('signup_proof', 'proof_http_status', 'assertion_failed'),
         (caught.exception.failure_stage, caught.exception.failure_gate,
          caught.exception.failure_category))
+
+  def test_proof_status_assertion_failure_keeps_outer_catch_diagnostics(self):
+    # A non-503 proof response fails inside failure_flow before its normal
+    # diagnostic snapshot. signup_wallet_flow's outer catch must still attach it.
+    with redirect_stdout(StringIO()):
+      with self.assertRaises(RuntimeError) as caught:
+        self.run_signup('consume-loss', mutation=(0, (202, {}, b'{"status":"accepted"}')))
+    self.assertEqual(('signup_proof', 'proof_http_status', 'assertion_failed'),
+        (caught.exception.failure_stage, caught.exception.failure_gate,
+         caught.exception.failure_category))
+    diagnostics = caught.exception.issue7_diagnostics
+    self.assertEqual('observed', diagnostics['store_diagnostic_read_status'])
+    self.assertEqual('observed', diagnostics['fixture_factory_witness'])
+    self.assertEqual('observed', diagnostics['fixture_operation_witness'])
+    self.assertEqual('committed_then_threw', diagnostics['fixture_mutation_outcome'])
+    self.assertEqual(1, diagnostics['store_fault_count'])
+    self.assertEqual(1, diagnostics['correlated_store_failure_count'])
+    self.assertNotIn('request_id', json.dumps(diagnostics))
 
   def test_status_and_identical_retry_contract_failures_have_distinct_gates(self):
     for index, gate in ((1, 'proof_status'), (2, 'identical_retry')):
@@ -331,7 +404,7 @@ class FailureFlowTest(unittest.TestCase):
            caught.exception.failure_category))
 
   def test_store_correlation_failure_has_explicit_bounded_gate(self):
-    logs = 'ISSUE7_TEST_PROVIDER: factory selected\\nISSUE7_TEST_FAULT: pending consume committed then threw'
+    logs = 'ISSUE7_TEST_PROVIDER: factory create invoked\\nISSUE7_TEST_FAULT: pending consume committed then threw'
     with redirect_stdout(StringIO()):
       with self.assertRaises(RuntimeError) as caught:
         self.run_signup('consume-loss', logs=logs)
@@ -357,7 +430,7 @@ class FailureFlowTest(unittest.TestCase):
             self.run_signup('consume-loss', (index, response))
 
   def test_missing_or_wrong_correlated_production_signal_rejects_failure(self):
-    for logs in ('', 'ISSUE7_TEST_PROVIDER: factory selected\nISSUE7_TEST_FAULT: pending consume committed then threw',
+    for logs in ('', 'ISSUE7_TEST_PROVIDER: factory create invoked\nISSUE7_TEST_FAULT: pending consume committed then threw',
         'Wallet pending transaction unavailable (request=' + 'f' * 32 + ', reason=consume-unavailable)'):
       with self.subTest(logs=logs), redirect_stdout(StringIO()):
         with self.assertRaises(RuntimeError):
@@ -528,11 +601,15 @@ class MainCoordinatorTest(unittest.TestCase):
     failure.failure_gate = 'proof_http_status'
     failure.failure_category = 'runtime_error'
     failure.failure_http_status = 503
+    setattr(failure, 'issue7_last_confirmed_phase', 'proof')
     setattr(failure, 'issue7_diagnostics', {
-        'store_diagnostic_read_status': 'unavailable',
+        'store_diagnostic_read_status': 'observed',
         'store_provider_selected': False,
         'store_fault_count': 0,
         'correlated_store_failure_count': 0,
+        'fixture_factory_witness': 'observed',
+        'fixture_operation_witness': 'observed',
+        'fixture_mutation_outcome': 'committed_then_threw',
         'exception': 'private message'})
 
     def fail_after_progress(*args, **kwargs):
@@ -549,10 +626,13 @@ class MainCoordinatorTest(unittest.TestCase):
         'fault_evidence_provenance': 'wrapper-mediated-application-path',
         'failure_stage': 'signup_proof', 'failure_gate': 'proof_http_status',
         'failure_category': 'runtime_error', 'signup_proof_http': 503,
-        'signup_intent_action_http': 200,
-        'store_diagnostic_read_status': 'unavailable',
+        'signup_intent_action_http': 200, 'last_confirmed_phase': 'proof',
+        'store_diagnostic_read_status': 'observed',
         'store_provider_selected': False, 'store_fault_count': 0,
-        'correlated_store_failure_count': 0}, checkpoints[-1]['issue7_store_recovery'])
+        'correlated_store_failure_count': 0,
+        'fixture_factory_witness': 'observed',
+        'fixture_operation_witness': 'observed',
+        'fixture_mutation_outcome': 'committed_then_threw'}, checkpoints[-1]['issue7_store_recovery'])
     self.assertNotIn('private', json.dumps(checkpoints))
 
   def test_signup_success_profile_failure_callback_preserves_failure_stage_and_action_fact(self):
@@ -636,7 +716,9 @@ class MainCoordinatorTest(unittest.TestCase):
         'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
         'user_readback_fault_mode': 'empty', 'failure_stage': 'signup_proof',
         'failure_gate': 'proof_http_status', 'failure_category': 'assertion_failed',
-        'signup_proof_http': 503}, checkpoints[0])
+        'signup_proof_http': 503, 'fixture_factory_witness': 'unavailable',
+        'fixture_operation_witness': 'unavailable',
+        'fixture_mutation_outcome': 'unavailable'}, checkpoints[0])
     self.assertNotIn('private exception details', json.dumps(checkpoints))
 
   def test_production_main_runs_real_coordinator_through_final_sanitized_checkpoint(self):
@@ -835,8 +917,12 @@ class PackagingTest(unittest.TestCase):
 class ProductionEntrypointRegressionTest(unittest.TestCase):
   def test_main_runs_real_store_recovery_flows_for_every_profile(self):
     profiles = probe.issue7_store_recovery.PROFILES
-    for profile, mode in profiles.items():
-      with self.subTest(profile=profile):
+    cases = [(profile, mode, 503) for profile, mode in profiles.items()]
+    # A proof response that violates the expected-fault assertion must still
+    # preserve the available bounded witness through main()'s final checkpoint.
+    cases.append(('issue7-consume-loss-recovery', 'consume-loss', 202))
+    for profile, mode, proof_status in cases:
+      with self.subTest(profile=profile, proof_status=proof_status):
         subject, identifier = 'private-retained-subject', 'private-identity'
         user = {'id': subject, 'enabled': True,
             'attributes': {'decent_identity_id': [identifier]}}
@@ -883,7 +969,7 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
                   'challenge':'private-challenge-' + self.name, 'csrf_token':'C'*43}).encode()
             if self.kind == 'signup-wallet' and method == 'POST':
               events.append(self.name + ':proof')
-              return (503 if sum(call[0] == 'POST' for call in self.calls) == 1 else 404), {}, b''
+              return (proof_status if sum(call[0] == 'POST' for call in self.calls) == 1 else 404), {}, b''
             if self.kind == 'signup-browser' and method == 'GET' and url == status_path:
               events.append(self.name + ':status')
               return 404, {}, b''
@@ -976,6 +1062,7 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
             if mode=='consume-loss' else f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)')
         logs=(f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} request={request_id}\n'
             f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}\n'+production)
+        logs='ISSUE7_TEST_PROVIDER: factory create invoked'+chr(10)+logs
         admin=Mock(wallet_container_id='a'*64)
         with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
           stack.enter_context(patch.object(probe,'SCRATCH',scratch))
@@ -1021,16 +1108,48 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
           stack.enter_context(patch.object(probe.time,'sleep'))
           cooldown=stack.enter_context(patch.object(probe,'wait_for_identity_lookup_cooldown',wraps=probe.wait_for_identity_lookup_cooldown))
           stack.enter_context(patch.object(Path,'write_text',capture))
-          with redirect_stdout(stdout): probe.main()
-        finish_cleanup.assert_called_once_with('registry','resolver-tools')
+          with redirect_stdout(stdout):
+            if proof_status == 503:
+              probe.main()
+            else:
+              with self.assertRaises(RuntimeError):
+                probe.main()
         self.assertIsNotNone(start_keycloak)
         start_keycloak.assert_called_once()
         self.assertEqual(mode,start_keycloak.call_args.kwargs['store_fault_mode'])
         self.assertIsNone(start_keycloak.call_args.kwargs['user_readback_fault_mode'])
+        if proof_status != 503:
+          finish_cleanup.assert_not_called()
+          self.assertTrue(checkpoints)
+          safe=checkpoints[-1]['issue7_store_recovery']
+          self.assertEqual('faulted_signup', safe['stage'])
+          self.assertEqual(mode, safe['store_fault_mode'])
+          self.assertEqual('proof', safe['last_confirmed_phase'])
+          self.assertEqual('proof_http_status', safe['failure_gate'])
+          self.assertEqual(proof_status, safe['signup_proof_http'])
+          self.assertEqual(200, safe['signup_intent_action_http'])
+          self.assertEqual('observed', safe['store_diagnostic_read_status'])
+          self.assertEqual('observed', safe['fixture_factory_witness'])
+          self.assertEqual('observed', safe['fixture_operation_witness'])
+          self.assertEqual('committed_then_threw', safe['fixture_mutation_outcome'])
+          self.assertEqual(1, safe['correlated_store_failure_count'])
+          self.assertEqual(1, sum(event.endswith(':proof') for event in events))
+          self.assertFalse(any(':auth' in event or ':callback' in event or ':token' in event
+              for event in events if event.startswith(('fresh-', 'login-'))))
+          serialized=json.dumps(checkpoints) + stdout.getvalue()
+          for secret in (subject, identifier, request_id, first_locator, second_locator,
+              'private-admin-secret', 'private-challenge'):
+            self.assertNotIn(secret, serialized)
+          continue
+        finish_cleanup.assert_called_once_with('registry','resolver-tools')
         self.assertEqual('complete',checkpoints[-1]['issue7_store_recovery']['stage'])
         safe=checkpoints[-1]['issue7_store_recovery']
         self.assertEqual(mode,safe['store_fault_mode'])
         self.assertEqual(1,safe['store_fault_count']); self.assertEqual(1,safe['correlated_store_failure_count'])
+        self.assertEqual('observed', safe['fixture_factory_witness'])
+        self.assertEqual('observed', safe['fixture_operation_witness'])
+        self.assertEqual('returned_false_before_commit' if mode == 'accepted-receipt-write-false'
+            else 'committed_then_threw', safe['fixture_mutation_outcome'])
         self.assertTrue(safe['store_provider_selected']); self.assertTrue(safe['same_local_subject'])
         self.assertEqual(503,safe['signup_proof_http'])
         self.assertEqual(404,safe['browser_status_http']); self.assertEqual(404,safe['retry_http'])

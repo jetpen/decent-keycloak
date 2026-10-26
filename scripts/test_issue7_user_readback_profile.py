@@ -24,6 +24,42 @@ ROOT = Path(__file__).parents[1]
 
 
 class UserReadbackProfileTest(unittest.TestCase):
+  def test_readback_fixture_witness_requires_unique_selection_operation_and_outcome_markers(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    for mode in ('empty', 'throw', 'over-cap'):
+      logs = '\n'.join((
+          'ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
+          f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}',
+          'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read',
+          'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted',
+          f'ISSUE7_USER_READBACK_OUTCOME: {mode}',
+          f'Wallet account mapping lookup unavailable (request={request_id}, IdentityMappingUnavailableException)'))
+      with self.subTest(mode=mode):
+        self.assertEqual({'fixture_factory_witness': 'observed',
+            'fixture_operation_witness': 'observed',
+            'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode},
+            probe.user_readback_fixture_witness(logs, mode, request_id))
+
+    unavailable = {'fixture_factory_witness': 'unavailable',
+        'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
+    for logs, expected in ((None, unavailable), ('', unavailable), (OSError('unreadable'), unavailable),
+        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
+            {**unavailable, 'fixture_factory_witness': 'observed'}),
+        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
+            'ISSUE7_USER_READBACK_PROVIDER: factory create invoked', unavailable),
+        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
+            'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty',
+            {**unavailable, 'fixture_factory_witness': 'observed'}),
+        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
+            'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty\n'
+            'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read\n'
+            'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read',
+            unavailable),
+        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
+            'ISSUE7_USER_READBACK_UNKNOWN: unexpected', unavailable)):
+      with self.subTest(logs=logs):
+        self.assertEqual(expected, probe.user_readback_fixture_witness(logs, 'empty', request_id))
+
   def test_subject_match_predicate_compares_exact_claim_without_returning_it(self):
     self.assertTrue(probe.subject_matches_expected({'sub': 'retained-subject'},
         'retained-subject'))
@@ -684,13 +720,16 @@ class UserReadbackProfileTest(unittest.TestCase):
             (200, {}, json.dumps([user]).encode()),
         ]
         request_id = hashlib.sha256(('A' * 43).encode('ascii')).hexdigest()[:32]
-        fault_tail = ('ISSUE7_USER_READBACK_PROVIDER: factory selected' + chr(10)
+        fault_tail = ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked' + chr(10)
             + f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}')
-        fault_window = ('ISSUE7_USER_READBACK_PROVIDER: factory selected' + chr(10)
-            + f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}' + chr(10)
-            + 'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted' + chr(10)
-            + f'Wallet account mapping lookup unavailable (request={request_id}, '
-            + 'IdentityMappingUnavailableException)')
+        fault_window = chr(10).join((
+            'ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
+            f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}',
+            'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read',
+            'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted',
+            f'ISSUE7_USER_READBACK_OUTCOME: {mode}',
+            f'Wallet account mapping lookup unavailable (request={request_id}, '
+                'IdentityMappingUnavailableException)'))
         checkpoints = []
         original_write_text = Path.write_text
 
@@ -775,6 +814,10 @@ class UserReadbackProfileTest(unittest.TestCase):
         self.assertEqual('one-keycloak-node', evidence['scope'])
         self.assertEqual(mode, evidence['user_readback_fault_mode'])
         self.assertEqual(mode, evidence['effective_user_readback_fault_mode'])
+        self.assertEqual('observed', evidence['fixture_factory_witness'])
+        self.assertEqual('observed', evidence['fixture_operation_witness'])
+        self.assertEqual('over_cap' if mode == 'over-cap' else mode,
+            evidence['fixture_mutation_outcome'])
         self.assertEqual('wrapper-mediated-application-path', evidence['fault_evidence_provenance'])
         self.assertTrue(evidence['same_local_subject'])
         self.assertTrue(evidence['account_retained_after_failure'])
@@ -860,7 +903,7 @@ class UserReadbackProfileTest(unittest.TestCase):
   def test_fault_diagnostics_are_correlated_bounded_and_sanitized(self):
     request_id = '0123456789abcdef0123456789abcdef'
     logs = (
-        'ISSUE7_USER_READBACK_PROVIDER: factory selected\n'
+        'ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
         'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty\n'
         'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted\n'
         f'Wallet account mapping lookup unavailable (request={request_id}, IdentityMappingUnavailableException)\n'

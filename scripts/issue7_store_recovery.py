@@ -27,6 +27,8 @@ FAILURE_GATES = {'unclassified', 'proof_http_status', 'account_readback', 'proof
     'signup_intent_response_decode', 'signup_intent_response_parse',
     'signup_challenge_request', 'signup_challenge_decode', 'proof_prepare', 'token_exchange'}
 FAILURE_CATEGORIES = {'runtime_error', 'assertion_failed'}
+CONFIRMED_PHASES = frozenset({'intent', 'proof', 'account', 'callback', 'token'})
+FACTORY_CREATE_MARKER = 'ISSUE7_TEST_PROVIDER: factory create invoked'
 SIGNUP_PROOF_HTTP_GATES = {'proof_http_status'}
 FAILURE_CONTEXTS = {
     'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code':
@@ -37,12 +39,15 @@ FAILURE_CONTEXTS = {
 
 
 def checkpoint_signup_failure(checkpoint, failure, *, mode_field, mode):
+  phase = getattr(failure, 'issue7_last_confirmed_phase', None)
   evidence = {
       'stage': 'faulted_signup', 'scope': 'one-keycloak-node', mode_field: mode,
       'failure_stage': getattr(failure, 'failure_stage', 'signup_flow'),
       'failure_gate': getattr(failure, 'failure_gate', 'unclassified'),
       'failure_category': getattr(failure, 'failure_category', 'runtime_error'),
   }
+  if phase in CONFIRMED_PHASES:
+    evidence['last_confirmed_phase'] = phase
   status = getattr(failure, 'failure_http_status', None)
   if type(status) is int and 100 <= status <= 599:
     status_field = ('signup_proof_http' if evidence['failure_gate'] in SIGNUP_PROOF_HTTP_GATES
@@ -60,6 +65,12 @@ def checkpoint_signup_failure(checkpoint, failure, *, mode_field, mode):
       count = diagnostics.get(field)
       if type(count) is int and 0 <= count <= 5:
         evidence[field] = count
+    for field in ('fixture_factory_witness', 'fixture_operation_witness',
+        'fixture_mutation_outcome'):
+      value = diagnostics.get(field)
+      if value in {'observed', 'unavailable', 'committed_then_threw',
+          'returned_false_before_commit', 'empty', 'throw', 'over_cap'}:
+        evidence[field] = value
   try:
     checkpoint(evidence)
   except Exception:
@@ -95,9 +106,44 @@ def failure_diagnostic_snapshot(api, *, container, log_cursor, mode, locator):
   except Exception:
     return {'store_diagnostic_read_status': 'unavailable',
         'store_provider_selected': False, 'store_fault_count': 0,
-        'correlated_store_failure_count': 0}
+        'correlated_store_failure_count': 0,
+        **fixture_witness(None, mode, '')}
   return {'store_diagnostic_read_status': 'observed',
-      **diagnostics(logs, mode, request_id)}
+      **diagnostics(logs, mode, request_id),
+      **fixture_witness(logs, mode, request_id)}
+
+
+def fixture_witness(logs, mode, request_id):
+  """Project exact, bounded store-fixture markers; never infer reach from registration."""
+  unavailable = {'fixture_factory_witness': 'unavailable',
+      'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
+  if (not isinstance(logs, str) or mode not in MARKERS
+      or not re.fullmatch(r'[a-f0-9]{32}', request_id)):
+    return unavailable
+  operation = 'transaction_remove' if mode == 'consume-loss' else 'accepted_replace'
+  expected_fault = MARKERS[mode]
+  recognized = ('ISSUE7_TEST_PROVIDER:', 'ISSUE7_TEST_PROVIDER_OPERATION:', 'ISSUE7_TEST_FAULT:')
+  lines = [line for line in logs.splitlines() if 'ISSUE7_' in line]
+  selected = 'ISSUE7_TEST_PROVIDER: factory create invoked'
+  op_line = f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} request={request_id}'
+  fault_line = f'ISSUE7_TEST_FAULT: {expected_fault} request={request_id}'
+  # Unknown/malformed fixture markers make the window ambiguous, not partial evidence.
+  if any(not line.startswith(recognized) or line not in {selected, op_line, fault_line}
+      for line in lines):
+    return unavailable
+  if any(lines.count(line) > 1 for line in {selected, op_line, fault_line}) or lines.count(selected) != 1:
+    return unavailable
+  selection = 'observed'
+  if lines.count(op_line) != 1:
+    return {**unavailable, 'fixture_factory_witness': selection}
+  operation_reached = 'observed'
+  if lines.count(fault_line) != 1:
+    return {**unavailable, 'fixture_factory_witness': selection,
+        'fixture_operation_witness': operation_reached}
+  outcome = ('returned_false_before_commit' if mode == 'accepted-receipt-write-false'
+      else 'committed_then_threw')
+  return {'fixture_factory_witness': selection,
+      'fixture_operation_witness': 'observed', 'fixture_mutation_outcome': outcome}
 
 
 def attach_failure_diagnostics(failure, api, *, container, log_cursor, mode, locator):
@@ -108,7 +154,8 @@ def attach_failure_diagnostics(failure, api, *, container, log_cursor, mode, loc
     # Diagnostic collection must never replace the signup failure.
     failure.issue7_diagnostics = {'store_diagnostic_read_status': 'unavailable',
         'store_provider_selected': False, 'store_fault_count': 0,
-        'correlated_store_failure_count': 0}
+        'correlated_store_failure_count': 0,
+        **fixture_witness(None, mode, '')}
 
 
 def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof,
@@ -156,10 +203,17 @@ def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof
 
 def run(api, client, key, identifier, container, admin_client, image, progress, checkpoint, profile):
   mode = PROFILES[profile]
+  last_phase = {}
+  def track_progress(phase, fields):
+    if phase in CONFIRMED_PHASES:
+      last_phase['phase'] = phase
+    progress(phase, fields)
   try:
     failed = api.signup_wallet_flow(client, key, identifier, container, admin_client,
-        progress, image, store_fault_mode=mode)
+        track_progress, image, store_fault_mode=mode)
   except Exception as failure:
+    if last_phase:
+      setattr(failure, 'issue7_last_confirmed_phase', last_phase['phase'])
     checkpoint_signup_failure(checkpoint, failure, mode_field='store_fault_mode', mode=mode)
     raise
   # Defense in depth at the coordinator seam, before another ceremony is possible.
@@ -216,6 +270,11 @@ def sanitize(value):
       'scope': {'one-keycloak-node'}, 'store_fault_mode': set(PROFILES.values()),
       'recovery_intent': {'signup', 'login'},
       'fault_evidence_provenance': {'wrapper-mediated-application-path'},
+      'last_confirmed_phase': CONFIRMED_PHASES,
+      'fixture_factory_witness': {'observed', 'unavailable'},
+      'fixture_operation_witness': {'observed', 'unavailable'},
+      'fixture_mutation_outcome': {'unavailable', 'committed_then_threw',
+          'returned_false_before_commit', 'empty', 'throw', 'over_cap'},
       'failure_stage': FAILURE_STAGES, 'failure_gate': FAILURE_GATES,
       'failure_category': FAILURE_CATEGORIES,
       'store_diagnostic_read_status': {'observed', 'unavailable'}}
