@@ -1627,7 +1627,7 @@ def cleanup_owned_resources(registry_node, resolver_tools, interruption_collecto
       interruptions.append(failure)
 
   for category, cleanup in (
-      ('registry_log_stream_stop_error', lambda: stop_registry(registry_node, None)),
+      ('registry_log_stream_stop_error', lambda: stop_registry(registry_node)),
       ('resolver_tools_stop_error', lambda: stop_resolver_tools(None))):
     try:
       cleanup()
@@ -2197,7 +2197,18 @@ def start_registry(temp, image, run_seconds=300):
     require(bootstrap is not None, 'ephemeral packaged Registry startup')
     return node, bootstrap, port
   except BaseException:
-    stop_registry(node, container)
+    cleanup_inconclusive = False
+    try:
+      stop_registry(node)
+    except BaseException:
+      cleanup_inconclusive = True
+    try:
+      removal = remove_owned_container(cid_file)
+      cleanup_inconclusive |= (not removal['removed'] or removal['retained_cid'])
+    except BaseException:
+      cleanup_inconclusive = True
+    if cleanup_inconclusive:
+      print('registry_startup_cleanup_status=inconclusive')
     raise
 
 
@@ -2240,22 +2251,15 @@ def stop_resolver_tools(container):
       raise RuntimeError('resolver tools container removal failed')
 
 
-def stop_registry(node, container):
-  removal_failed = False
-  try:
-    if container:
-      removed = run(['podman', 'rm', '--force', container], timeout=20)
-      removal_failed = removed.returncode != 0
-  finally:
-    if node is not None and node.poll() is None:
-      node.terminate()
-      try:
-        node.wait(timeout=8)
-      except subprocess.TimeoutExpired:
-        node.kill()
-        node.wait(timeout=5)
-  if removal_failed:
-    raise RuntimeError('Registry container removal failed')
+def stop_registry(node):
+  """Stop the log follower; container removal is CID-file owned cleanup."""
+  if node is not None and node.poll() is None:
+    node.terminate()
+    try:
+      node.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+      node.kill()
+      node.wait(timeout=5)
 
 
 def parse_dht_lookup_summary_line(line):

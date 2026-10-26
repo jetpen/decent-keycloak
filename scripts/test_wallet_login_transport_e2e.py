@@ -1064,6 +1064,37 @@ class Issue6PostConsumeRuntimeProfileTest(unittest.TestCase):
     runner.assert_called_once_with()
 
 
+class RegistryStartupOwnershipTest(unittest.TestCase):
+  def test_bootstrap_failure_cleans_up_through_run_cid_not_container_name(self):
+    import tempfile
+    import wallet_login_live_e2e as probe
+
+    with tempfile.TemporaryDirectory() as scratch:
+      cid_dir = Path(scratch) / 'cids'
+      cid_dir.mkdir()
+      node = SimpleNamespace(poll=lambda: 1, stdout=object())
+      started_id = 'a' * 64
+      def start_owned(args, cid_file, **kwargs):
+        Path(cid_file).write_text(started_id, encoding='ascii')
+        return SimpleNamespace(returncode=0, stdout=started_id), started_id
+
+      with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(probe, 'RUN_CID_DIR', cid_dir))
+        stack.enter_context(patch.object(probe, 'free_port', return_value=12345))
+        stack.enter_context(patch.object(probe, 'start_owned_container', side_effect=start_owned))
+        stack.enter_context(patch.object(probe.subprocess, 'Popen', return_value=node))
+        stack.enter_context(patch.object(probe.time, 'monotonic', side_effect=[0, 26]))
+        stop = stack.enter_context(patch.object(probe, 'stop_registry'))
+        remove = stack.enter_context(patch.object(probe, 'remove_owned_container',
+            return_value={'removed': True, 'retained_cid': False}))
+        with self.assertRaises(RuntimeError):
+          probe.start_registry(Path(scratch), 'immutable-image')
+
+      stop.assert_called_once_with(node)
+      remove.assert_called_once_with(cid_dir / 'registry.cid')
+      self.assertNotIn('wallet-login-registry-', str(remove.call_args))
+
+
 class OwnedResourceCleanupFailureTest(unittest.TestCase):
   def run_cleanup(self, cleanup_failures=(), primary_failure=None, cleanup_interrupt=None):
     import tempfile
