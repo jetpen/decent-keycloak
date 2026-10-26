@@ -34,7 +34,7 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
 
   @Override
   public UserProvider create(KeycloakSession session) {
-    System.err.println("ISSUE7_USER_READBACK_PROVIDER: factory selected");
+    System.err.println("ISSUE7_USER_READBACK_PROVIDER: factory create invoked");
     System.err.println("ISSUE7_USER_READBACK_PROVIDER: fault mode=" + mode);
     UserProvider delegate = session.getProvider(UserProvider.class, "jpa");
     if (delegate == null) throw new IllegalStateException("Keycloak local jpa UserProvider unavailable");
@@ -46,11 +46,20 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
           if ("searchForUserByUserAttributeStream".equals(method.getName()) && args != null && args.length == 3
               && IDENTITY_ATTRIBUTE.equals(args[1]) && added != null && args[2] instanceof String identity
               && identity.equals(added.getFirstAttribute(IDENTITY_ATTRIBUTE)) && armed.compareAndSet(true, false)) {
+            System.err.println("ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read");
             System.err.println("ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted");
-            if ("empty".equals(mode)) return Stream.empty();
-            if ("throw".equals(mode)) throw new IllegalStateException("issue7 test-only readback unavailable");
-            if ("over-cap".equals(mode)) return IntStream.range(0, 65)
-                .mapToObj(index -> syntheticCandidate(added, index));
+            if ("empty".equals(mode)) {
+              System.err.println("ISSUE7_USER_READBACK_OUTCOME: empty");
+              return Stream.empty();
+            }
+            if ("throw".equals(mode)) {
+              System.err.println("ISSUE7_USER_READBACK_OUTCOME: throw");
+              throw new IllegalStateException("issue7 test-only readback unavailable");
+            }
+            if ("over-cap".equals(mode)) {
+              System.err.println("ISSUE7_USER_READBACK_OUTCOME: over-cap");
+              return IntStream.range(0, 65).mapToObj(index -> syntheticCandidate(added, index));
+            }
           }
           try {
             Object result = method.invoke(delegate, args);

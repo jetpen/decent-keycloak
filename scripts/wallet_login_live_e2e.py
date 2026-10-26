@@ -160,7 +160,7 @@ def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
   """Project a byte-bounded log window into allowlisted counts and fault-mode enum."""
   if not isinstance(logs, str):
     logs = ''
-  factory = 'ISSUE7_USER_READBACK_PROVIDER: factory selected' in logs
+  factory = 'ISSUE7_USER_READBACK_PROVIDER: factory create invoked' in logs
   modes = [mode for mode in {'empty', 'throw', 'over-cap'}
       if f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}' in logs]
   effective_mode = modes[0] if len(modes) == 1 else None
@@ -174,6 +174,46 @@ def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
       'effective_fault_mode': effective_mode,
       'post_create_read_fault_count': min(5, fault_count),
       'correlated_mapping_failure_count': min(5, failure_count)}
+
+
+def user_readback_fixture_witness(logs, mode, expected_request_id=None):
+  unavailable = {'fixture_factory_witness': 'unavailable',
+      'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
+  if not isinstance(logs, str) or mode not in {'empty', 'throw', 'over-cap'}:
+    return unavailable
+  recognized = ('ISSUE7_USER_READBACK_PROVIDER:', 'ISSUE7_USER_READBACK_OPERATION:',
+      'ISSUE7_USER_READBACK_FAULT:', 'ISSUE7_USER_READBACK_OUTCOME:')
+  lines = [line for line in logs.splitlines()
+      if 'ISSUE7_USER_READBACK_' in line or 'Wallet account mapping lookup unavailable' in line]
+  selected = 'ISSUE7_USER_READBACK_PROVIDER: factory create invoked'
+  selected_mode = f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}'
+  operation = 'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read'
+  fault = 'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted'
+  outcome = f'ISSUE7_USER_READBACK_OUTCOME: {mode}'
+  production_failure = (f'Wallet account mapping lookup unavailable (request={expected_request_id}, '
+      'IdentityMappingUnavailableException)'
+      if isinstance(expected_request_id, str)
+      and re.fullmatch(r'[0-9a-f]{32}', expected_request_id) else None)
+  allowed = {selected, selected_mode, operation, fault, outcome}
+  if production_failure is not None:
+    allowed.add(production_failure)
+  if any(not line.startswith(recognized) and not line.startswith(
+      'Wallet account mapping lookup unavailable') or line not in allowed for line in lines):
+    return unavailable
+  if any(lines.count(line) > 1 for line in allowed) or lines.count(selected) != 1:
+    return unavailable
+  selected_evidence = {'fixture_factory_witness': 'observed',
+      'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
+  if lines.count(selected_mode) != 1:
+    return selected_evidence
+  if (production_failure is None or lines.count(operation) != 1
+      or lines.count(fault) != 1 or lines.count(production_failure) != 1):
+    return selected_evidence
+  if lines.count(outcome) != 1:
+    return {**selected_evidence, 'fixture_operation_witness': 'observed'}
+  return {'fixture_factory_witness': 'observed',
+      'fixture_operation_witness': 'observed',
+      'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode}
 
 
 def failure_response_has_no_callback_or_code(body, headers, redirects=()):
@@ -657,7 +697,7 @@ def report_partial_evidence_on_failure(evidence_path, diagnostic_provider=None):
 
 def checkpoint_signup_stage(result, stage, fields, checkpoint):
   """Persist one bounded signup phase before its next failure gate."""
-  if stage not in {'intent', 'proof', 'account', 'callback', 'token'}:
+  if stage not in issue7_store_recovery.CONFIRMED_PHASES:
     return
   allowed = {
       'signup_intent_action_http', 'signup_proof_http', 'exact_mapped_users',
@@ -683,7 +723,7 @@ def checkpoint_signup_failure(result, failure, checkpoint, transaction_consume_p
   """Merge bounded failure facts into the last confirmed ordinary-signup checkpoint."""
   current = dict(result.get('signup_case', {}))
   stage = current.get('stage')
-  if stage not in {'intent', 'proof', 'account', 'callback', 'token'}:
+  if stage not in issue7_store_recovery.CONFIRMED_PHASES:
     stage = 'unclassified'
   failure_stage = getattr(failure, 'failure_stage', None)
   failure_gate = getattr(failure, 'failure_gate', None)
@@ -889,7 +929,7 @@ def sanitize_live_checkpoint(candidate):
       'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
       'issue7_single_node_signup_recovery', 'issue7_store_recovery',
   }
-  signup_stages = {'intent', 'proof', 'account', 'callback', 'token', 'complete', 'unclassified'}
+  signup_stages = issue7_store_recovery.CONFIRMED_PHASES | {'complete', 'unclassified'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
       'stale_proof_pending', 'current_proof', 'current_attempt', 'current_accepted', 'callback', 'complete', 'mapping'}
   expiry_stages = {'started', 'transaction_created', 'expired_proof_submitted',
@@ -1172,6 +1212,10 @@ def sanitize_live_checkpoint(candidate):
           'stage': stages,
           'user_readback_fault_mode': {'empty', 'throw', 'over-cap'},
           'effective_user_readback_fault_mode': {'empty', 'throw', 'over-cap'},
+          'last_confirmed_phase': issue7_store_recovery.CONFIRMED_PHASES,
+          'fixture_factory_witness': {'observed', 'unavailable'},
+          'fixture_operation_witness': {'observed', 'unavailable'},
+          'fixture_mutation_outcome': {'unavailable', 'empty', 'throw', 'over_cap'},
           'fault_evidence_provenance': {'wrapper-mediated-application-path'},
       'failure_stage': issue7_store_recovery.FAILURE_STAGES,
       'failure_gate': issue7_store_recovery.FAILURE_GATES,
@@ -4836,12 +4880,28 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       issue7_store_recovery.attach_failure_diagnostics(failure, sys.modules[__name__],
           container=container, log_cursor=log_cursor, mode=store_fault_mode,
           locator=signup_locator)
+    elif expect_user_readback_fault:
+      try:
+        fault_logs = read_provider_fault_log_window(container, log_cursor, strict=True)
+        if not isinstance(fault_logs, str):
+          raise ValueError('diagnostic log result unavailable')
+        setattr(failure, 'issue7_diagnostics', {
+            'store_diagnostic_read_status': 'observed',
+            **user_readback_fixture_witness(fault_logs, expected_fault_mode, request_id)})
+      except Exception:
+        setattr(failure, 'issue7_diagnostics', {
+            'store_diagnostic_read_status': 'unavailable',
+            'fixture_factory_witness': 'unavailable',
+            'fixture_operation_witness': 'unavailable',
+            'fixture_mutation_outcome': 'unavailable'})
     raise
   redirects_after_proof = list(wallet.redirects[redirects_before_proof:])
   if expect_user_readback_fault:
-    fault_logs = read_provider_fault_log_window(container, log_cursor)
+    fault_logs = read_provider_fault_log_window(container, log_cursor, strict=True)
     diagnostics = sanitize_user_readback_fault_diagnostics(
         fault_logs, expected_request_id=request_id)
+    user_readback_witness = user_readback_fixture_witness(fault_logs, expected_fault_mode, request_id)
+    progress('proof', user_readback_witness)
   progress('proof', {'signup_proof_http': proof_status})
   progress('proof', {'provider_request_id': provider_request_id})
   if store_fault_mode is not None:
@@ -5072,13 +5132,28 @@ def run_issue7_single_node_signup_recovery_profile(client, key, identifier, cont
     admin_client, image, progress, checkpoint, profile):
   """Inject one post-create readback fault, then prove fresh signup reuses the account."""
   phase = 'faulted_signup'
+  last_phase = {}
+  fixture_evidence_checkpointed = False
   def phase_progress(stage, fields):
-    progress(phase, fields)
+    nonlocal fixture_evidence_checkpointed
+    if stage in issue7_store_recovery.CONFIRMED_PHASES:
+      last_phase['phase'] = stage
+    if 'fixture_factory_witness' in fields:
+      fixture_evidence_checkpointed = True
+    progress(phase, {**fields, 'last_confirmed_phase': stage})
   try:
     failed = signup_wallet_flow(client, key, identifier, container, admin_client,
         phase_progress, image, expect_user_readback_fault=True,
         expected_fault_mode=user_readback_fault_mode(profile))
   except Exception as failure:
+    if last_phase:
+      setattr(failure, 'issue7_last_confirmed_phase', last_phase['phase'])
+    if (not fixture_evidence_checkpointed
+        and not isinstance(getattr(failure, 'issue7_diagnostics', None), dict)):
+      setattr(failure, 'issue7_diagnostics', {
+          'fixture_factory_witness': 'unavailable',
+          'fixture_operation_witness': 'unavailable',
+          'fixture_mutation_outcome': 'unavailable'})
     issue7_store_recovery.checkpoint_signup_failure(checkpoint, failure,
         mode_field='user_readback_fault_mode', mode=user_readback_fault_mode(profile))
     raise
@@ -6537,6 +6612,8 @@ def main():
           def store_progress(stage, fields):
             current = dict(result['issue7_store_recovery'])
             current.update(fields)
+            if stage in issue7_store_recovery.CONFIRMED_PHASES:
+              current['last_confirmed_phase'] = stage
             if current.get('stage') != 'recovery':
               current['stage'] = 'faulted_signup'
             save_store_checkpoint(current)
@@ -6568,6 +6645,12 @@ def main():
                   'account_retained_after_failure', 'user_readback_factory_selected',
                   'post_create_read_fault_observed'} and type(value) is bool:
                 current[field] = value
+              elif field in {'last_confirmed_phase'} and value in issue7_store_recovery.CONFIRMED_PHASES:
+                current[field] = value
+              elif field in {'fixture_factory_witness', 'fixture_operation_witness'} and value in {'observed', 'unavailable'}:
+                current[field] = value
+              elif field == 'fixture_mutation_outcome' and value in {'unavailable', 'empty', 'throw', 'over_cap'}:
+                current[field] = 'over_cap' if value == 'over_cap' else value
               elif field == 'effective_user_readback_fault_mode' and value in {'empty', 'throw', 'over-cap'}:
                 current[field] = value
             result['issue7_single_node_signup_recovery'] = current

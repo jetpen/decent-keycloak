@@ -42,7 +42,7 @@ public final class Issue7FaultInjectingSingleUseObjectProviderFactory
   public SingleUseObjectProvider create(KeycloakSession session) {
     SingleUseObjectProvider delegate = session.getProvider(SingleUseObjectProvider.class, "infinispan");
     if (delegate == null) throw new IllegalStateException("infinispan single-use provider unavailable");
-    System.err.println("ISSUE7_TEST_PROVIDER: factory selected");
+    System.err.println("ISSUE7_TEST_PROVIDER: factory create invoked");
     return new SingleUseObjectProvider() {
       @Override
       public void put(String key, long lifespan, Map<String, String> notes) {
