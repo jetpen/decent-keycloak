@@ -41,16 +41,23 @@ that original offline preparation slice, not later runtime attempts. The combine
 checkpoint must still satisfy exact account, callback/replay, state, and PKCE assertions; the
 consume marker alone does not establish accepted receipt publication or code issuance.
 
-## Later ordinary signup runtime attempt
+## PR #43 correction and later ordinary signup runtime attempt
+
+PR #43 merged at `c203a028804882c088718b3add6ebbd7e8ad9b3d` from source head
+`8c2c83488060c684ee8506485c47d9e4059b6b1c`. Its authorized push run `40393741461` and
+pull_request run `40393878849` both succeeded and included “Build and check the immutable-base
+provider image”. That CI step built a Docker image and ran the Keycloak 26.8.0 `kc.sh --version`
+smoke only; it did not run signup or qualify Registry behavior. This post-publication CI evidence
+is distinct from local offline implementation and does not qualify the signup profile.
 
 The separate authorized `issue7-signup-success` attempt on source
 `24f36d843774997193faee6cfe8f1ab9902ff93c` was consumed once and failed at `account_readback`
 after signup intent HTTP 200, before proof, consume, callback/replay, PKCE or selected-provider
-witness. Offline tracing found `main()` reused the realm-preprovisioned Identity for fresh signup;
-the corrected isolated candidate now gives this profile a distinct Identity but has not been
-live-verified. The exact harness/image provenance and cleanup reconciliation are recorded in
-[`issue-7-store-recovery.md`](issue-7-store-recovery.md). Issue #7 remains OPEN; do not retry
-without fresh explicit authorization.
+witness. Offline tracing found `main()` reused the realm-preprovisioned Identity for fresh signup.
+PR #43 changes only the ordinary success profile to use a distinct fresh Identity after realm
+setup; this correction has not been live-verified. The exact harness/image provenance and cleanup
+reconciliation are recorded in [`issue-7-store-recovery.md`](issue-7-store-recovery.md). Issue #7
+remains OPEN; do not retry without fresh explicit authorization.
 
 ## Receipt-publication failure
 
