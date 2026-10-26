@@ -1,11 +1,10 @@
-# Issue #7 store recovery: scoped current-main candidate
+# Issue #7 store recovery: merged implementation and evidence status
 
 Refs #7: https://github.com/jetpen/decent-keycloak/issues/7
 
-**Disposition: scoped offline implementation candidate for human review; Issue #7 remains OPEN. This does not close the issue or qualify runtime behavior.**
-No live/container/Registry invocation or image build was performed for this slice.
-Real Keycloak HTTP, selected runtime SPI, wallet/browser and production-provider recovery
-remain unqualified. Neither passing scripted HTTP tests nor an SPI JAR proves runtime qualification.
+**Disposition: PR #43 merged at `c203a028804882c088718b3add6ebbd7e8ad9b3d` (source head `8c2c83488060c684ee8506485c47d9e4059b6b1c`); Issue #7 remains OPEN.** The merged implementation does not establish live signup, provider, or Registry qualification.
+
+The authorized PR #43 push run `40393741461` and pull_request run `40393878849` both succeeded. Each included “Build and check the immutable-base provider image”, which built the Docker image and ran the Keycloak 26.8.0 `kc.sh --version` smoke only—not the signup profile or Registry qualification. CI image-build and Keycloak 26.8.0 version smoke do not qualify signup or Registry behavior. This is post-publication CI evidence; it does not mean a local image/container operation occurred for this documentation reconciliation. Real Keycloak signup HTTP, selected runtime SPI, wallet/browser and production-provider recovery remain unqualified. Neither scripted HTTP tests nor an SPI JAR proves runtime qualification.
 Multi-node integration and distributed provisioning/replay guarantees are out of scope.
 
 ## Ordinary signup attempt and correction boundary
@@ -24,12 +23,12 @@ callback, replay, or PKCE; no selected-provider witness was reached and no pass 
 Offline source tracing attributes this attempt's account-readback failure to profile wiring, not
 an established production-path defect: `main()` used the first Identity both to provision the
 realm through `configure_realm` and to dispatch the success profile, while the real
-`signup_wallet_flow` requires no exact mapped account before fresh signup proof. This candidate
-keeps the first Identity for realm setup and other profiles, then publishes and passes a distinct
-fresh Identity only for `issue7-signup-success`. It is corrected harness wiring, not a live-verified
-fix; it does not change production Java behavior or acceptance criteria. The failure belongs to
-the source snapshot above and remains a failed, consumed attempt. Cleanup was verified against
-pre/post inventories: run-owned containers/networks/volumes/listeners/CID dirs/temp dirs were
+`signup_wallet_flow` requires no exact mapped account before fresh signup proof. PR #43's correction
+keeps the first Identity for realm setup and other profiles, then gives only the ordinary
+`issue7-signup-success` profile a distinct fresh Identity after realm setup. This is a narrow harness
+correction, not a live-verified fix; it does not change production Java behavior or acceptance
+criteria. The failure belongs to the source snapshot above and remains the sole failed, consumed
+attempt. Cleanup was verified against pre/post inventories: run-owned containers/networks/volumes/listeners/CID dirs/temp dirs were
 reconciled, run-owned containers and the image were absent afterward, and no run CID or
 credential scratch file remained. Do not retry without fresh explicit authorization.
 
@@ -110,7 +109,7 @@ runtime authorization before these commands may be executed.
 
 ## Source and verification limits
 
-This candidate is based on the current integration base after PR #41 at `72c61f4cbfe11d9bcda8f1da9ae0349d00d709c1`. It adds bounded fixture-witness parsing/checkpoint wiring for the three store and three readback failure profiles, a production-main proof-status assertion-failure regression, the shared confirmed-phase vocabulary, and offline evidence/docs updates. Test-only SPI log markers distinguish run-scoped factory creation from request-scoped operation/fault/outcome; both store and readback markers require the exact allowlisted wrapper ID, operation, and same handle-derived request ID. Readback correlation uses a nested-restoring synchronous request context. No delegate identity is claimed. These are fixture-backed offline orchestration/parser signals only, not runtime provider qualification; Issue #7 remains OPEN.
+Earlier offline fixture-witness parsing/checkpoint work was delivered in PR #42, merged at `24f36d843774997193faee6cfe8f1ab9902ff93c`. It covers the three store and three readback failure profiles, a production-main proof-status assertion-failure regression, shared confirmed-phase vocabulary, and offline evidence/docs updates. Test-only SPI log markers distinguish run-scoped factory creation from request-scoped operation/fault/outcome; both store and readback markers require the exact allowlisted wrapper ID, operation, and same handle-derived request ID. Readback correlation uses a nested-restoring synchronous request context. No delegate identity is claimed. These are fixture-backed offline orchestration/parser signals only, not runtime provider qualification; Issue #7 remains OPEN. PR #43 adds only the distinct fresh Identity wiring for the ordinary success profile after realm setup, as recorded above; it changes no production Java behavior and remains unverified by a live profile.
 
 
 The Python store-recovery module now includes an all-mode production-entrypoint regression: the production `main()` with external setup mocked selects each configured store profile, executes the real `issue7_store_recovery.run`, and calls the real `signup_wallet_flow` plus either a fresh real signup (consume-loss) or real `auth_flow` (both receipt-write modes) using scripted browser/wallet HTTP and Admin readbacks. It checks scripted browser/wallet request ordering (explicit signup intent, challenge, proof, status and retry); empty 503 and old pending/retry 404 without redirect/callback/code; exact retained enabled-user readback from fixed Admin responses; and serialized evidence from a hand-authored request-correlated log fixture; cooldown; distinct recovery transaction; correct ceremony and accurate transaction counts; same local subject; callback/replay/state/code/PKCE; and final checkpoint/stdout sanitization. The test does not observe current Registry verification, actual local-account creation/readback, pending-store consumption, or provider-emitted fault logs. Those Issue #7 gates remain runtime/provider qualifications. The core flow and coordinator are not mocked. All secrets, private subject/identity, locators, challenges, proof material, codes, tokens and raw logs are excluded from serialized evidence. Factory-create markers may repeat across Keycloak sessions in the bounded profile log window and are run-scoped presence only; only the exact unique request-correlated operation+provider marker establishes that the test provider was used for that operation. This is scripted offline application-path evidence only; external setup is mocked and no container, Registry, Keycloak server/provider or live profile was run. Java tests continue to exercise one-shot decorator mutation ordering and delegation. None of this qualifies actual Keycloak acceptance, JPA/provider persistence/atomicity, real Registry/wallet behavior, or runtime/browser/provider selection. The added scenario passed against the unchanged production flow and is characterization of the previously untested orchestration; no product defect or runtime pass is claimed.

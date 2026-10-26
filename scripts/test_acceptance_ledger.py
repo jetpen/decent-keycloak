@@ -9,12 +9,13 @@ README = Path(__file__).parents[1] / "README.md"
 SECURITY_REVIEW = Path(__file__).parents[1] / "docs/security-review.md"
 
 class AcceptanceLedgerTest(unittest.TestCase):
-  def test_issue7_store_recovery_candidate_is_offline_and_ceremonies_are_distinct(self):
+  def test_issue7_store_recovery_is_merged_and_ceremonies_are_distinct(self):
     readme = README.read_text()
     doc = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
     self.assertIn('docs/acceptance/issue-7-store-recovery.md', readme)
-    self.assertIn('candidate for human review', doc)
+    self.assertIn('PR #42', doc)
     self.assertIn('Issue #7 remains OPEN', doc)
+    self.assertNotIn('candidate for human review', doc)
     self.assertIn('the real `issue7_store_recovery.run`', doc)
     self.assertIn('last_confirmed_phase', doc)
     self.assertIn('fixture_factory_witness', doc)
@@ -36,8 +37,13 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('actual Keycloak/UserProvider/JPA runtime behavior remains unqualified', readme)
     self.assertIn('bounded last-confirmed signup progress', readme)
     self.assertIn('status alone never selects a gate', readme)
-    self.assertIn('349 tests passed', readme)
+    self.assertNotIn('349 tests passed', readme)
     self.assertIn('same handle-derived request ID', readme)
+    issue7_rows = [line for line in readme.splitlines() if line.startswith('| Keycloak #7 signup provisioning and recovery')]
+    self.assertEqual(2, len(issue7_rows))
+    self.assertNotEqual(issue7_rows[0], issue7_rows[1])
+    self.assertIn('PR #42 provides offline request-correlated fixture witnesses; PR #43 limits the ordinary success profile to a distinct fresh Identity', issue7_rows[0])
+    self.assertIn('13-module README/CI Python acceptance command passed 350 tests', issue7_rows[1])
 
   def test_issue7_ordinary_signup_failure_provenance_is_reconciled(self):
     readme = README.read_text()
@@ -48,10 +54,11 @@ class AcceptanceLedgerTest(unittest.TestCase):
         'baa747716f0e050e2a18e4089b701dccc7a9acf9b84ce99776eb8cbdeebea0ed',
         'fc83bfb91d11555f6be59f7aa4700ba4d0617137c7287fb1d3f111dfea5aacd2',
         'sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669'):
-      self.assertIn(provenance, readme)
       self.assertIn(provenance, recovery)
+    self.assertIn('24f36d843774997193faee6cfe8f1ab9902ff93c', readme)
     for text in (readme, recovery, boundary):
       self.assertIn('account_readback', text)
+    self.assertIn('single ordinary-signup runtime attempt failed at `account_readback` and was consumed', readme)
     self.assertIn('fresh authorization', readme)
     self.assertIn('fresh explicit authorization', recovery)
     self.assertIn('fresh explicit authorization', boundary)
@@ -59,9 +66,33 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('before proof', readme)
     self.assertIn('before proof', boundary)
     self.assertIn('no pass is claimed', recovery)
-    self.assertIn('profile wiring gap', readme)
-    self.assertIn('distinct fresh Identity', readme)
-    self.assertEqual(2, readme.count('349 tests passed'))
+    self.assertIn('only the ordinary `issue7-signup-success` profile receives a distinct fresh Identity after realm setup', readme)
+    self.assertIn('distinct fresh Identity after realm setup', recovery)
+    self.assertIn('not live-verified', readme)
+    self.assertIn('not a live-verified fix', recovery)
+    self.assertNotIn('349 tests passed', readme)
+
+  def test_issue7_pr43_and_ci_evidence_are_separate_from_live_qualification(self):
+    readme = README.read_text()
+    recovery = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
+    boundary = (README.parent / 'docs/acceptance/issue-7-safe-retry-boundary.md').read_text()
+    for text in (readme, recovery):
+      self.assertIn('PR #43', text)
+      self.assertIn('c203a028804882c088718b3add6ebbd7e8ad9b3d', text)
+      self.assertIn('8c2c83488060c684ee8506485c47d9e4059b6b1c', text)
+      self.assertIn('40393741461', text)
+      self.assertIn('40393878849', text)
+      self.assertIn('Build and check the immutable-base provider image', text)
+      self.assertIn('Keycloak 26.8.0', text)
+      self.assertIn('Registry qualification', text)
+    self.assertIn('not signup or Registry qualification', readme)
+    self.assertIn('not the signup profile or Registry qualification', recovery)
+    self.assertIn('40393741461', boundary)
+    self.assertIn('40393878849', boundary)
+    self.assertNotIn('corrected isolated candidate', readme + recovery + boundary)
+    self.assertNotIn('No live/container/Registry invocation or image build was performed for this slice.', recovery)
+    self.assertEqual(2, readme.count('| Keycloak #7 signup provisioning and recovery (single-node only) |'))
+    self.assertIn('No new attempt was performed; any additional runtime attempt requires fresh explicit authorization', readme)
 
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
     text = README.read_text()
