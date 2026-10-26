@@ -190,9 +190,11 @@ public final class WalletLoginTransportHandler {
               requestId, intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup, occupied);
           return HttpResult.empty(403);
         }
-        org.keycloak.models.UserModel provisioned = accounts.ensureEnabledUser(proof.identityId());
-        if (provisioned == null || !provisioned.isEnabled()) return HttpResult.empty(503);
-        if (!accounts.hasUniqueEnabledUser(proof.identityId())) return HttpResult.empty(503);
+        try (WalletRequestCorrelation.Scope ignored = WalletRequestCorrelation.open(requestId)) {
+          org.keycloak.models.UserModel provisioned = accounts.ensureEnabledUser(proof.identityId());
+          if (provisioned == null || !provisioned.isEnabled()) return HttpResult.empty(503);
+          if (!accounts.hasUniqueEnabledUser(proof.identityId())) return HttpResult.empty(503);
+        }
       }
     } catch (Exception unavailable) {
       LOG.warnf("Wallet account mapping lookup unavailable (request=%s, %s)", requestId, unavailable.getClass().getSimpleName());

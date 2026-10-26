@@ -164,9 +164,13 @@ def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
   modes = [mode for mode in {'empty', 'throw', 'over-cap'}
       if f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}' in logs]
   effective_mode = modes[0] if len(modes) == 1 else None
-  fault_count = logs.count('ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted')
+  fault_count = 0
   failure_count = 0
   if expected_request_id and re.fullmatch(r'[0-9a-f]{32}', expected_request_id):
+    fault_line = (f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault '
+        f'operation=post_create_exact_attribute_read post-create exact attribute read intercepted '
+        f'request={expected_request_id}')
+    fault_count = logs.count(fault_line)
     needle = (f'Wallet account mapping lookup unavailable (request={expected_request_id}, '
         'IdentityMappingUnavailableException)')
     failure_count = min(5, logs.count(needle))
@@ -187,9 +191,13 @@ def user_readback_fixture_witness(logs, mode, expected_request_id=None):
       if 'ISSUE7_USER_READBACK_' in line or 'Wallet account mapping lookup unavailable' in line]
   selected = 'ISSUE7_USER_READBACK_PROVIDER: factory create invoked'
   selected_mode = f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}'
-  operation = 'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read'
-  fault = 'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted'
-  outcome = f'ISSUE7_USER_READBACK_OUTCOME: {mode}'
+  operation = (f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault '
+      f'operation=post_create_exact_attribute_read request={expected_request_id}')
+  fault = (f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault '
+      f'operation=post_create_exact_attribute_read post-create exact attribute read intercepted '
+      f'request={expected_request_id}')
+  outcome = (f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault '
+      f'operation=post_create_exact_attribute_read {mode} request={expected_request_id}')
   production_failure = (f'Wallet account mapping lookup unavailable (request={expected_request_id}, '
       'IdentityMappingUnavailableException)'
       if isinstance(expected_request_id, str)
@@ -200,20 +208,16 @@ def user_readback_fixture_witness(logs, mode, expected_request_id=None):
   if any(not line.startswith(recognized) and not line.startswith(
       'Wallet account mapping lookup unavailable') or line not in allowed for line in lines):
     return unavailable
-  if any(lines.count(line) > 1 for line in allowed) or lines.count(selected) != 1:
+  if (lines.count(selected_mode) != 1
+      or lines.count(operation) != 1 or lines.count(fault) != 1
+      or lines.count(outcome) != 1 or production_failure is None
+      or lines.count(production_failure) != 1):
     return unavailable
-  selected_evidence = {'fixture_factory_witness': 'observed',
-      'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
-  if lines.count(selected_mode) != 1:
-    return selected_evidence
-  if (production_failure is None or lines.count(operation) != 1
-      or lines.count(fault) != 1 or lines.count(production_failure) != 1):
-    return selected_evidence
-  if lines.count(outcome) != 1:
-    return {**selected_evidence, 'fixture_operation_witness': 'observed'}
-  return {'fixture_factory_witness': 'observed',
+  return {'fixture_factory_witness': 'observed' if selected in lines else 'unavailable',
       'fixture_operation_witness': 'observed',
-      'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode}
+      'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode,
+      'fixture_selected_provider_id': 'issue7-user-readback-fault',
+      'fixture_operation': 'post_create_exact_attribute_read'}
 
 
 def failure_response_has_no_callback_or_code(body, headers, redirects=()):
@@ -1215,7 +1219,9 @@ def sanitize_live_checkpoint(candidate):
           'last_confirmed_phase': issue7_store_recovery.CONFIRMED_PHASES,
           'fixture_factory_witness': {'observed', 'unavailable'},
           'fixture_operation_witness': {'observed', 'unavailable'},
-          'fixture_mutation_outcome': {'unavailable', 'empty', 'throw', 'over_cap'},
+          'fixture_mutation_outcome': issue7_store_recovery.ISSUE7_USER_READBACK_FIXTURE_MUTATION_OUTCOMES,
+          'fixture_selected_provider_id': issue7_store_recovery.ISSUE7_USER_READBACK_FIXTURE_PROVIDER_IDS,
+          'fixture_operation': issue7_store_recovery.ISSUE7_USER_READBACK_FIXTURE_OPERATIONS,
           'fault_evidence_provenance': {'wrapper-mediated-application-path'},
       'failure_stage': issue7_store_recovery.FAILURE_STAGES,
       'failure_gate': issue7_store_recovery.FAILURE_GATES,
@@ -4896,6 +4902,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
             'fixture_mutation_outcome': 'unavailable'})
     raise
   redirects_after_proof = list(wallet.redirects[redirects_before_proof:])
+  user_readback_witness = {'fixture_factory_witness': 'unavailable',
+      'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
   if expect_user_readback_fault:
     fault_logs = read_provider_fault_log_window(container, log_cursor, strict=True)
     diagnostics = sanitize_user_readback_fault_diagnostics(
@@ -4952,7 +4960,10 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
         'correlated_mapping_failure_count': diagnostics['correlated_mapping_failure_count']})
     require(factory_selected and effective_fault_mode == expected_fault_mode
         and diagnostics['post_create_read_fault_count'] == 1
-        and diagnostics['correlated_mapping_failure_count'] >= 1,
+        and diagnostics['correlated_mapping_failure_count'] >= 1
+        and user_readback_witness.get('fixture_operation_witness') == 'observed'
+        and user_readback_witness.get('fixture_selected_provider_id') == 'issue7-user-readback-fault'
+        and user_readback_witness.get('fixture_operation') == 'post_create_exact_attribute_read',
         'faulted signup has selected mode, one provider read fault, and request-correlated mapping failure')
     return {'signup_intent_action_http': action_status, 'signup_proof_http': proof_status,
         'exact_mapped_users': len(matched), 'browser_status_http': polled,
@@ -4961,6 +4972,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
         'effective_user_readback_fault_mode': effective_fault_mode,
         'post_create_read_fault_observed': True,
         'post_create_read_fault_count': diagnostics['post_create_read_fault_count'],
+        **user_readback_witness,
         'fresh_signup_reused_account': False,
         'correlated_mapping_failure_count': diagnostics['correlated_mapping_failure_count'],
         'expected_existing_subject': matched[0]['id']}
@@ -5174,6 +5186,9 @@ def run_issue7_single_node_signup_recovery_profile(client, key, identifier, cont
           failed['exact_mapped_users'], recovered['exact_mapped_users']],
       'same_local_subject': same_subject,
       'user_readback_fault_mode': user_readback_fault_mode(profile),
+      **{field: failed.get(field, 'unavailable') for field in ('fixture_factory_witness',
+          'fixture_operation_witness', 'fixture_mutation_outcome',
+          'fixture_selected_provider_id', 'fixture_operation')},
       'effective_user_readback_fault_mode': failed['effective_user_readback_fault_mode'],
       'user_readback_factory_selected': failed['user_readback_factory_selected'],
       'post_create_read_fault_observed': failed['post_create_read_fault_observed'],
@@ -6649,8 +6664,12 @@ def main():
                 current[field] = value
               elif field in {'fixture_factory_witness', 'fixture_operation_witness'} and value in {'observed', 'unavailable'}:
                 current[field] = value
-              elif field == 'fixture_mutation_outcome' and value in {'unavailable', 'empty', 'throw', 'over_cap'}:
-                current[field] = 'over_cap' if value == 'over_cap' else value
+              elif field == 'fixture_mutation_outcome' and value in issue7_store_recovery.ISSUE7_USER_READBACK_FIXTURE_MUTATION_OUTCOMES:
+                current[field] = value
+              elif field == 'fixture_selected_provider_id' and value in issue7_store_recovery.ISSUE7_USER_READBACK_FIXTURE_PROVIDER_IDS:
+                current[field] = value
+              elif field == 'fixture_operation' and value in issue7_store_recovery.ISSUE7_USER_READBACK_FIXTURE_OPERATIONS:
+                current[field] = value
               elif field == 'effective_user_readback_fault_mode' and value in {'empty', 'throw', 'over-cap'}:
                 current[field] = value
             result['issue7_single_node_signup_recovery'] = current

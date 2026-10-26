@@ -254,7 +254,7 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
   }
 
   private static String safeCallbackRequestId(String requestId) {
-    return requestId != null && requestId.matches("[0-9a-f]{32}") ? requestId : "unavailable";
+    return WalletRequestCorrelation.isValidRequestId(requestId) ? requestId : "unavailable";
   }
 
   private static void denyCompletedCallbackReplay(AuthenticationFlowContext context,
@@ -268,7 +268,7 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
       String state = auth.getClientNote(org.keycloak.protocol.oidc.OIDCLoginProtocol.STATE_PARAM);
       LOG.infof("Wallet callback replay guard entered (request=%s, state_present=%s, "
               + "redirect_uri_present=%s, redirect_uri_registered=%s, protocol_openid_connect=%s)",
-          requestId != null && requestId.matches("[0-9a-f]{32}") ? requestId : "unavailable",
+          WalletRequestCorrelation.isValidRequestId(requestId) ? requestId : "unavailable",
           state != null && !state.isBlank(), redirectUri != null && !redirectUri.isBlank(),
           redirectUriRegistered, "openid-connect".equals(auth.getProtocol()));
       var event = context.getEvent();
