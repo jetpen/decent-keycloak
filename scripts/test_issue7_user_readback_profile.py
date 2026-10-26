@@ -383,22 +383,33 @@ class UserReadbackProfileTest(unittest.TestCase):
       stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
       stack.enter_context(patch.object(probe, 'start_registry', return_value=('registry', 'bootstrap', 1234)))
       stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
+      initial_identity = (key_path, Path(scratch) / 'initial-wrapper', 'private-identity')
+      success_identity = (Path(scratch) / 'success-identity.pem',
+          Path(scratch) / 'success-wrapper', 'success-identity')
       identity = stack.enter_context(patch.object(probe, 'write_identity',
-          return_value=(key_path, Path(scratch) / 'wrapper', 'private-identity')))
+          side_effect=[initial_identity, success_identity]))
       stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
       stack.enter_context(patch.object(probe, 'admin_token', return_value='token'))
       stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
           'runtime_qualification_status': 'runtime_facts_verified',
           'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
-      stack.enter_context(patch.object(probe, 'configure_realm'))
+      realm_setup = stack.enter_context(patch.object(probe, 'configure_realm'))
       stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
-      stack.enter_context(patch.object(probe, 'admin_call', side_effect=[
-          (200, {}, b'[]'), (200, {}, b'[{"attributes":{"decent_identity_id":["private-identity"]},"enabled":true,"id":"private-subject"}]')]))
+      user_reads = {}
+      def read_users(_client, _token, method, path, *_args, **_kwargs):
+        self.assertEqual('GET', method)
+        identity_id = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)['q'][0].split(':', 1)[1]
+        user_reads[identity_id] = user_reads.get(identity_id, 0) + 1
+        if user_reads[identity_id] == 1:
+          return 200, {}, b'[]'
+        return (200, {}, json.dumps([{'attributes': {'decent_identity_id': [identity_id]},
+            'enabled': True, 'id': 'private-subject'}]).encode())
+      stack.enter_context(patch.object(probe, 'admin_call', side_effect=read_users))
       stack.enter_context(patch.object(probe, 'Client', side_effect=[browser, wallet]))
       stack.enter_context(patch.object(probe.subprocess, 'run',
           return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
-      stack.enter_context(patch.object(probe, 'verify_id_token', return_value={
-          'sub': 'private-subject', 'decent_identity_id': 'private-identity'}))
+      stack.enter_context(patch.object(probe, 'verify_id_token', side_effect=lambda *_args, **_kwargs: {
+          'sub': 'private-subject', 'decent_identity_id': next(iter(user_reads))}))
       request_id = probe.account_policy_request_id(locator)
       stack.enter_context(patch.object(probe, 'read_provider_success_log_window',
           return_value=f'Wallet proof transaction consumed (request={request_id}, provider=infinispan)'))
@@ -416,8 +427,13 @@ class UserReadbackProfileTest(unittest.TestCase):
           wraps=probe.dispatch_live_profile))
       printed = stack.enter_context(patch('builtins.print'))
       probe.main()
-    identity.assert_called_once()
-    self.assertEqual(1, signup_flow.call_count)
+    self.assertEqual(2, identity.call_count)
+    self.assertEqual(('bootstrap', 'ordinary-image'), identity.call_args_list[0].args[1:])
+    self.assertEqual('wallet-login-signup', identity.call_args_list[1].kwargs['label'])
+    self.assertEqual('private-identity', realm_setup.call_args.args[2])
+    self.assertNotEqual(realm_setup.call_args.args[2], signup_flow.call_args.args[2])
+    self.assertEqual('success-identity', signup_flow.call_args.args[2])
+    self.assertEqual(Path(scratch) / 'success-identity.pem', signup_flow.call_args.args[1])
     self.assertNotIn('local_subject_matches_expected', actual_signup_results[0])
     self.assertNotIn('local_subject', actual_signup_results[0])
     self.assertNotIn('private-subject', json.dumps(actual_signup_results[0]))

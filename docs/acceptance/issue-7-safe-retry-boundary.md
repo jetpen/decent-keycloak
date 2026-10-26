@@ -36,11 +36,21 @@ conflicting, or unrelated-only markers fail closed. The final checkpoint project
 only for a completed success profile and omits the request ID and raw log contents.
 
 Offline tests cover the production handler log, parser correlation/allowlisting, final checkpoint
-projection, and the production entrypoint with scripted HTTP plus external setup mocked. This is
-preparation for future one-node qualification, not evidence that Keycloak selected a particular
-provider at runtime: no image build or live profile was run for this slice. The combined success
+projection, and the production entrypoint with scripted HTTP plus external setup mocked. This describes
+that original offline preparation slice, not later runtime attempts. The combined success
 checkpoint must still satisfy exact account, callback/replay, state, and PKCE assertions; the
 consume marker alone does not establish accepted receipt publication or code issuance.
+
+## Later ordinary signup runtime attempt
+
+The separate authorized `issue7-signup-success` attempt on source
+`24f36d843774997193faee6cfe8f1ab9902ff93c` was consumed once and failed at `account_readback`
+after signup intent HTTP 200, before proof, consume, callback/replay, PKCE or selected-provider
+witness. Offline tracing found `main()` reused the realm-preprovisioned Identity for fresh signup;
+the corrected isolated candidate now gives this profile a distinct Identity but has not been
+live-verified. The exact harness/image provenance and cleanup reconciliation are recorded in
+[`issue-7-store-recovery.md`](issue-7-store-recovery.md). Issue #7 remains OPEN; do not retry
+without fresh explicit authorization.
 
 ## Receipt-publication failure
 

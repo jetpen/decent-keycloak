@@ -6690,13 +6690,15 @@ def main():
           resolver_tools = None
           return
         if profile == 'issue7-signup-success':
+          signup_key, _, signup_identifier = write_identity(
+              temp, bootstrap, IMAGE, label='wallet-login-signup')
           def signup_success_progress(stage, fields):
             checkpoint_signup_stage(result, stage, fields, checkpoint)
           def signup_success_failure(evidence):
             result['signup_case'] = evidence
             checkpoint()
           handlers = {profile: lambda: run_issue7_signup_success_profile(
-              Client(), key, identifier, container, client, IMAGE,
+              Client(), signup_key, signup_identifier, container, client, IMAGE,
               signup_success_progress,
               lambda evidence: checkpoint_signup_stage(
                   result, 'complete', evidence, checkpoint),

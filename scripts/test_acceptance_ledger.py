@@ -36,8 +36,32 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('actual Keycloak/UserProvider/JPA runtime behavior remains unqualified', readme)
     self.assertIn('bounded last-confirmed signup progress', readme)
     self.assertIn('status alone never selects a gate', readme)
-    self.assertIn('348 tests passed', readme)
+    self.assertIn('349 tests passed', readme)
     self.assertIn('same handle-derived request ID', readme)
+
+  def test_issue7_ordinary_signup_failure_provenance_is_reconciled(self):
+    readme = README.read_text()
+    recovery = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
+    boundary = (README.parent / 'docs/acceptance/issue-7-safe-retry-boundary.md').read_text()
+    for provenance in (
+        '24f36d843774997193faee6cfe8f1ab9902ff93c',
+        'baa747716f0e050e2a18e4089b701dccc7a9acf9b84ce99776eb8cbdeebea0ed',
+        'fc83bfb91d11555f6be59f7aa4700ba4d0617137c7287fb1d3f111dfea5aacd2',
+        'sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669'):
+      self.assertIn(provenance, readme)
+      self.assertIn(provenance, recovery)
+    for text in (readme, recovery, boundary):
+      self.assertIn('account_readback', text)
+    self.assertIn('fresh authorization', readme)
+    self.assertIn('fresh explicit authorization', recovery)
+    self.assertIn('fresh explicit authorization', boundary)
+    self.assertIn('signup intent HTTP 200', readme)
+    self.assertIn('before proof', readme)
+    self.assertIn('before proof', boundary)
+    self.assertIn('no pass is claimed', recovery)
+    self.assertIn('profile wiring gap', readme)
+    self.assertIn('distinct fresh Identity', readme)
+    self.assertEqual(2, readme.count('349 tests passed'))
 
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
     text = README.read_text()

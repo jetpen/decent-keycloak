@@ -8,6 +8,31 @@ Real Keycloak HTTP, selected runtime SPI, wallet/browser and production-provider
 remain unqualified. Neither passing scripted HTTP tests nor an SPI JAR proves runtime qualification.
 Multi-node integration and distributed provisioning/replay guarantees are out of scope.
 
+## Ordinary signup attempt and correction boundary
+
+Exactly one authorized `issue7-signup-success` runtime attempt was consumed on 2026-10-26. It
+used source `24f36d843774997193faee6cfe8f1ab9902ff93c`, harness SHA-256
+`baa747716f0e050e2a18e4089b701dccc7a9acf9b84ce99776eb8cbdeebea0ed`, image ID
+`fc83bfb91d11555f6be59f7aa4700ba4d0617137c7287fb1d3f111dfea5aacd2`, image digest
+`sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669`, and one
+Keycloak 26.8.0 node (dev-file/local cache). It exited 1 at `account_readback`, with
+`stage=intent`, `failure_stage=account_readback`, `failure_gate=account_readback`,
+`failure_category=assertion_failed`, and provider operation witness unavailable. The signup
+intent POST returned HTTP 200. This failed before proof POST, accepted transaction/consume,
+callback, replay, or PKCE; no selected-provider witness was reached and no pass is claimed.
+
+Offline source tracing attributes this attempt's account-readback failure to profile wiring, not
+an established production-path defect: `main()` used the first Identity both to provision the
+realm through `configure_realm` and to dispatch the success profile, while the real
+`signup_wallet_flow` requires no exact mapped account before fresh signup proof. This candidate
+keeps the first Identity for realm setup and other profiles, then publishes and passes a distinct
+fresh Identity only for `issue7-signup-success`. It is corrected harness wiring, not a live-verified
+fix; it does not change production Java behavior or acceptance criteria. The failure belongs to
+the source snapshot above and remains a failed, consumed attempt. Cleanup was verified against
+pre/post inventories: run-owned containers/networks/volumes/listeners/CID dirs/temp dirs were
+reconciled, run-owned containers and the image were absent afterward, and no run CID or
+credential scratch file remained. Do not retry without fresh explicit authorization.
+
 ## Preserved ordering and residual states
 
 Failure-checkpoint diagnostics now preserve `last_confirmed_phase` separately from the coordinator's `faulted_signup` stage. The three store profiles and three UserProvider readback profiles project `fixture_factory_witness`, `fixture_operation_witness`, and `fixture_mutation_outcome` only from exact markers in the bounded per-run Keycloak log window. The factory-create witness records only run-scoped factory creation; it is never a selection claim. Both store and UserProvider request-level operation, fault, and outcome markers include the allowlisted wrapper ID, exact operation, and same handle-derived request ID. Readback correlation is bridged to the synchronous interception seam through a nested-restoring request-scoped context cleared/restored on scope close. A unique exact operation witness is required for attribution; delegate identity is not claimed. Provider registration/enumeration and factory creation alone never prove a particular transaction used the fixture. Missing/unreadable, duplicate, malformed, wrong-request, wrong-provider, wrong-operation, conflicting, or unknown markers fail closed for the request-level witness. No raw log, request ID, locator, identity, subject, exception, proof, token, or secret is serialized. This remains fixture-backed offline orchestration/parser evidence—not runtime provider qualification; Issue #7 remains OPEN.
