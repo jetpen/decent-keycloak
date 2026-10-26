@@ -24,32 +24,67 @@ ROOT = Path(__file__).parents[1]
 
 
 class UserReadbackProfileTest(unittest.TestCase):
+  def test_readback_witness_rejects_wrong_request_provider_operation_and_noisy_markers(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    operation = (f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault '
+        f'operation=post_create_exact_attribute_read request={request_id}')
+    fault = (f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault '
+        f'operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}')
+    outcome = (f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault '
+        f'operation=post_create_exact_attribute_read empty request={request_id}')
+    production = (f'Wallet account mapping lookup unavailable (request={request_id}, '
+        'IdentityMappingUnavailableException)')
+    prelude = ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
+        'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty\n')
+    exact = '\n'.join((prelude.rstrip(), operation, fault, outcome, production))
+    unavailable = {'fixture_factory_witness': 'unavailable',
+        'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
+    self.assertEqual('observed', probe.user_readback_fixture_witness(
+        exact, 'empty', request_id)['fixture_operation_witness'])
+    repeated_create = exact.replace('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n',
+        'ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n' * 3)
+    self.assertEqual('observed', probe.user_readback_fixture_witness(
+        repeated_create, 'empty', request_id)['fixture_operation_witness'])
+    variants = (
+        exact.replace(request_id, 'f' * 32),
+        exact.replace('provider=issue7-user-readback-fault', 'provider=unknown'),
+        exact.replace('operation=post_create_exact_attribute_read', 'operation=other'),
+        '\n'.join((prelude.rstrip(), fault, outcome, production)),
+        exact + '\n' + operation,
+        exact.replace(operation, operation + ' malformed'),
+        exact + '\nISSUE7_USER_READBACK_UNKNOWN: unexpected',
+    )
+    for logs in variants:
+      with self.subTest(logs=logs):
+        self.assertEqual(unavailable,
+            probe.user_readback_fixture_witness(logs, 'empty', request_id))
+
   def test_readback_fixture_witness_requires_unique_selection_operation_and_outcome_markers(self):
     request_id = '1234567890abcdef1234567890abcdef'
     for mode in ('empty', 'throw', 'over-cap'):
       logs = '\n'.join((
           'ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
           f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}',
-          'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read',
-          'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted',
-          f'ISSUE7_USER_READBACK_OUTCOME: {mode}',
+          f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read request={request_id}',
+          f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}',
+          f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read {mode} request={request_id}',
           f'Wallet account mapping lookup unavailable (request={request_id}, IdentityMappingUnavailableException)'))
       with self.subTest(mode=mode):
         self.assertEqual({'fixture_factory_witness': 'observed',
             'fixture_operation_witness': 'observed',
-            'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode},
+            'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode,
+            'fixture_selected_provider_id': 'issue7-user-readback-fault',
+            'fixture_operation': 'post_create_exact_attribute_read'},
             probe.user_readback_fixture_witness(logs, mode, request_id))
 
     unavailable = {'fixture_factory_witness': 'unavailable',
         'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
     for logs, expected in ((None, unavailable), ('', unavailable), (OSError('unreadable'), unavailable),
-        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
-            {**unavailable, 'fixture_factory_witness': 'observed'}),
+        ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked', unavailable),
         ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
             'ISSUE7_USER_READBACK_PROVIDER: factory create invoked', unavailable),
         ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
-            'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty',
-            {**unavailable, 'fixture_factory_witness': 'observed'}),
+            'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty', unavailable),
         ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
             'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty\n'
             'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read\n'
@@ -619,6 +654,131 @@ class UserReadbackProfileTest(unittest.TestCase):
         self.assertNotIn('transaction_consume_witness', unavailable)
         self.assertNotIn('transaction_consume_provider_id', unavailable)
 
+  def test_production_main_fault_checkpoint_retains_readback_witness_after_later_status_failure(self):
+    profile = 'issue7-user-readback-empty'
+    locator = ('https://idp.example:' + str(probe.KC_PORT) + '/auth/realms/'
+        + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'A' * 43)
+    request_id = hashlib.sha256(('A' * 43).encode('ascii')).hexdigest()[:32]
+    status_url = ('/auth/realms/' + probe.REALM
+        + '/decent-wallet-login/v1/transactions/status')
+    callback_query = urllib.parse.urlencode({'session_code': 'secret-session',
+        'execution': 'secret-execution', 'client_id': 'secret-client',
+        'tab_id': 'secret-tab', 'client_data': 'secret-client-data'})
+
+    class ScriptedClient:
+      def __init__(self, browser):
+        self.browser = browser
+        self.redirects = []
+        self.privateClientAdminCredential = '[REDACTED]'
+        self.wallet_container_id = None
+        self.requests = []
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        self.requests.append((method, path))
+        parsed = urllib.parse.urlsplit(path)
+        if self.browser and method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          html = (f'<p id="wallet-locator">{locator}</p><form method="post" '
+              f'action="/auth/realms/{probe.REALM}/login-actions/authenticate?{callback_query}">'
+              '<input type="hidden" name="wallet_intent" value="signup"></form>')
+          return 200, {}, html.encode()
+        if self.browser and method == 'POST' and 'login-actions/authenticate?' in path:
+          html = (f'<p id="wallet-locator">{locator}</p>'
+              f'<script>const statusUrl = "{status_url}"; const csrfToken = "{"A" * 43}";</script>'
+              'Creating a new account with this wallet identity.')
+          return 200, {}, html.encode()
+        if not self.browser and method == 'GET' and path == locator:
+          return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+              'challenge': 'private-challenge', 'csrf_token': 'A' * 43}).encode()
+        if not self.browser and method == 'POST' and path == locator:
+          return 503, {}, b''
+        if self.browser and method == 'GET' and path == status_url:
+          # A status response that is not pending fails after readback progress.
+          return 200, {}, b'{"status":"accepted"}'
+        raise AssertionError((method, path))
+
+    browser, wallet = ScriptedClient(True), ScriptedClient(False)
+    identifier, subject = 'private-identity', 'private-subject'
+    user = {'attributes': {'decent_identity_id': [identifier]},
+        'enabled': True, 'id': subject}
+    admin = Mock(wallet_container_id='a' * 64)
+    checkpoints = []
+    original_write_text = Path.write_text
+    def capture(path, data, *args, **kwargs):
+      if path.name == 'live-evidence.json':
+        checkpoints.append(json.loads(data))
+      return original_write_text(path, data, *args, **kwargs)
+    fault_window = '\n'.join((
+        'ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
+        'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty',
+        f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read request={request_id}',
+        f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}',
+        f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read empty request={request_id}',
+        f'Wallet account mapping lookup unavailable (request={request_id}, IdentityMappingUnavailableException)'))
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      key_path = Path(scratch) / 'identity.pem'
+      stack.enter_context(patch.object(probe, 'SCRATCH', scratch))
+      stack.enter_context(patch.object(probe, 'RUN_CID_DIR', None))
+      stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE': profile,
+          'WALLET_IT_USER_READBACK_IMAGE': 'test-image'}, clear=False))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('test-image', 'sha256:' + 'a' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
+      stack.enter_context(patch.object(probe, 'start_registry',
+          return_value=('registry', 'bootstrap', 1234)))
+      stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
+      stack.enter_context(patch.object(probe, 'write_identity',
+          return_value=(key_path, Path(scratch) / 'wrapper', identifier)))
+      stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='[REDACTED]'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
+          'runtime_qualification_status': 'runtime_facts_verified',
+          'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
+      stack.enter_context(patch.object(probe, 'configure_realm'))
+      stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
+      admin_call = stack.enter_context(patch.object(probe, 'admin_call', side_effect=[
+          (200, {}, b'[]'), (200, {}, json.dumps([user]).encode()),
+          (200, {}, json.dumps([user]).encode())]))
+      stack.enter_context(patch.object(probe, 'Client', side_effect=[browser, wallet]))
+      stack.enter_context(patch.object(probe.subprocess, 'run',
+          return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
+      log_window = stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
+          return_value=fault_window))
+      stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
+      stack.enter_context(patch.object(probe, 'cleanup_after_failure'))
+      stack.enter_context(patch.object(Path, 'write_text', autospec=True,
+          side_effect=capture))
+      signup = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
+          wraps=probe.signup_wallet_flow))
+      dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
+          wraps=probe.dispatch_live_profile))
+      printed = stack.enter_context(patch('builtins.print'))
+      with self.assertRaises(RuntimeError):
+        probe.main()
+
+    self.assertEqual(1, signup.call_count)
+    self.assertEqual(1, dispatcher.call_count)
+    self.assertEqual(profile, dispatcher.call_args.args[0])
+    self.assertEqual(1, log_window.call_count)
+    self.assertEqual(2, admin_call.call_count)
+    self.assertEqual(['GET', 'POST', 'GET'], [method for method, _ in browser.requests])
+    self.assertEqual(['GET', 'POST'], [method for method, _ in wallet.requests])
+    final = checkpoints[-1]['issue7_single_node_signup_recovery']
+    self.assertEqual('faulted_signup', final['stage'])
+    self.assertEqual('signup_proof', final['failure_stage'])
+    self.assertEqual('proof_status', final['failure_gate'])
+    self.assertEqual('assertion_failed', final['failure_category'])
+    self.assertEqual(200, final['failure_http_status'])
+    self.assertEqual('observed', final['fixture_factory_witness'])
+    self.assertEqual('observed', final['fixture_operation_witness'])
+    self.assertEqual('empty', final['fixture_mutation_outcome'])
+    self.assertEqual('issue7-user-readback-fault', final['fixture_selected_provider_id'])
+    self.assertEqual('post_create_exact_attribute_read', final['fixture_operation'])
+    serialized = json.dumps(checkpoints) + repr(printed.call_args_list)
+    for forbidden in (identifier, subject, 'private-challenge', locator, request_id,
+        'IdentityMappingUnavailableException', 'secret-session', 'secret-client-data',
+        'client_data=', 'session_code='):
+      self.assertNotIn(forbidden, serialized)
+
   def test_production_main_runs_real_readback_failure_and_fresh_signup_for_each_mode(self):
     profiles = {
         'issue7-user-readback-empty': 'empty',
@@ -725,9 +885,9 @@ class UserReadbackProfileTest(unittest.TestCase):
         fault_window = chr(10).join((
             'ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
             f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}',
-            'ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read',
-            'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted',
-            f'ISSUE7_USER_READBACK_OUTCOME: {mode}',
+            f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read request={request_id}',
+            f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}',
+            f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read {mode} request={request_id}',
             f'Wallet account mapping lookup unavailable (request={request_id}, '
                 'IdentityMappingUnavailableException)'))
         checkpoints = []
@@ -818,6 +978,8 @@ class UserReadbackProfileTest(unittest.TestCase):
         self.assertEqual('observed', evidence['fixture_operation_witness'])
         self.assertEqual('over_cap' if mode == 'over-cap' else mode,
             evidence['fixture_mutation_outcome'])
+        self.assertEqual('issue7-user-readback-fault', evidence['fixture_selected_provider_id'])
+        self.assertEqual('post_create_exact_attribute_read', evidence['fixture_operation'])
         self.assertEqual('wrapper-mediated-application-path', evidence['fault_evidence_provenance'])
         self.assertTrue(evidence['same_local_subject'])
         self.assertTrue(evidence['account_retained_after_failure'])
@@ -905,7 +1067,8 @@ class UserReadbackProfileTest(unittest.TestCase):
     logs = (
         'ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
         'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty\n'
-        'ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted\n'
+        'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request='
+        + request_id + '\n'
         f'Wallet account mapping lookup unavailable (request={request_id}, IdentityMappingUnavailableException)\n'
         'private-identity wallet-handle callback-code')
     diagnostics = probe.sanitize_user_readback_fault_diagnostics(logs, request_id)

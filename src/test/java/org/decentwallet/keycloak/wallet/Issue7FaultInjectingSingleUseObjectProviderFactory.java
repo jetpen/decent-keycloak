@@ -55,9 +55,9 @@ public final class Issue7FaultInjectingSingleUseObjectProviderFactory
         Map<String, String> removed = delegate.remove(key);
         if (removed != null && mode.equals("consume-loss") && key.startsWith(TRANSACTION)) {
           String requestId = requestCorrelationId(key.substring(TRANSACTION.length()));
-          System.err.println("ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request=" + requestId);
+          System.err.println("ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request=" + requestId);
           if (claim()) {
-            System.err.println("ISSUE7_TEST_FAULT: pending consume committed then threw request=" + requestId);
+            System.err.println("ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=transaction_remove pending consume committed then threw request=" + requestId);
             throw new IllegalStateException("test-only post-consume fault");
           }
         }
@@ -68,14 +68,14 @@ public final class Issue7FaultInjectingSingleUseObjectProviderFactory
         boolean acceptance = key.startsWith(ACCEPTED) && "accepted".equals(notes.get("status"));
         String requestId = acceptance ? requestCorrelationId(key.substring(ACCEPTED.length())) : null;
         if (acceptance) System.err.println(
-            "ISSUE7_TEST_PROVIDER_OPERATION: operation=accepted_replace request=" + requestId);
+            "ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=accepted_replace request=" + requestId);
         if (acceptance && mode.equals("accepted-receipt-write-false") && claim()) {
-          System.err.println("ISSUE7_TEST_FAULT: accepted receipt write returned false before commit request=" + requestId);
+          System.err.println("ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=accepted_replace accepted receipt write returned false before commit request=" + requestId);
           return false;
         }
         boolean committed = delegate.replace(key, notes);
         if (committed && acceptance && mode.equals("accepted-receipt-write") && claim()) {
-          System.err.println("ISSUE7_TEST_FAULT: accepted receipt write committed then threw request=" + requestId);
+          System.err.println("ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=accepted_replace accepted receipt write committed then threw request=" + requestId);
           throw new IllegalStateException("test-only accepted receipt postwrite fault");
         }
         return committed;

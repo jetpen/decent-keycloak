@@ -192,20 +192,36 @@ class StoreRecoveryTest(unittest.TestCase):
     request_id = '1234567890abcdef1234567890abcdef'
     other_id = 'f' * 32
     mode = 'consume-loss'
-    provider = f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={request_id}'
-    fault = f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}'
+    provider = f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request={request_id}'
+    fault = f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=transaction_remove {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}'
     production = f'Wallet pending transaction unavailable (request={request_id}, reason=consume-unavailable)'
     observed = probe.issue7_store_recovery.diagnostics('\n'.join((provider, fault, production)), mode, request_id)
     self.assertEqual({'store_fault_count': 1, 'correlated_store_failure_count': 1,
         'store_provider_selected': True}, observed)
 
     unrelated = '\n'.join((
-        f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={other_id}',
+        f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request={other_id}',
         f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={other_id}',
         production))
     self.assertEqual({'store_fault_count': 0, 'correlated_store_failure_count': 1,
         'store_provider_selected': False},
         probe.issue7_store_recovery.diagnostics(unrelated, mode, request_id))
+    for noise in ('ISSUE7_TEST_PROVIDER_OPERATION: provider=unknown operation=transaction_remove request=' + request_id,
+        'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request=' + request_id,
+        'ISSUE7_TEST_FAULT: provider=unknown operation=transaction_remove pending consume committed then threw request=' + request_id):
+      with self.subTest(noise=noise):
+        self.assertFalse(probe.issue7_store_recovery.diagnostics(
+            '\n'.join((provider, fault, noise, production)), mode, request_id)['store_provider_selected'])
+    for invalid_provider, invalid_operation in (
+        ('unknown', 'transaction_remove'),
+        ('issue7-fault-injection', 'accepted_replace')):
+      bad = '\n'.join((
+          f'ISSUE7_TEST_PROVIDER_OPERATION: provider={invalid_provider} operation={invalid_operation} request={request_id}',
+          f'ISSUE7_TEST_FAULT: provider={invalid_provider} operation={invalid_operation} {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}',
+          production))
+      with self.subTest(provider=invalid_provider, operation=invalid_operation):
+        self.assertEqual(False, probe.issue7_store_recovery.diagnostics(
+            bad, mode, request_id)['store_provider_selected'])
 
   def test_diagnostics_do_not_accept_factory_or_unrelated_marker_only_evidence(self):
     request_id = '1234567890abcdef1234567890abcdef'
@@ -220,30 +236,49 @@ class StoreRecoveryTest(unittest.TestCase):
   def test_fixture_witness_projection_distinguishes_selected_reached_and_outcome(self):
     request_id = '1234567890abcdef1234567890abcdef'
     logs = (f'ISSUE7_TEST_PROVIDER: factory create invoked\n'
-        f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={request_id}\n'
-        f'ISSUE7_TEST_FAULT: pending consume committed then threw request={request_id}')
+        f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request={request_id}\n'
+        f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=transaction_remove pending consume committed then threw request={request_id}')
     result = probe.issue7_store_recovery.fixture_witness(logs, 'consume-loss', request_id)
     self.assertEqual({'fixture_factory_witness': 'observed',
         'fixture_operation_witness': 'observed',
-        'fixture_mutation_outcome': 'committed_then_threw'}, result)
+        'fixture_mutation_outcome': 'committed_then_threw',
+        'fixture_selected_provider_id': 'issue7-fault-injection',
+        'fixture_operation': 'transaction_remove'}, result)
+
+  def test_fixture_create_markers_are_run_scoped_not_a_unique_selection_signal(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    logs = ('ISSUE7_TEST_PROVIDER: factory create invoked\n' * 3
+        + f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request={request_id}\n'
+        + f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=transaction_remove pending consume committed then threw request={request_id}')
+    result = probe.issue7_store_recovery.fixture_witness(logs, 'consume-loss', request_id)
+    self.assertEqual('observed', result['fixture_factory_witness'])
+    self.assertEqual('observed', result['fixture_operation_witness'])
+    self.assertEqual('issue7-fault-injection', result['fixture_selected_provider_id'])
 
   def test_fixture_witness_fails_closed_for_missing_duplicate_unrelated_and_unknown_markers(self):
     request_id = '1234567890abcdef1234567890abcdef'
     selected_only = 'ISSUE7_TEST_PROVIDER: factory create invoked'
-    operation = f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={request_id}'
-    fault = f'ISSUE7_TEST_FAULT: pending consume committed then threw request={request_id}'
+    operation = f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request={request_id}'
+    fault = f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=transaction_remove pending consume committed then threw request={request_id}'
     unavailable = {'fixture_factory_witness': 'unavailable',
         'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
     for logs, expected in (('', unavailable),
         (selected_only, {**unavailable, 'fixture_factory_witness': 'observed'}),
-        (selected_only + '\n' + selected_only, unavailable),
+        (selected_only + '\n' + selected_only, {**unavailable, 'fixture_factory_witness': 'observed'}),
         (selected_only + '\n' + operation + '\n' + operation + '\n' + fault, unavailable),
         (selected_only + '\n' + operation,
             {**unavailable, 'fixture_factory_witness': 'observed',
                 'fixture_operation_witness': 'observed'}),
-        (f'ISSUE7_TEST_PROVIDER_OPERATION: operation=transaction_remove request={"f"*32}\n'
-            + f'ISSUE7_TEST_FAULT: pending consume committed then threw request={"f"*32}',
-            unavailable), (selected_only + '\nISSUE7_TEST_UNKNOWN: unexplained', unavailable)):
+        (f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation=transaction_remove request={"f"*32}\n'
+            + f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation=transaction_remove pending consume committed then threw request={"f"*32}',
+            unavailable),
+        (selected_only + '\n' + operation.replace('provider=issue7-fault-injection', 'provider=unknown')
+            + '\n' + fault, unavailable),
+        (selected_only + '\n' + operation.replace('transaction_remove', 'accepted_replace')
+            + '\n' + fault, unavailable),
+        (selected_only + '\n' + operation + ' malformed\n' + fault, unavailable),
+        (selected_only + '\n' + operation + '\n' + fault + ' malformed', unavailable),
+        (selected_only + '\nISSUE7_TEST_UNKNOWN: unexplained', unavailable)):
       with self.subTest(logs=logs):
         self.assertEqual(expected,
             probe.issue7_store_recovery.fixture_witness(logs, 'consume-loss', request_id))
@@ -308,8 +343,8 @@ class FailureFlowTest(unittest.TestCase):
           if mode == 'consume-loss' else
           f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)')
       logs = '\n'.join((probe.issue7_store_recovery.FACTORY_CREATE_MARKER,
-          f'ISSUE7_TEST_PROVIDER_OPERATION: operation={"transaction_remove" if mode == "consume-loss" else "accepted_replace"} request={request_id}',
-          f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}',
+          f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation={"transaction_remove" if mode == "consume-loss" else "accepted_replace"} request={request_id}',
+          f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation={"transaction_remove" if mode == "consume-loss" else "accepted_replace"} {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}',
           branch))
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
       stack.enter_context(patch.object(probe, 'Client', return_value=wallet))
@@ -353,7 +388,9 @@ class FailureFlowTest(unittest.TestCase):
         'correlated_store_failure_count': 1,
         'fixture_factory_witness': 'observed',
         'fixture_operation_witness': 'observed',
-        'fixture_mutation_outcome': 'committed_then_threw'}, diagnostics)
+        'fixture_mutation_outcome': 'committed_then_threw',
+        'fixture_selected_provider_id': 'issue7-fault-injection',
+        'fixture_operation': 'transaction_remove'}, diagnostics)
     sanitized = probe.sanitize_live_checkpoint({'issue7_store_recovery': {
         'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
         'store_fault_mode': 'consume-loss', **diagnostics}})
@@ -365,7 +402,9 @@ class FailureFlowTest(unittest.TestCase):
         'correlated_store_failure_count': 1,
         'fixture_factory_witness': 'observed',
         'fixture_operation_witness': 'observed',
-        'fixture_mutation_outcome': 'committed_then_threw'}, sanitized['issue7_store_recovery'])
+        'fixture_mutation_outcome': 'committed_then_threw',
+        'fixture_selected_provider_id': 'issue7-fault-injection',
+        'fixture_operation': 'transaction_remove'}, sanitized['issue7_store_recovery'])
     self.assertNotIn('private transport detail', json.dumps(sanitized))
 
   def test_proof_http_contract_failure_is_classified(self):
@@ -505,7 +544,9 @@ class MainCoordinatorTest(unittest.TestCase):
         'failure_responses_no_callback_or_code': True, 'account_retained_after_failure': True,
         'exact_mapped_users': 1, 'expected_existing_subject': 'retained-subject',
         'prior_locator': 'private-old-locator', 'store_fault_count': 1,
-        'store_provider_selected': True, 'correlated_store_failure_count': 1}
+        'store_provider_selected': True, 'correlated_store_failure_count': 1,
+        'fixture_operation_witness': 'observed',
+        'fixture_selected_provider_id': 'issue7-fault-injection'}
     recovered = {'signup_proof_http': 202, 'proof_post_http': 202, 'exact_mapped_users': 1,
         'local_subject': 'retained-subject', 'local_subject_matches_expected': True,
         'callback_http': 302, 'pkce_token_http': 200,
@@ -810,6 +851,35 @@ class MainCoordinatorTest(unittest.TestCase):
         'recovery_intent': 'signup', 'retry_http': 404, 'store_fault_count': 1,
         'correlated_store_failure_count': 1, 'account_retained_after_failure': True}}, safe)
 
+  def test_store_and_readback_fixture_allowlists_remain_distinct(self):
+    recovery = probe.issue7_store_recovery
+    store_values = {
+        'fixture_selected_provider_id': 'issue7-fault-injection',
+        'fixture_operation': 'transaction_remove',
+        'fixture_mutation_outcome': 'committed_then_threw'}
+    self.assertEqual(store_values, recovery.sanitize(store_values))
+    self.assertNotIn('fixture_selected_provider_id', recovery.sanitize({
+        'fixture_selected_provider_id': 'issue7-user-readback-fault'}))
+    self.assertNotIn('fixture_operation', recovery.sanitize({
+        'fixture_operation': 'post_create_exact_attribute_read'}))
+    self.assertEqual({'fixture_mutation_outcome': 'returned_false_before_commit'},
+        recovery.sanitize({'fixture_mutation_outcome': 'returned_false_before_commit'}))
+
+    readback = {
+        'fixture_selected_provider_id': 'issue7-user-readback-fault',
+        'fixture_operation': 'post_create_exact_attribute_read',
+        'fixture_mutation_outcome': 'over_cap'}
+    self.assertEqual(readback, probe.sanitize_live_checkpoint(
+        {'issue7_single_node_signup_recovery': readback})[
+            'issue7_single_node_signup_recovery'])
+    readback_rejects_store_only = {
+        'fixture_selected_provider_id': 'issue7-fault-injection',
+        'fixture_operation': 'transaction_remove',
+        'fixture_mutation_outcome': 'committed_then_threw'}
+    self.assertEqual({}, probe.sanitize_live_checkpoint(
+        {'issue7_single_node_signup_recovery': readback_rejects_store_only}).get(
+            'issue7_single_node_signup_recovery', {}))
+
   def test_readback_failure_metadata_survives_both_checkpoint_projectors(self):
     issue7 = {'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
         'failure_stage': 'user_readback', 'failure_gate': 'account_readback',
@@ -1060,8 +1130,8 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
         operation='transaction_remove' if mode=='consume-loss' else 'accepted_replace'
         production=(f'Wallet pending transaction unavailable (request={request_id}, reason=consume-unavailable)'
             if mode=='consume-loss' else f'Wallet proof acceptance unavailable (request={request_id}, outcome=not_accepted)')
-        logs=(f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} request={request_id}\n'
-            f'ISSUE7_TEST_FAULT: {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}\n'+production)
+        logs=(f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation={operation} request={request_id}\n'
+            f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation={operation} {probe.issue7_store_recovery.MARKERS[mode]} request={request_id}\n'+production)
         logs='ISSUE7_TEST_PROVIDER: factory create invoked'+chr(10)+logs
         admin=Mock(wallet_container_id='a'*64)
         with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
@@ -1132,6 +1202,9 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
           self.assertEqual('observed', safe['fixture_factory_witness'])
           self.assertEqual('observed', safe['fixture_operation_witness'])
           self.assertEqual('committed_then_threw', safe['fixture_mutation_outcome'])
+          self.assertEqual('issue7-fault-injection', safe['fixture_selected_provider_id'])
+          self.assertEqual('transaction_remove' if mode == 'consume-loss' else 'accepted_replace',
+              safe['fixture_operation'])
           self.assertEqual(1, safe['correlated_store_failure_count'])
           self.assertEqual(1, sum(event.endswith(':proof') for event in events))
           self.assertFalse(any(':auth' in event or ':callback' in event or ':token' in event
@@ -1151,6 +1224,9 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
         self.assertEqual('returned_false_before_commit' if mode == 'accepted-receipt-write-false'
             else 'committed_then_threw', safe['fixture_mutation_outcome'])
         self.assertTrue(safe['store_provider_selected']); self.assertTrue(safe['same_local_subject'])
+        self.assertEqual('issue7-fault-injection', safe['fixture_selected_provider_id'])
+        self.assertEqual('transaction_remove' if mode == 'consume-loss' else 'accepted_replace',
+            safe['fixture_operation'])
         self.assertEqual(503,safe['signup_proof_http'])
         self.assertEqual(404,safe['browser_status_http']); self.assertEqual(404,safe['retry_http'])
         self.assertTrue(safe['failure_responses_no_callback_or_code'])

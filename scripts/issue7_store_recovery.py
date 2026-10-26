@@ -30,6 +30,22 @@ FAILURE_CATEGORIES = {'runtime_error', 'assertion_failed'}
 CONFIRMED_PHASES = frozenset({'intent', 'proof', 'account', 'callback', 'token'})
 FACTORY_CREATE_MARKER = 'ISSUE7_TEST_PROVIDER: factory create invoked'
 SIGNUP_PROOF_HTTP_GATES = {'proof_http_status'}
+# Canonical Issue #7 fixture allowlists. Keep each profile's narrower contract
+# explicit here; in particular, readback evidence is not the store union.
+ISSUE7_STORE_FIXTURE_PROVIDER_IDS = frozenset({'issue7-fault-injection'})
+ISSUE7_USER_READBACK_FIXTURE_PROVIDER_IDS = frozenset({'issue7-user-readback-fault'})
+ISSUE7_FIXTURE_PROVIDER_IDS = (ISSUE7_STORE_FIXTURE_PROVIDER_IDS
+    | ISSUE7_USER_READBACK_FIXTURE_PROVIDER_IDS)
+ISSUE7_STORE_FIXTURE_OPERATIONS = frozenset({'transaction_remove', 'accepted_replace'})
+ISSUE7_USER_READBACK_FIXTURE_OPERATIONS = frozenset({'post_create_exact_attribute_read'})
+ISSUE7_FIXTURE_OPERATIONS = (ISSUE7_STORE_FIXTURE_OPERATIONS
+    | ISSUE7_USER_READBACK_FIXTURE_OPERATIONS)
+ISSUE7_USER_READBACK_FIXTURE_MUTATION_OUTCOMES = frozenset({
+    'unavailable', 'empty', 'throw', 'over_cap'})
+ISSUE7_STORE_FIXTURE_MUTATION_OUTCOMES = (
+    ISSUE7_USER_READBACK_FIXTURE_MUTATION_OUTCOMES
+    | frozenset({'committed_then_threw', 'returned_false_before_commit'}))
+ISSUE7_FIXTURE_MUTATION_OUTCOMES = ISSUE7_STORE_FIXTURE_MUTATION_OUTCOMES
 FAILURE_CONTEXTS = {
     'post-create UserProvider readback fault returns empty 503 without redirect, callback, or code':
         ('signup_proof', 'proof_http_status'),
@@ -65,11 +81,16 @@ def checkpoint_signup_failure(checkpoint, failure, *, mode_field, mode):
       count = diagnostics.get(field)
       if type(count) is int and 0 <= count <= 5:
         evidence[field] = count
-    for field in ('fixture_factory_witness', 'fixture_operation_witness',
-        'fixture_mutation_outcome'):
+    allowed_fixture_values = {
+        'fixture_factory_witness': {'observed', 'unavailable'},
+        'fixture_operation_witness': {'observed', 'unavailable'},
+        'fixture_mutation_outcome': ISSUE7_STORE_FIXTURE_MUTATION_OUTCOMES,
+        'fixture_selected_provider_id': ISSUE7_STORE_FIXTURE_PROVIDER_IDS,
+        'fixture_operation': ISSUE7_STORE_FIXTURE_OPERATIONS,
+    }
+    for field, allowed in allowed_fixture_values.items():
       value = diagnostics.get(field)
-      if value in {'observed', 'unavailable', 'committed_then_threw',
-          'returned_false_before_commit', 'empty', 'throw', 'over_cap'}:
+      if value in allowed:
         evidence[field] = value
   try:
     checkpoint(evidence)
@@ -85,13 +106,20 @@ def diagnostics(logs, mode, request_id):
       + ', reason=consume-unavailable)' if mode == 'consume-loss' else
       'Wallet proof acceptance unavailable (request=' + request_id + ', outcome=not_accepted)')
   operation = 'transaction_remove' if mode == 'consume-loss' else 'accepted_replace'
-  provider_witness = (f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} '
+  provider_witness = (f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection '
+      f'operation={operation} '
       f'request={request_id}')
-  fault_witness = f'ISSUE7_TEST_FAULT: {MARKERS[mode]} request={request_id}'
+  fault_witness = (f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection '
+      f'operation={operation} {MARKERS[mode]} request={request_id}')
+  marker_lines = [line for line in logs.splitlines() if line.startswith('ISSUE7_')]
+  exact_marker_lines = {FACTORY_CREATE_MARKER, provider_witness, fault_witness}
+  selection_is_unambiguous = (logs.count(provider_witness) == 1
+      and all(line in exact_marker_lines for line in marker_lines)
+      and all(marker_lines.count(line) == 1 for line in {provider_witness, fault_witness}))
   return {
       'store_fault_count': min(5, logs.count(fault_witness)),
       'correlated_store_failure_count': min(5, logs.count(cause)),
-      'store_provider_selected': logs.count(provider_witness) == 1,
+      'store_provider_selected': selection_is_unambiguous,
   }
 
 
@@ -125,15 +153,17 @@ def fixture_witness(logs, mode, request_id):
   recognized = ('ISSUE7_TEST_PROVIDER:', 'ISSUE7_TEST_PROVIDER_OPERATION:', 'ISSUE7_TEST_FAULT:')
   lines = [line for line in logs.splitlines() if 'ISSUE7_' in line]
   selected = 'ISSUE7_TEST_PROVIDER: factory create invoked'
-  op_line = f'ISSUE7_TEST_PROVIDER_OPERATION: operation={operation} request={request_id}'
-  fault_line = f'ISSUE7_TEST_FAULT: {expected_fault} request={request_id}'
+  op_line = (f'ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection '
+      f'operation={operation} request={request_id}')
+  fault_line = (f'ISSUE7_TEST_FAULT: provider=issue7-fault-injection '
+      f'operation={operation} {expected_fault} request={request_id}')
   # Unknown/malformed fixture markers make the window ambiguous, not partial evidence.
   if any(not line.startswith(recognized) or line not in {selected, op_line, fault_line}
       for line in lines):
     return unavailable
-  if any(lines.count(line) > 1 for line in {selected, op_line, fault_line}) or lines.count(selected) != 1:
+  if any(lines.count(line) > 1 for line in {op_line, fault_line}):
     return unavailable
-  selection = 'observed'
+  selection = 'observed' if selected in lines else 'unavailable'
   if lines.count(op_line) != 1:
     return {**unavailable, 'fixture_factory_witness': selection}
   operation_reached = 'observed'
@@ -143,7 +173,9 @@ def fixture_witness(logs, mode, request_id):
   outcome = ('returned_false_before_commit' if mode == 'accepted-receipt-write-false'
       else 'committed_then_threw')
   return {'fixture_factory_witness': selection,
-      'fixture_operation_witness': 'observed', 'fixture_mutation_outcome': outcome}
+      'fixture_operation_witness': 'observed', 'fixture_mutation_outcome': outcome,
+      'fixture_selected_provider_id': 'issue7-fault-injection',
+      'fixture_operation': operation}
 
 
 def attach_failure_diagnostics(failure, api, *, container, log_cursor, mode, locator):
@@ -182,10 +214,14 @@ def failure_flow(api, *, mode, wallet, browser, locator, status_url, csrf, proof
         raw, response_headers, requester.redirects[before:]),
         'consumed transaction status and retry deny all receipt/callback/code disclosure',
         polled, failure_stage='signup_proof', failure_gate=gate, http_status=polled)
+  operation = 'transaction_remove' if mode == 'consume-loss' else 'accepted_replace'
   facts = failure_diagnostic_snapshot(api, container=container,
       log_cursor=log_cursor, mode=mode, locator=locator)
   api.require(facts['store_provider_selected'] and facts['store_fault_count'] == 1
-      and facts['correlated_store_failure_count'] >= 1,
+      and facts['correlated_store_failure_count'] >= 1
+      and facts.get('fixture_operation_witness') == 'observed'
+      and facts.get('fixture_selected_provider_id') == 'issue7-fault-injection'
+      and facts.get('fixture_operation') == operation,
       'one-shot store fixture and production failure branch correlate to this request',
       failure_stage='signup_proof', failure_gate='store_correlation')
   import json
@@ -222,6 +258,8 @@ def run(api, client, key, identifier, container, admin_client, image, progress, 
       and failed.get('signup_proof_http') == 503 and failed.get('browser_status_http') == 404
       and failed.get('retry_http') == 404 and failed.get('exact_mapped_users') == 1
       and failed.get('store_fault_count') == 1 and failed.get('store_provider_selected') is True
+      and failed.get('fixture_operation_witness') == 'observed'
+      and failed.get('fixture_selected_provider_id') == 'issue7-fault-injection'
       and failed.get('correlated_store_failure_count', 0) >= 1
       and bool(failed.get('expected_existing_subject')) and bool(failed.get('prior_locator')),
       'complete safe failed signup evidence required before recovery')
@@ -273,8 +311,9 @@ def sanitize(value):
       'last_confirmed_phase': CONFIRMED_PHASES,
       'fixture_factory_witness': {'observed', 'unavailable'},
       'fixture_operation_witness': {'observed', 'unavailable'},
-      'fixture_mutation_outcome': {'unavailable', 'committed_then_threw',
-          'returned_false_before_commit', 'empty', 'throw', 'over_cap'},
+      'fixture_mutation_outcome': ISSUE7_STORE_FIXTURE_MUTATION_OUTCOMES,
+      'fixture_selected_provider_id': ISSUE7_STORE_FIXTURE_PROVIDER_IDS,
+      'fixture_operation': ISSUE7_STORE_FIXTURE_OPERATIONS,
       'failure_stage': FAILURE_STAGES, 'failure_gate': FAILURE_GATES,
       'failure_category': FAILURE_CATEGORIES,
       'store_diagnostic_read_status': {'observed', 'unavailable'}}

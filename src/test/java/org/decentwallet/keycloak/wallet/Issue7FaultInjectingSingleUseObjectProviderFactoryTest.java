@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.util.HashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -55,6 +57,45 @@ final class Issue7FaultInjectingSingleUseObjectProviderFactoryTest {
   @Test void unsupportedModesAndMissingDelegateFailClosed() {
     assertThrows(IllegalArgumentException.class, () -> factory("concurrent-consume"));
     assertThrows(IllegalStateException.class, () -> factory("consume-loss").create(session(null)));
+  }
+
+  @Test void storeOperationAndFaultMarkersCarryWrapperOperationAndHandleCorrelation() {
+    String expected = WalletLoginTransportHandler.requestCorrelationId("exact-key");
+    ByteArrayOutputStream captured = new ByteArrayOutputStream();
+    PrintStream original = System.err;
+    try (PrintStream replacement = new PrintStream(captured)) {
+      System.setErr(replacement);
+      var delegate = new Memory();
+      var consume = factory("consume-loss").create(session(delegate));
+      consume.put(TRANSACTION, 300, Map.of("status", "pending"));
+      assertThrows(IllegalStateException.class, () -> consume.remove(TRANSACTION));
+
+      var accepted = new Memory();
+      var write = new Issue7FaultInjectingSingleUseObjectProviderFactory(
+          "accepted-receipt-write", directory.resolve("accepted-marker"))
+          .create(session(accepted));
+      write.put(ACCEPTED, 300, Map.of());
+      assertThrows(IllegalStateException.class,
+          () -> write.replace(ACCEPTED, Map.of("status", "accepted")));
+
+      var rejected = new Issue7FaultInjectingSingleUseObjectProviderFactory(
+          "accepted-receipt-write-false", directory.resolve("false-marker"))
+          .create(session(new Memory()));
+      rejected.put(ACCEPTED, 300, Map.of());
+      assertFalse(rejected.replace(ACCEPTED, Map.of("status", "accepted")));
+    } finally {
+      System.setErr(original);
+    }
+    String logs = captured.toString(java.nio.charset.StandardCharsets.UTF_8);
+    for (String operation : new String[] {"transaction_remove", "accepted_replace"}) {
+      String exactMarker = "provider=issue7-fault-injection operation=" + operation + " request=" + expected;
+      assertTrue(logs.contains("ISSUE7_TEST_PROVIDER_OPERATION: " + exactMarker));
+      assertTrue(logs.contains("ISSUE7_TEST_FAULT: " + exactMarker.substring(0,
+          exactMarker.length() - (" request=" + expected).length())));
+    }
+    assertTrue(logs.contains("pending consume committed then threw request=" + expected));
+    assertTrue(logs.contains("accepted receipt write committed then threw request=" + expected));
+    assertTrue(logs.contains("accepted receipt write returned false before commit request=" + expected));
   }
 
   private Issue7FaultInjectingSingleUseObjectProviderFactory factory(String mode) {

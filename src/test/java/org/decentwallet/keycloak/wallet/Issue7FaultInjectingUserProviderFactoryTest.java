@@ -12,6 +12,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.stream.Stream;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 
 import org.junit.jupiter.api.Test;
 import org.keycloak.credential.CredentialModel;
@@ -22,6 +24,71 @@ import org.keycloak.models.UserModel;
 import org.keycloak.models.UserProvider;
 
 class Issue7FaultInjectingUserProviderFactoryTest {
+  @Test
+  void requestCorrelationIsNestedRestoredAndClearedAndMarksExactReadback() {
+    String requestId = "1234567890abcdef1234567890abcdef";
+    assertTrue(WalletRequestCorrelation.isValidRequestId(requestId));
+    for (String invalidRequestId : new String[] {null, "", "1234567890abcdef1234567890abcde", "1234567890abcdef1234567890abcdefg",
+        "1234567890abcdef1234567890abcdeG", "1234567890abcdef1234567890abcde-"}) {
+      assertTrue(!WalletRequestCorrelation.isValidRequestId(invalidRequestId), "accepted invalid request ID: " + invalidRequestId);
+    }
+    assertEquals(null, WalletRequestCorrelation.current());
+    try (WalletRequestCorrelation.Scope outer = WalletRequestCorrelation.open("a".repeat(32))) {
+      assertEquals("a".repeat(32), WalletRequestCorrelation.current());
+      try (WalletRequestCorrelation.Scope inner = WalletRequestCorrelation.open(requestId)) {
+        assertEquals(requestId, WalletRequestCorrelation.current());
+      }
+      assertEquals("a".repeat(32), WalletRequestCorrelation.current());
+    }
+    assertEquals(null, WalletRequestCorrelation.current());
+
+    UserProvider jpa = mock(UserProvider.class);
+    KeycloakSession session = session(jpa);
+    RealmModel realm = mock(RealmModel.class);
+    UserModel created = mock(UserModel.class);
+    when(jpa.addUser(realm, null, "signup-user", true, true)).thenReturn(created);
+    when(created.getFirstAttribute("decent_identity_id")).thenReturn("identity-value");
+    UserProvider decorated = factory("empty").create(session);
+    decorated.addUser(realm, null, "signup-user", true, true);
+    ByteArrayOutputStream captured = new ByteArrayOutputStream();
+    PrintStream prior = System.err;
+    try (PrintStream replacement = new PrintStream(captured);
+        WalletRequestCorrelation.Scope scope = WalletRequestCorrelation.open(requestId)) {
+      System.setErr(replacement);
+      decorated.searchForUserByUserAttributeStream(realm, "decent_identity_id", "identity-value").count();
+    } finally {
+      System.setErr(prior);
+    }
+    String logs = captured.toString(java.nio.charset.StandardCharsets.UTF_8);
+    assertEquals(String.join(System.lineSeparator(),
+        "ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read request=" + requestId,
+        "ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request=" + requestId,
+        "ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read empty request=" + requestId,
+        ""), logs);
+    assertEquals(null, WalletRequestCorrelation.current());
+    for (String invalidRequestId : new String[] {null, "not-a-request-id"}) {
+      UserProvider invalidJpa = mock(UserProvider.class);
+      KeycloakSession invalidSession = session(invalidJpa);
+      RealmModel invalidRealm = mock(RealmModel.class);
+      UserModel invalidCreated = mock(UserModel.class);
+      when(invalidJpa.addUser(invalidRealm, null, "signup-user", true, true)).thenReturn(invalidCreated);
+      when(invalidCreated.getFirstAttribute("decent_identity_id")).thenReturn("identity-value");
+      UserProvider invalidDecorated = factory("empty").create(invalidSession);
+      invalidDecorated.addUser(invalidRealm, null, "signup-user", true, true);
+
+      ByteArrayOutputStream invalidCaptured = new ByteArrayOutputStream();
+      PrintStream invalidPrior = System.err;
+      try (PrintStream replacement = new PrintStream(invalidCaptured);
+          WalletRequestCorrelation.Scope scope = WalletRequestCorrelation.open(invalidRequestId)) {
+        System.setErr(replacement);
+        invalidDecorated.searchForUserByUserAttributeStream(invalidRealm, "decent_identity_id", "identity-value").count();
+      } finally {
+        System.setErr(invalidPrior);
+      }
+      assertEquals("", invalidCaptured.toString(java.nio.charset.StandardCharsets.UTF_8));
+    }
+  }
+
   @Test
   void decoratedProviderRetainsCredentialStoreTypeAndDelegatesCredentialCalls() {
     UserProvider jpa = mock(UserProvider.class,

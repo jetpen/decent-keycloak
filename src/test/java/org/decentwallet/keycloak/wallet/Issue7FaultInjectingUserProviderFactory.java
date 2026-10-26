@@ -18,6 +18,8 @@ import org.keycloak.models.UserProviderFactory;
 /** Test-only decorator: injects one exact post-addUser attribute readback failure. */
 public final class Issue7FaultInjectingUserProviderFactory implements UserProviderFactory<UserProvider> {
   static final String IDENTITY_ATTRIBUTE = "decent_identity_id";
+  private static final String PROVIDER_ID = "issue7-user-readback-fault";
+  private static final String POST_CREATE_EXACT_ATTRIBUTE_READ = "post_create_exact_attribute_read";
   private static final String MODE = System.getenv().getOrDefault("ISSUE7_USER_READBACK_FAULT_MODE", "disabled");
   private final String mode;
 
@@ -46,18 +48,21 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
           if ("searchForUserByUserAttributeStream".equals(method.getName()) && args != null && args.length == 3
               && IDENTITY_ATTRIBUTE.equals(args[1]) && added != null && args[2] instanceof String identity
               && identity.equals(added.getFirstAttribute(IDENTITY_ATTRIBUTE)) && armed.compareAndSet(true, false)) {
-            System.err.println("ISSUE7_USER_READBACK_OPERATION: post_create_exact_attribute_read");
-            System.err.println("ISSUE7_USER_READBACK_FAULT: post-create exact attribute read intercepted");
+            String requestId = WalletRequestCorrelation.current();
+            if (WalletRequestCorrelation.isValidRequestId(requestId))
+              System.err.println("ISSUE7_USER_READBACK_OPERATION: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " request=" + requestId);
+            if (WalletRequestCorrelation.isValidRequestId(requestId))
+              System.err.println("ISSUE7_USER_READBACK_FAULT: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " post-create exact attribute read intercepted request=" + requestId);
             if ("empty".equals(mode)) {
-              System.err.println("ISSUE7_USER_READBACK_OUTCOME: empty");
+              if (WalletRequestCorrelation.isValidRequestId(requestId)) System.err.println("ISSUE7_USER_READBACK_OUTCOME: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " empty request=" + requestId);
               return Stream.empty();
             }
             if ("throw".equals(mode)) {
-              System.err.println("ISSUE7_USER_READBACK_OUTCOME: throw");
+              if (WalletRequestCorrelation.isValidRequestId(requestId)) System.err.println("ISSUE7_USER_READBACK_OUTCOME: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " throw request=" + requestId);
               throw new IllegalStateException("issue7 test-only readback unavailable");
             }
             if ("over-cap".equals(mode)) {
-              System.err.println("ISSUE7_USER_READBACK_OUTCOME: over-cap");
+              if (WalletRequestCorrelation.isValidRequestId(requestId)) System.err.println("ISSUE7_USER_READBACK_OUTCOME: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " over-cap request=" + requestId);
               return IntStream.range(0, 65).mapToObj(index -> syntheticCandidate(added, index));
             }
           }
@@ -91,5 +96,5 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
   @Override public void init(Config.Scope config) {}
   @Override public void postInit(KeycloakSessionFactory factory) {}
   @Override public void close() {}
-  @Override public String getId() { return "issue7-user-readback-fault"; }
+  @Override public String getId() { return PROVIDER_ID; }
 }
