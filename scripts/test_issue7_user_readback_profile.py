@@ -467,6 +467,122 @@ class UserReadbackProfileTest(unittest.TestCase):
         'opaque-fixture-id', 'fixture-identity', 'session_code=', 'client_data='):
       self.assertNotIn(forbidden, serialized)
 
+  def run_production_signup_status_failure(self, log_result):
+    locator = ('https://idp.example:' + str(probe.KC_PORT) + '/auth/realms/'
+        + probe.REALM + '/decent-wallet-login/v1/transactions/' + 'A' * 43)
+    status_url = '/auth/realms/' + probe.REALM + '/decent-wallet-login/v1/transactions/status'
+    request_id = probe.account_policy_request_id(locator)
+    callback_query = urllib.parse.urlencode({'session_code': 's', 'execution': 'e',
+        'client_id': 'c', 'tab_id': 't', 'client_data': 'd'})
+
+    class ScriptedClient:
+      def __init__(self):
+        self.redirects = []
+        self.privateClientAdminCredential = '[REDACTED]'
+        self.wallet_container_id = None
+        self.requests = []
+      def request(self, method, path, data=None, headers=None, timeout=10):
+        self.requests.append((method, path))
+        parsed = urllib.parse.urlsplit(path)
+        if method == 'GET' and '/protocol/openid-connect/auth?' in path:
+          page = (f'<p id="wallet-locator">{locator}</p><form method="post" '
+              f'action="/auth/realms/{probe.REALM}/login-actions/authenticate?{callback_query}">'
+              '<input type="hidden" name="wallet_intent" value="signup"></form>')
+          return 200, {}, page.encode()
+        if method == 'POST' and 'login-actions/authenticate?' in path:
+          page = (f'<p id="wallet-locator">{locator}</p>'
+              f'<script>const statusUrl = "{status_url}"; const csrfToken = "{"A" * 43}";</script>'
+              'Creating a new account with this wallet identity.')
+          return 200, {}, page.encode()
+        if method == 'GET' and path == locator:
+          return 200, {}, json.dumps({'profile': 'decent-wallet-login-v1',
+              'challenge': 'challenge', 'csrf_token': 'A' * 43}).encode()
+        if method == 'POST' and path == locator:
+          return 202, {}, b''
+        if method == 'GET' and path == status_url:
+          return 503, {}, b'private-status-error'
+        raise AssertionError((method, path))
+
+    browser, wallet = ScriptedClient(), ScriptedClient()
+    admin = Mock(wallet_container_id='a' * 64, privateClientAdminCredential='[REDACTED]')
+    checkpoints = []
+    original_write = Path.write_text
+    def capture(path, data, *args, **kwargs):
+      if path.name == 'live-evidence.json':
+        checkpoints.append(json.loads(data))
+      return original_write(path, data, *args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      key_path = Path(scratch) / 'identity.pem'
+      for name, value in {'SCRATCH': scratch, 'IMAGE': 'original-image',
+          'RUN_CID_DIR': None}.items():
+        stack.enter_context(patch.object(probe, name, value))
+      stack.enter_context(patch.dict(os.environ,
+          {'WALLET_IT_PROFILE': 'issue7-signup-success'}, clear=False))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('ordinary-image', 'sha256:' + 'a' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      stack.enter_context(patch.object(probe, 'start_resolver_tools', return_value='resolver-tools'))
+      stack.enter_context(patch.object(probe, 'start_registry', return_value=('registry', 'bootstrap', 1234)))
+      stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
+      stack.enter_context(patch.object(probe, 'write_identity',
+          return_value=(key_path, Path(scratch) / 'wrapper', 'fixture-identity')))
+      stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='[REDACTED]'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
+          'runtime_qualification_status': 'runtime_facts_verified',
+          'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
+      stack.enter_context(patch.object(probe, 'configure_realm'))
+      stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
+      stack.enter_context(patch.object(probe, 'admin_call', side_effect=[
+          (200, {}, b'[]'), (200, {}, b'[{"attributes":{"decent_identity_id":["fixture-identity"]},"enabled":true,"id":"private-subject"}]')]))
+      stack.enter_context(patch.object(probe, 'Client', side_effect=[browser, wallet]))
+      stack.enter_context(patch.object(probe.subprocess, 'run',
+          return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
+      stack.enter_context(patch.object(probe, 'read_provider_success_log_window',
+          return_value=log_result) if not isinstance(log_result, Exception) else
+          patch.object(probe, 'read_provider_success_log_window', side_effect=log_result))
+      stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
+      stack.enter_context(patch.object(probe, 'cleanup_after_failure'))
+      stack.enter_context(patch.object(Path, 'write_text', autospec=True, side_effect=capture))
+      signup_flow = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
+          wraps=probe.signup_wallet_flow))
+      printed = stack.enter_context(patch('builtins.print'))
+      with self.assertRaises(RuntimeError):
+        probe.main()
+
+    self.assertEqual(1, signup_flow.call_count)
+    self.assertEqual(['GET', 'POST', 'GET'], [method for method, _ in browser.requests])
+    self.assertEqual(['GET', 'POST'], [method for method, _ in wallet.requests])
+    self.assertTrue(checkpoints)
+    final = checkpoints[-1]['signup_case']
+    serialized = json.dumps(checkpoints) + repr(printed.call_args_list)
+    for forbidden in ('fixture-identity', 'private-subject', 'private-status-error',
+        request_id, 'challenge', 'signature', 'authorization_code', 'privateClientAdminCredential'):
+      self.assertNotIn(forbidden, serialized)
+    return final
+
+  def test_production_main_correlates_consume_witness_only_for_one_known_marker(self):
+    request_id = probe.account_policy_request_id(
+        'https://idp.example:' + str(probe.KC_PORT) + '/auth/realms/' + probe.REALM
+        + '/decent-wallet-login/v1/transactions/' + 'A' * 43)
+    marker = (f'Wallet proof transaction consumed (request={request_id}, '
+        'provider=infinispan)')
+    observed = self.run_production_signup_status_failure(marker)
+    self.assertEqual('account', observed['stage'])
+    self.assertEqual('signup_proof', observed['failure_stage'])
+    self.assertEqual('proof_status', observed['failure_gate'])
+    self.assertEqual(503, observed['failure_http_status'])
+    self.assertEqual('observed', observed['transaction_consume_witness'])
+    self.assertEqual('infinispan', observed['transaction_consume_provider_id'])
+    for log_result in (None, OSError('private log failure'), marker + '\n' + marker,
+        marker.replace(request_id, 'f' * 32), marker.replace('infinispan', 'unknown')):
+      with self.subTest(log_result=log_result):
+        unavailable = self.run_production_signup_status_failure(log_result)
+        self.assertEqual('unavailable', unavailable['provider_operation_witness'])
+        self.assertNotIn('transaction_consume_witness', unavailable)
+        self.assertNotIn('transaction_consume_provider_id', unavailable)
+
   def test_production_main_runs_real_readback_failure_and_fresh_signup_for_each_mode(self):
     profiles = {
         'issue7-user-readback-empty': 'empty',

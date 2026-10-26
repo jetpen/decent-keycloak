@@ -679,7 +679,7 @@ def checkpoint_signup_stage(result, stage, fields, checkpoint):
   checkpoint()
 
 
-def checkpoint_signup_failure(result, failure, checkpoint):
+def checkpoint_signup_failure(result, failure, checkpoint, transaction_consume_provider_id=None):
   """Merge bounded failure facts into the last confirmed ordinary-signup checkpoint."""
   current = dict(result.get('signup_case', {}))
   stage = current.get('stage')
@@ -696,6 +696,10 @@ def checkpoint_signup_failure(result, failure, checkpoint):
           else 'unclassified',
       'failure_category': failure_category if failure_category in issue7_store_recovery.FAILURE_CATEGORIES
           else 'runtime_error'}
+  if transaction_consume_provider_id in {'infinispan', 'jpa', 'remote'}:
+    evidence.pop('provider_operation_witness', None)
+    evidence['transaction_consume_witness'] = 'observed'
+    evidence['transaction_consume_provider_id'] = transaction_consume_provider_id
   status = getattr(failure, 'failure_http_status', None)
   if type(status) is int and 100 <= status <= 599:
     status_field = ('signup_proof_http' if evidence['failure_gate'] in
@@ -1461,6 +1465,10 @@ def sanitize_live_checkpoint(candidate):
         safe['failure_category'] = value['failure_category']
       if value.get('provider_operation_witness') == 'unavailable':
         safe['provider_operation_witness'] = 'unavailable'
+      if (value.get('transaction_consume_witness') == 'observed'
+          and value.get('transaction_consume_provider_id') in {'infinispan', 'jpa', 'remote'}):
+        safe['transaction_consume_witness'] = 'observed'
+        safe['transaction_consume_provider_id'] = value['transaction_consume_provider_id']
       if (type(value.get('failure_http_status')) is int
           and 100 <= value['failure_http_status'] <= 599
           and value.get('failure_gate') not in issue7_store_recovery.SIGNUP_PROOF_HTTP_GATES):
@@ -4758,6 +4766,7 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   require(status_url is not None and csrf is not None, 'signup transaction browser binding')
   if status_url is None or csrf is None:
     raise RuntimeError('acceptance probe failed at signup transaction binding')
+  progress('intent', {'provider_request_id': provider_request_id})
   wallet = Client()
   challenge_status, _, challenge_raw = signup_boundary('signup_proof',
       'signup_challenge_request', lambda: wallet.request('GET', signup_locator))
@@ -5008,17 +5017,35 @@ def run_issue7_signup_success_profile(client, key, identifier, container,
   """Run exactly one ordinary explicit-signup success ceremony and checkpoint its safe facts."""
   log_cursor = utc_log_cursor()
   last_confirmed = {}
+  request_binding: dict[str, str | None] = {'request_id': None}
   def record_progress(stage, fields):
+    if 'provider_request_id' in fields:
+      candidate = fields.get('provider_request_id')
+      if isinstance(candidate, str) and re.fullmatch(r'[0-9a-f]{32}', candidate):
+        request_binding['request_id'] = candidate
+      fields = {name: value for name, value in fields.items() if name != 'provider_request_id'}
+      if not fields:
+        return
     last_confirmed.update({'stage': stage, **fields})
     progress(stage, fields)
   try:
     evidence = signup_wallet_flow(client, key, identifier, container, admin_client,
         record_progress, image)
   except Exception as failure:
+    transaction_consume_provider_id = None
+    request_id = request_binding['request_id']
+    if request_id is not None:
+      try:
+        logs = read_provider_success_log_window(container, log_cursor)
+        transaction_consume_provider_id = sanitize_success_provider_witness(logs, request_id)
+      except Exception:
+        pass
     if failure_checkpoint is None:
-      checkpoint_signup_failure({'signup_case': last_confirmed}, failure, checkpoint)
+      checkpoint_signup_failure({'signup_case': last_confirmed}, failure, checkpoint,
+          transaction_consume_provider_id=transaction_consume_provider_id)
     else:
-      checkpoint_signup_failure({'signup_case': last_confirmed}, failure, failure_checkpoint)
+      checkpoint_signup_failure({'signup_case': last_confirmed}, failure, failure_checkpoint,
+          transaction_consume_provider_id=transaction_consume_provider_id)
     raise
   request_id = evidence.get('provider_request_id')
   logs = read_provider_success_log_window(container, log_cursor)
