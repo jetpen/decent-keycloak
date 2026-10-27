@@ -50,14 +50,11 @@ provider image”. That CI step built a Docker image and ran the Keycloak 26.8.0
 smoke only; it did not run signup or qualify Registry behavior. This post-publication CI evidence
 is distinct from local offline implementation and does not qualify the signup profile.
 
-The separate authorized `issue7-signup-success` attempt on source
-`24f36d843774997193faee6cfe8f1ab9902ff93c` was consumed once and failed at `account_readback`
-after signup intent HTTP 200, before proof, consume, callback/replay, PKCE or selected-provider
-witness. Offline tracing found `main()` reused the realm-preprovisioned Identity for fresh signup.
-PR #43 changes only the ordinary success profile to use a distinct fresh Identity after realm
-setup; this correction has not been live-verified. The exact harness/image provenance and cleanup
-reconciliation are recorded in [`issue-7-store-recovery.md`](issue-7-store-recovery.md). Issue #7
-remains OPEN; do not retry without fresh explicit authorization.
+The two authorized `issue7-signup-success` attempts are distinct and both were consumed. The earlier attempt used source `24f36d843774997193faee6cfe8f1ab9902ff93c` and failed at `account_readback` after signup intent HTTP 200, before proof, consume, callback/replay, PKCE or selected-provider witness. Offline tracing found `main()` reused the realm-preprovisioned Identity for fresh signup. PR #43 changes only the ordinary success profile to use a distinct fresh Identity after realm setup; this correction has not been live-verified.
+
+The later and latest attempt used source `5310a2dc8944bd8c7cef8964e924ea4b07fb3ed0`, harness SHA-256 `03ff2e3b7adac4a26471c0ba5065d9567e42b8b1ad1b8240416bd8b10e2067e2`, image ID `918defd28421a226c8d11b0b39445d99d7f805714e098c1dd68e332b30d43992`, and digest `sha256:79b4ec91b1482009a7f900c1d86336ff5e25702a6b826c87132a9a008f9c6aae`. Its wrapper window was `2026-10-27T00:00:50Z`–`2026-10-27T00:01:50Z`; the sanitized receipt records exit code 1 and not timed out, with no `signup_case` evidence, no request-correlated selected-provider witness, and no captured acceptance gate. The exact failure gate/cause is unavailable; raw runner output was not retained. Do not attribute this latest failure to `account_readback` or infer its cause.
+
+Partial facts identify Keycloak 26.8.0 on one node, configured/effective DB `dev-file`, configured/effective cache `local` (effective-cache source: runtime log), and `show_config_fields_missing`; the selected SingleUseObjectProvider configuration/path is unavailable. `infinispan` was advertised as available only, not established as selected. Registry proof, exact-account acceptance, callback, replay, and PKCE remain unverified; no pass is claimed. No additional runtime attempt is authorized; any future attempt requires fresh explicit authorization. Issue #7 remains OPEN. The exact provenance and receipt reconciliation are recorded in [`issue-7-store-recovery.md`](issue-7-store-recovery.md).
 
 ## Receipt-publication failure
 

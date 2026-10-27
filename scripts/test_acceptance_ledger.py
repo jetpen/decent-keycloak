@@ -42,24 +42,47 @@ class AcceptanceLedgerTest(unittest.TestCase):
     issue7_rows = [line for line in readme.splitlines() if line.startswith('| Keycloak #7 signup provisioning and recovery')]
     self.assertEqual(2, len(issue7_rows))
     self.assertNotEqual(issue7_rows[0], issue7_rows[1])
-    self.assertIn('PR #42 provides offline request-correlated fixture witnesses; PR #43 limits the ordinary success profile to a distinct fresh Identity', issue7_rows[0])
-    self.assertIn('13-module README/CI Python acceptance command passed 350 tests', issue7_rows[1])
+    self.assertIn('PR #42 provides offline request-correlated fixture witnesses; PR #43\'s distinct-fresh-Identity correction remains not live-verified.', issue7_rows[0])
+    self.assertIn('The exact 13-module README/CI Python acceptance command passed 350 tests', issue7_rows[1])
 
   def test_issue7_ordinary_signup_failure_provenance_is_reconciled(self):
     readme = README.read_text()
     recovery = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
     boundary = (README.parent / 'docs/acceptance/issue-7-safe-retry-boundary.md').read_text()
-    for provenance in (
+    previous_attempt = (
         '24f36d843774997193faee6cfe8f1ab9902ff93c',
         'baa747716f0e050e2a18e4089b701dccc7a9acf9b84ce99776eb8cbdeebea0ed',
         'fc83bfb91d11555f6be59f7aa4700ba4d0617137c7287fb1d3f111dfea5aacd2',
-        'sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669'):
+        'sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669')
+    for provenance in previous_attempt:
       self.assertIn(provenance, recovery)
-    self.assertIn('24f36d843774997193faee6cfe8f1ab9902ff93c', readme)
+    current_attempt = (
+        '5310a2dc8944bd8c7cef8964e924ea4b07fb3ed0',
+        '03ff2e3b7adac4a26471c0ba5065d9567e42b8b1ad1b8240416bd8b10e2067e2',
+        '918defd28421a226c8d11b0b39445d99d7f805714e098c1dd68e332b30d43992',
+        'sha256:79b4ec91b1482009a7f900c1d86336ff5e25702a6b826c87132a9a008f9c6aae',
+        '2026-10-27T00:00:50Z', '2026-10-27T00:01:50Z')
     for text in (readme, recovery, boundary):
-      self.assertIn('account_readback', text)
-    self.assertIn('single ordinary-signup runtime attempt failed at `account_readback` and was consumed', readme)
-    self.assertIn('fresh authorization', readme)
+      for provenance in current_attempt:
+        self.assertIn(provenance, text)
+      self.assertIn('exit code 1', text)
+      self.assertIn('not timed out', text)
+      self.assertIn('no `signup_case` evidence', text)
+      self.assertIn('no request-correlated selected-provider witness', text)
+      self.assertIn('exact failure gate/cause is unavailable', text)
+      self.assertIn('Issue #7 remains OPEN', text)
+      self.assertIn('Keycloak 26.8.0', text)
+      self.assertIn('configured/effective DB `dev-file`', text)
+      self.assertIn('configured/effective cache `local`', text)
+      self.assertIn('show_config_fields_missing', text)
+      self.assertIn('selected SingleUseObjectProvider configuration/path', text)
+      self.assertIn('unavailable', text)
+      self.assertIn('advertised as available only', text)
+    self.assertIn('account_readback', readme)
+    self.assertIn('account_readback', recovery)
+    self.assertIn('earlier attempt failed at `account_readback` after signup intent HTTP 200', readme)
+    self.assertIn('two authorized ordinary-signup attempts are distinct failures', readme)
+    self.assertIn('fresh explicit authorization', readme)
     self.assertIn('fresh explicit authorization', recovery)
     self.assertIn('fresh explicit authorization', boundary)
     self.assertIn('signup intent HTTP 200', readme)
@@ -70,6 +93,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('distinct fresh Identity after realm setup', recovery)
     self.assertIn('not live-verified', readme)
     self.assertIn('not a live-verified fix', recovery)
+    self.assertIn('Cleanup for the later attempt was verified by observed removal of the built image and build-stage image by exact IDs, with the post-run inventory returning to the 29-image baseline. This cleanup is not reported by the sanitized receipt', recovery)
     self.assertNotIn('349 tests passed', readme)
 
   def test_issue7_pr43_and_ci_evidence_are_separate_from_live_qualification(self):
@@ -92,7 +116,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn('corrected isolated candidate', readme + recovery + boundary)
     self.assertNotIn('No live/container/Registry invocation or image build was performed for this slice.', recovery)
     self.assertEqual(2, readme.count('| Keycloak #7 signup provisioning and recovery (single-node only) |'))
-    self.assertIn('No new attempt was performed; any additional runtime attempt requires fresh explicit authorization', readme)
+    self.assertIn('No additional attempt or runtime operation is authorized here', readme)
 
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
     text = README.read_text()

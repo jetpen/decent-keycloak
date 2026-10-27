@@ -9,8 +9,9 @@ Multi-node integration and distributed provisioning/replay guarantees are out of
 
 ## Ordinary signup attempt and correction boundary
 
-Exactly one authorized `issue7-signup-success` runtime attempt was consumed on 2026-10-26. It
-used source `24f36d843774997193faee6cfe8f1ab9902ff93c`, harness SHA-256
+Two distinct authorized `issue7-signup-success` runtime attempts have now been consumed; keep their evidence separate.
+
+The earlier attempt (2026-10-26) used source `24f36d843774997193faee6cfe8f1ab9902ff93c`, harness SHA-256
 `baa747716f0e050e2a18e4089b701dccc7a9acf9b84ce99776eb8cbdeebea0ed`, image ID
 `fc83bfb91d11555f6be59f7aa4700ba4d0617137c7287fb1d3f111dfea5aacd2`, image digest
 `sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669`, and one
@@ -20,18 +21,15 @@ Keycloak 26.8.0 node (dev-file/local cache). It exited 1 at `account_readback`, 
 intent POST returned HTTP 200. This failed before proof POST, accepted transaction/consume,
 callback, replay, or PKCE; no selected-provider witness was reached and no pass is claimed.
 
-Offline source tracing attributes this attempt's account-readback failure to profile wiring, not
-an established production-path defect: `main()` used the first Identity both to provision the
-realm through `configure_realm` and to dispatch the success profile, while the real
-`signup_wallet_flow` requires no exact mapped account before fresh signup proof. PR #43's correction
-keeps the first Identity for realm setup and other profiles, then gives only the ordinary
-`issue7-signup-success` profile a distinct fresh Identity after realm setup. This is a narrow harness
-correction, not a live-verified fix; it does not change production Java behavior or acceptance
-criteria. The failure belongs to the source snapshot above and remains the sole failed, consumed
-attempt. Cleanup was verified against pre/post inventories: run-owned containers/networks/volumes/listeners/CID dirs/temp dirs were
-reconciled, run-owned containers and the image were absent afterward, and no run CID or
-credential scratch file remained. Do not retry without fresh explicit authorization.
+The later and latest attempt ran on source `5310a2dc8944bd8c7cef8964e924ea4b07fb3ed0` in the wrapper window
+`2026-10-27T00:00:50Z`–`2026-10-27T00:01:50Z`. Its sanitized receipt records profile `issue7-signup-success`, exit code 1, and not timed out. The source used harness SHA-256
+`03ff2e3b7adac4a26471c0ba5065d9567e42b8b1ad1b8240416bd8b10e2067e2`, image ID
+`918defd28421a226c8d11b0b39445d99d7f805714e098c1dd68e332b30d43992`, and image digest
+`sha256:79b4ec91b1482009a7f900c1d86336ff5e25702a6b826c87132a9a008f9c6aae`. The receipt contains no `signup_case` evidence, no request-correlated selected-provider witness, and no captured acceptance gate; the exact failure gate/cause is unavailable. Raw runner output was not retained. Do not attribute this attempt to `account_readback` or infer a cause.
 
+Partial facts in the receipt identify Keycloak 26.8.0 on one node, configured/effective DB `dev-file`, and configured/effective cache `local` (effective-cache source: runtime log). `show_config_fields_missing` means the `show-config` fields were missing; the selected SingleUseObjectProvider configuration/path is unavailable. `infinispan` was advertised as available only, not established as selected. Registry proof, exact-account acceptance, callback, replay, and PKCE remain unverified; no pass is claimed. The receipt also contains diagnostic-probe partial evidence, which does not supply the missing acceptance result.
+
+Offline source tracing of the earlier failure attributes that attempt's account-readback failure to profile wiring, not an established production-path defect: `main()` used the first Identity both to provision the realm through `configure_realm` and to dispatch the success profile, while the real `signup_wallet_flow` requires no exact mapped account before fresh signup proof. PR #43's correction keeps the first Identity for realm setup and other profiles, then gives only the ordinary `issue7-signup-success` profile a distinct fresh Identity after realm setup. This is a narrow harness correction, not a live-verified fix; it does not change production Java behavior or acceptance criteria. The later attempt is a separate failure with unavailable gate/cause and does not retroactively alter the earlier `account_readback` result. Cleanup for the earlier attempt was verified against pre/post inventories. Cleanup for the later attempt was verified by observed removal of the built image and build-stage image by exact IDs, with the post-run inventory returning to the 29-image baseline. This cleanup is not reported by the sanitized receipt; this offline reconciliation performs no runtime action. Issue #7 remains OPEN; do not retry without fresh explicit authorization.
 ## Preserved ordering and residual states
 
 Failure-checkpoint diagnostics now preserve `last_confirmed_phase` separately from the coordinator's `faulted_signup` stage. The three store profiles and three UserProvider readback profiles project `fixture_factory_witness`, `fixture_operation_witness`, and `fixture_mutation_outcome` only from exact markers in the bounded per-run Keycloak log window. The factory-create witness records only run-scoped factory creation; it is never a selection claim. Both store and UserProvider request-level operation, fault, and outcome markers include the allowlisted wrapper ID, exact operation, and same handle-derived request ID. Readback correlation is bridged to the synchronous interception seam through a nested-restoring request-scoped context cleared/restored on scope close. A unique exact operation witness is required for attribution; delegate identity is not claimed. Provider registration/enumeration and factory creation alone never prove a particular transaction used the fixture. Missing/unreadable, duplicate, malformed, wrong-request, wrong-provider, wrong-operation, conflicting, or unknown markers fail closed for the request-level witness. No raw log, request ID, locator, identity, subject, exception, proof, token, or secret is serialized. This remains fixture-backed offline orchestration/parser evidence—not runtime provider qualification; Issue #7 remains OPEN.
