@@ -1,0 +1,78 @@
+{
+  "cleanup_verified": true,
+  "evidence": [
+    {
+      "issue7_store_recovery": {
+        "account_retained_after_failure": true,
+        "browser_status_http": 404,
+        "callback_http": 302,
+        "correlated_store_failure_count": 1,
+        "exact_mapped_users": 1,
+        "failure_responses_no_callback_or_code": true,
+        "fault_evidence_provenance": "wrapper-mediated-application-path",
+        "fixture_factory_witness": "observed",
+        "fixture_mutation_outcome": "committed_then_threw",
+        "fixture_operation": "transaction_remove",
+        "fixture_operation_witness": "observed",
+        "fixture_selected_provider_id": "issue7-fault-injection",
+        "fresh_explicit_signup_transactions": 2,
+        "fresh_login_transactions": 0,
+        "keycloak_node_count": 1,
+        "last_confirmed_phase": "token",
+        "pkce_token_http": 200,
+        "recovery_intent": "signup",
+        "retry_http": 404,
+        "same_local_subject": true,
+        "scope": "one-keycloak-node",
+        "signup_intent_action_http": 200,
+        "signup_proof_http": 503,
+        "stage": "complete",
+        "store_diagnostic_read_status": "observed",
+        "store_fault_count": 1,
+        "store_fault_mode": "consume-loss",
+        "store_provider_selected": true
+      },
+      "resolver_runtime": {
+        "cache_mode_configured": "local",
+        "cache_mode_effective": "local",
+        "cache_mode_effective_evidence": "infinispan_configuration_log",
+        "cache_stack_effective": null,
+        "database_mode_configured": "dev-file",
+        "database_mode_effective": "dev-file",
+        "harness_sha256": "d02b93c6344a681d0ccb4df4bd109401b852d31e515f2535415decf4cc41e699",
+        "identity_commit": "2caec24de52c2dbe241e72fe317281c051d03f89",
+        "image_digest": "sha256:ad008273417774219e2e8c0181f86bf799d3ec9074083d5a329ca2cf22b3309a",
+        "keycloak_config_fields_present": [
+          "database_mode_effective"
+        ],
+        "keycloak_config_read_status": "show_config_fields_missing",
+        "keycloak_nodes": "one",
+        "keycloak_version": "26.8.0",
+        "registry_commit": "628120989703d146da50af97b4602f1f4aa3a068",
+        "runtime_command_fields_present": [
+          "cache_mode_configured",
+          "database_mode_configured"
+        ],
+        "runtime_lock_sha256": "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff",
+        "runtime_manifest_sha256": "d0506c4d2e6a3bd5fa52e074417443243df597379c61d8c55ac6927e04e21f89",
+        "runtime_qualification_status": "open_runtime_facts_unavailable",
+        "single_use_object_provider_configured": "unavailable",
+        "single_use_object_provider_ids": [
+          "infinispan",
+          "issue7-fault-injection"
+        ],
+        "single_use_object_provider_path": "unavailable"
+      }
+    }
+  ],
+  "finished_at": "2026-10-28T11:59:44.741570+00:00",
+  "harness_sha256": "d02b93c6344a681d0ccb4df4bd109401b852d31e515f2535415decf4cc41e699",
+  "image_digest": "sha256:ad008273417774219e2e8c0181f86bf799d3ec9074083d5a329ca2cf22b3309a",
+  "image_id": "1f559071f3494a764c4ebee9d2376aed325ff620c08c1b4299050ce74db8b5d7",
+  "profile": "issue7-consume-loss-recovery",
+  "runner_exit": 0,
+  "source_head": "7d308304b9516c51566710376fa096e026c86e7c",
+  "source_snapshot_sha256": "f95ac7698b05a49ad186febc05440e040cb2e7cc11694d3de8338c0f691813be",
+  "started_at": "2026-10-28T11:58:45.572800+00:00",
+  "state": "runner_returned"
+}

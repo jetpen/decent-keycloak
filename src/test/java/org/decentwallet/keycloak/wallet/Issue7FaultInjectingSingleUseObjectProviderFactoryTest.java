@@ -15,8 +15,18 @@ import org.keycloak.models.SingleUseObjectProvider;
 
 final class Issue7FaultInjectingSingleUseObjectProviderFactoryTest {
   @TempDir Path directory;
-  private static final String TRANSACTION = "decent-wallet-login-v1:transaction:exact-key";
-  private static final String ACCEPTED = "decent-wallet-login-v1:accepted:exact-key";
+  private static final String HANDLE_DIGEST = handleDigest("exact-key");
+  private static final String TRANSACTION = "decent-wallet-login-v1:transaction:" + HANDLE_DIGEST;
+  private static final String ACCEPTED = "decent-wallet-login-v1:accepted:" + HANDLE_DIGEST;
+
+  private static String handleDigest(String handle) {
+    try {
+      return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+          .digest(handle.getBytes(java.nio.charset.StandardCharsets.US_ASCII)));
+    } catch (java.security.NoSuchAlgorithmException impossible) {
+      throw new AssertionError(impossible);
+    }
+  }
 
   @Test void consumeLossCommitsExactRemovalThenThrowsOnlyOnceAcrossFactoryRecreation() {
     var delegate = new Memory();
@@ -96,6 +106,47 @@ final class Issue7FaultInjectingSingleUseObjectProviderFactoryTest {
     assertTrue(logs.contains("pending consume committed then threw request=" + expected));
     assertTrue(logs.contains("accepted receipt write committed then threw request=" + expected));
     assertTrue(logs.contains("accepted receipt write returned false before commit request=" + expected));
+  }
+
+  @Test void markersCorrelateToHandleThroughRealTransactionStoreKeys() {
+    var binding = new WalletLoginTransactionStore.Binding("realm", "client", "root", "tab",
+        "https://site.example/callback", "https://idp.example");
+    for (String mode : new String[] {"consume-loss", "accepted-receipt-write", "accepted-receipt-write-false"}) {
+      var captured = new ByteArrayOutputStream();
+      var original = System.err;
+      String requestId;
+      try (var replacement = new PrintStream(captured)) {
+        System.setErr(replacement);
+        var delegate = new Memory();
+        var provider = new Issue7FaultInjectingSingleUseObjectProviderFactory(mode,
+            directory.resolve(mode + "-real-key")).create(session(delegate));
+        var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(),
+            java.time.Clock.systemUTC());
+        var issued = store.issue(binding, WalletLoginTransactionStore.Intent.SIGNUP);
+        requestId = WalletLoginTransportHandler.requestCorrelationId(issued.handle());
+        if (mode.equals("consume-loss")) {
+          assertThrows(IllegalStateException.class, () -> store.consume(issued.handle(), binding,
+              issued.challenge(), issued.csrfToken()));
+          assertTrue(store.load(issued.handle()).isEmpty());
+        } else {
+          assertTrue(store.consume(issued.handle(), binding, issued.challenge(), issued.csrfToken()).isPresent());
+          assertThrows(IllegalStateException.class, () -> store.markAccepted(issued.handle(), binding,
+              "proof-digest", "identity", "public-key", issued.csrfToken(),
+              WalletLoginTransactionStore.Intent.SIGNUP));
+        }
+      } finally {
+        System.setErr(original);
+      }
+      String operation = mode.equals("consume-loss") ? "transaction_remove" : "accepted_replace";
+      String logs = captured.toString(java.nio.charset.StandardCharsets.UTF_8);
+      assertTrue(logs.contains("ISSUE7_TEST_PROVIDER_OPERATION: provider=issue7-fault-injection operation="
+          + operation + " request=" + requestId), "real storage-key marker must correlate for " + mode);
+      String outcome = mode.equals("consume-loss") ? "pending consume committed then threw"
+          : mode.equals("accepted-receipt-write") ? "accepted receipt write committed then threw"
+          : "accepted receipt write returned false before commit";
+      assertTrue(logs.contains("ISSUE7_TEST_FAULT: provider=issue7-fault-injection operation="
+          + operation + " " + outcome + " request=" + requestId), "fault must use the handle correlation");
+    }
   }
 
   private Issue7FaultInjectingSingleUseObjectProviderFactory factory(String mode) {

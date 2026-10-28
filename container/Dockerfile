@@ -96,12 +96,12 @@ FROM runtime AS issue7-user-readback-test-runtime
 USER 0
 COPY target/issue7-user-readback-provider.jar /opt/keycloak/providers/
 USER 1000
-RUN --network=none /opt/keycloak/bin/kc.sh build --spi-user--provider-default=issue7-user-readback-fault
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --http-relative-path=/auth --spi-single-use-object--provider-default=infinispan --spi-datastore--provider-default=issue7-user-readback-fault
 
 # Opt-in store fault wrapper; never included in the production runtime target.
 FROM runtime AS issue7-store-recovery-test-runtime
 COPY target/issue7-fault-provider.jar /opt/keycloak/providers/
-RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --spi-single-use-object--provider-default=issue7-fault-injection
+RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --http-relative-path=/auth --spi-single-use-object--provider-default=issue7-fault-injection
 
 # The Issue #6 receipt fault decorator is available only in this isolated test image.
 FROM keycloak-with-resolver AS issue6-postconsume-test-runtime

@@ -488,7 +488,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertEqual({'identity', 'registry'}, set(lock['sources']))
     self.assertEqual('2caec24de52c2dbe241e72fe317281c051d03f89',
         lock['sources']['identity']['commit'])
-    self.assertEqual('0fa9a6b631bd77725418e990ae9ea4d974dc546c',
+    self.assertEqual('628120989703d146da50af97b4602f1f4aa3a068',
         lock['sources']['registry']['commit'])
     for source in lock['sources'].values():
       self.assertRegex(source['commit'], re.compile(r'^[0-9a-f]{40}$'))

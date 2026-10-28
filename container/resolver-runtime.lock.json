@@ -51,9 +51,9 @@
       "requirements_source": "production imports against the pinned Registry runtime closure"
     },
     "registry": {
-      "url": "https://github.com/jetpen/decent-registry/archive/0fa9a6b631bd77725418e990ae9ea4d974dc546c.tar.gz",
-      "commit": "0fa9a6b631bd77725418e990ae9ea4d974dc546c",
-      "archive_sha256": "bf3e912ad18a9bf33f2d7aaebbc0ce43d34708e9d449e8daf81793a70917e098",
+      "url": "https://github.com/jetpen/decent-registry/archive/628120989703d146da50af97b4602f1f4aa3a068.tar.gz",
+      "commit": "628120989703d146da50af97b4602f1f4aa3a068",
+      "archive_sha256": "f47d9219f751fd38f1c909ec224a25c3ffe9423bc173637b0e6628a900730ed2",
       "requirements_lock": "resolver-requirements.lock.txt",
       "requirements_source": "pyproject.toml runtime requirements constrained to its pinned uv.lock"
     }

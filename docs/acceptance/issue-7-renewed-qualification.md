@@ -1,0 +1,141 @@
+# Issue #7 renewed one-node qualification campaign
+
+This campaign now has a **passing seven-profile one-node matrix**. The three readback modes and consume-loss profile each passed one corrected-gate rerun with original-subject continuity enforced; the other three profiles retain their original passing receipts. All four corrected runs completed exact fault witnesses, fail-closed outcomes, recovery through callback/PKCE, and verified cleanup. This qualifies wrapper-mediated application-path faults on one node only; it does not qualify arbitrary backend-originated faults, HA, restart, distributed behavior, or broad deployment. Issue #7 remains open; no PR, merge, or closure was authorized.
+
+## Corrected-gate live reruns (2026-10-28)
+
+| Profile | Exact observed fault / denial | Corrected recovery | Image / durable run receipt |
+|---|---|---|---|
+| Empty readback | `issue7-user-readback-fault`; one correlated `post_create_exact_attribute_read` / `empty`; proof 503; account retained; no callback/code | `same_local_subject=true` against the original failed-ceremony subject; two explicit signup transactions; exact enabled account counts `[1, 1]`; proof 202, callback 302, PKCE 200 | `0746a48323bf07f9b95f28c19bade48198705fca4909d91e56063873634907db` / `sha256:e0a0afcc1210651ecdef59a29376742a7e43128936ecc330b6085fed279bb22e`; [run receipt](evidence/issue7-corrected/issue7-user-readback-empty-corrected-1.json) |
+| Throwing readback | Same wrapper/operation; one correlated `throw`; proof 503; account retained; no callback/code | Original subject retained; two explicit signup transactions; exact enabled account counts `[1, 1]`; proof 202, callback 302, PKCE 200 | Same readback image; [run receipt](evidence/issue7-corrected/issue7-user-readback-throw-corrected-1.json) |
+| Over-cap readback | Same wrapper/operation; one correlated `over_cap` with 65 distinct synthetic candidate IDs; proof 503; account retained; no callback/code | Original subject retained; two explicit signup transactions; exact enabled account counts `[1, 1]`; proof 202, callback 302, PKCE 200 | Same readback image; [run receipt](evidence/issue7-corrected/issue7-user-readback-overcap-corrected-1.json) |
+| Consume loss | `issue7-fault-injection`; one correlated `transaction_remove` / `committed_then_threw`; proof 503; browser status/retry 404; account retained; no callback/code | Original subject retained; two explicit signup transactions; callback 302, PKCE 200 | `1f559071f3494a764c4ebee9d2376aed325ff620c08c1b4299050ce74db8b5d7` / `sha256:ad008273417774219e2e8c0181f86bf799d3ec9074083d5a329ca2cf22b3309a`; [run receipt](evidence/issue7-corrected/issue7-consume-loss-recovery-corrected-1.json) |
+
+All four runs used source HEAD `7d308304b9516c51566710376fa096e026c86e7c`, source snapshot SHA-256 `5adcfeb46c1af85119549b728cbaf47929389136231a45b85f2e662176220abb`, and corrected harness SHA-256 `e69609aae996f4df52dab07ebd2b68fe8b16de21ead8b5eeb05de53b1256c5a4`. The readback image digest is `sha256:e0a0afcc1210651ecdef59a29376742a7e43128936ecc330b6085fed279bb22e`; the store image digest is `sha256:ad008273417774219e2e8c0181f86bf799d3ec9074083d5a329ca2cf22b3309a`. Each reported Keycloak 26.8.0 on one node, `dev-file` DB and `local` cache. All pre/post container, volume, and network inventories matched; no run CID directories or admin env files remained; `wallet-login-test-net` was preserved.
+
+The fault wrappers and request-correlated outcomes were observed. The generic active SingleUseObjectProvider configuration path remains unavailable; this matrix does not upgrade the existing wrapper-mediated claim into provider-originated fault evidence. All four full sanitized attempt receipts remain in `/home/ben/.hermes/artifacts/issue7-renewed-qualification/`; the linked JSON files are allowlisted evidence projections without machine inventories or local paths.
+
+## Verification after corrected-gate evidence
+
+The documented canonical Python acceptance command passes **360 tests**. Python compilation and `git diff --check HEAD` pass. Java source was unchanged by the continuity/evidence updates; the previous clean offline Maven run passed **218 tests** with zero failures/errors/skips. No image build was performed for these harness-only reruns or evidence updates. Issue #7 remains open; no PR, merge, or closure was authorized.
+
+## Historical original seven-profile matrix (pre-continuity correction)
+
+**The table below preserves the earlier executed gates and original receipts unchanged.** In its three readback rows and consume-loss row, the former `same_local_subject=true` was not bound to the original failed-ceremony subject. Treat those rows as historical partial evidence; the corrected receipts above supersede only that continuity gate. Receipt-write fresh-login recovery and ordinary signup were unaffected.
+
+| Profile | Fault response / old transaction | Fresh recovery | Archived record |
+|---|---|---|---|
+| Ordinary signup | Proof 202; one exact account; correlated `infinispan` consume | Callback 302, replay denied, state preserved, PKCE 200 | [receipt](evidence/issue7/issue7-signup-success.json) |
+| Empty readback | 503; browser pending; account retained | Explicit signup 202, same subject, callback 302, PKCE 200 | [receipt](evidence/issue7/issue7-user-readback-empty-retry-1.json) |
+| Throwing readback | 503; browser pending; account retained | Explicit signup 202, same subject, callback 302, PKCE 200 | [receipt](evidence/issue7/issue7-user-readback-throw.json) |
+| Overcap readback | 503; 65 distinct synthetic candidate IDs; browser pending; account retained | Explicit signup 202, same subject, callback 302, PKCE 200 | [receipt](evidence/issue7/issue7-user-readback-overcap.json) |
+| Consume loss | Delegate removal committed; decorator threw; proof 503; old status/retry 404 | Fresh explicit signup, same subject, callback 302, PKCE 200 | [receipt](evidence/issue7/issue7-consume-loss-recovery-retry-2.json) |
+| Receipt write then throw | Delegate write committed; decorator threw; proof 503; old status/retry 404 | Fresh login, same subject, callback 302, PKCE 200 | [receipt](evidence/issue7/issue7-accepted-receipt-write-recovery.json) |
+| Receipt write false | Decorator returned false before delegate commit; proof 503; old status/retry 404 | Fresh login, same subject, callback 302, PKCE 200 | [receipt](evidence/issue7/issue7-accepted-receipt-write-false-recovery.json) |
+
+The original seven records report that the six fault profiles retained one enabled account, exposed no failed-request callback/code, and carried operation/outcome witnesses. For the three readback cases and consume-loss, their old recovery comparisons alone did not prove that the subject matched the original failed ceremony; that requirement is now established by the four corrected receipts above. The two receipt-failure recovery profiles were already directly bound to the retained subject. No consumed transaction was restored. All original records remain unchanged and describe their originally executed gates only; they are not newly minted or retroactively upgraded by the corrected runs.
+
+The final three store runs used image `1f559071f3494a764c4ebee9d2376aed325ff620c08c1b4299050ce74db8b5d7` / digest `sha256:ad008273417774219e2e8c0181f86bf799d3ec9074083d5a329ca2cf22b3309a`, harness SHA-256 `d02b93c6344a681d0ccb4df4bd109401b852d31e515f2535415decf4cc41e699`, source snapshot SHA-256 `f95ac7698b05a49ad186febc05440e040cb2e7cc11694d3de8338c0f691813be`, and HEAD `7d308304b9516c51566710376fa096e026c86e7c`. They observed one injection and one correlated production failure each, selected wrapper `issue7-fault-injection`, and exact operation `transaction_remove` or `accepted_replace`. The wrapper's production delegate is explicitly `infinispan`; the generic show-config provider path remains unavailable and is not relabeled as observed. Readback/ordinary runs retain their own earlier source/image/harness identities: later offline fixes do not retroactively change that provenance.
+
+No multi-node, HA, process-restart, backend-originated-fault, or distributed concurrency guarantee is claimed. Ordering is supported by production handler/store tests; a post-response Admin readback establishes final account state, not a live observation immediately before consume. Local concurrency characterization is single-process only. Operator recovery: leave the retained account intact, never resurrect a consumed gate, use a distinct explicit signup after readback uncertainty/consume loss, and use a fresh login after receipt publication failure. If independent readback cannot establish the exact enabled account, remain fail-closed and escalate rather than deleting it.
+
+## Earlier offline archive checkpoint (2026-10-27)
+
+At that evidence checkpoint, the canonical Python suite passed **355 tests**. A clean Java 21 offline Maven package passed **218 tests**, zero failures/errors/skips. Python compilation, locked resolver source/wheelhouse input verification, production-JAR service registration and exclusion of test injectors, and `git diff --check HEAD` passed. That checkpoint predates the corrected-gate reruns and later archive-test additions; it is not the current test total. Independent review is tracked separately; no commit/push/PR publication is implied.
+
+## Offline original-subject continuity correction
+
+
+Independent spec review of fingerprint `6b7bf749eb76a7abf51075e4d119b422afe6b292f72d63d6e030068b7303cfcf` established a medium harness-evidence defect: `reuse_existing=True` refreshed the expected subject from a new Admin read rather than preserving the failed ceremony's original subject. This could accept replacement account B after failed ceremony account A. The three readback profiles and consume-loss profile's original receipts therefore did not establish original-account continuity; those passes remain historical gate results, and the corrected receipts above add the missing gate. The two receipt-failure login profiles already passed the original subject to `auth_flow`.
+
+A new real-main/scripted-HTTP regression swaps the Admin user ID and token subject between readback ceremonies; it failed before the fix for all three modes. Signup recovery now requires the original `retained_subject` as an explicit in-memory input, verifies the pre-proof Admin ID against it, and uses that same subject for later account/token checks. Both readback and consume-loss coordinators supply their failed ceremony's subject. The consume-loss production-main replacement regression also verifies rejection before recovery proof and absence of any complete checkpoint. Positive full orchestration tests still pass. Missing/empty original subjects fail closed. No raw subject is serialized; only existing comparison booleans cross the checkpoint boundary.
+
+At that offline-fix checkpoint, no image build or live retry had occurred. The canonical Python suite at that snapshot passed **359 tests**, plus compilation and diff checks; the prior clean Maven suite remains 218 passing tests, with no Java code changed by the continuity correction. The later archive-test addition and corrected-gate live results are recorded separately above. The archive guard maps each profile to exact mode/wrapper/operation/outcome and rejects wrong/unavailable mutations.
+
+All original receipt/image/harness identities remain unchanged. The four corrected-gate receipts above supplement—not rewrite—the historical records, and replace the earlier evidence bundle's continuity caveat. Issue #7 remains open; no PR, merge, or closure was authorized.
+
+## Historical chronological record (superseded by the current matrix)
+
+The sections below describe the evidence and permissions at each earlier checkpoint, not current blockers. Separately approved retries are distinct runs and do not erase failures.
+
+
+## Executed profiles
+
+Both runs used source HEAD `7d308304b9516c51566710376fa096e026c86e7c` with uncommitted source snapshot SHA-256 `a67dc52be7e7556a83437c645018be7f6d146b72db4300cdb2d0610fe72d594d` and harness SHA-256 `035362b2071f2aa0d3e246728191c6af2f1bb5f54c4573aad4ed771417461404`. The source snapshot hash covers the binary tracked diff followed by sorted untracked names, a NUL separator, and each file's bytes. Later evidence-document edits are not part of that executed snapshot.
+
+| Profile | Result | Evidence |
+|---|---|---|
+| `issue7-signup-success` | Passed the live profile assertions; runner exit 0 | Signup intent 200, proof 202, one exact account, callback 302, callback replay denial, OIDC state preserved, PKCE token 200, request-correlated single-use provider ID `infinispan`; stage `complete`. |
+| `issue7-user-readback-empty` | Failed/incomplete; runner exit 1 | Intent 200, proof 503, browser status 200/pending, no callback/code disclosure, retained exact account, factory selected with mode `empty`, one readback fault and one correlated mapping failure. Strict factory/operation/outcome fixture witnesses were unavailable; failure gate `store_correlation`. Fresh recovery was not reached. |
+
+Production image: `8ee62173308c5351a46111d4e3d56119bcda7eb1ba0f529a6afa21de6c08bf56`, digest `sha256:8f9c1a5d3c3232674d048cb4d10d16e3bf251876be6da2f9ff8c764fb06f68b3`.
+
+Readback image: `0746a48323bf07f9b95f28c19bade48198705fca4909d91e56063873634907db`, digest `sha256:e0a0afcc1210651ecdef59a29376742a7e43128936ecc330b6085fed279bb22e`. The readback target persists `/auth` at build time and the harness uses `start --optimized`; production and store launch paths are unchanged.
+
+Both observed Keycloak 26.8.0, one node, effective `dev-file` database and `local` cache mode, and Registry source `628120989703d146da50af97b4602f1f4aa3a068`. The generic show-config provider path remained unavailable. The ordinary-signup request-correlated consume marker independently established provider ID `infinispan` for that operation; it does not establish every provider configuration or persistence guarantee.
+
+Both runs verified matching pre/post container, volume, and network inventories, no retained run CID directories/admin env files, and preservation of the pre-existing shared network. A preflight-only socket bind failure before the empty profile invoked the harness was not a profile attempt; no listener existed, and reuse-address preflight corrected the TIME_WAIT conflict.
+
+## Stop and remaining work
+
+The campaign stopped after the empty profile's missing fixture witnesses. Two of seven renewed attempts are consumed. Throw, overcap, consume-loss, accepted-receipt-write, and accepted-receipt-write-false remain unattempted in this campaign. No retry is implied.
+
+## Offline classifier correction after the stop
+
+Offline diagnosis reproduced a concrete parser defect: the fixture classifier accepted a bare `Wallet account mapping lookup unavailable` message, but rejected that identical message inside Keycloak's standard timestamp/WARN/logger/thread envelope. Its separate diagnostic counters used substring matching, explaining how the counters can observe the intended fault while the strict witness remains unavailable. The exact failed run's raw log window was not retained, so this is a demonstrated defect consistent with that receipt, not a proven reconstruction of its cause.
+
+The regression failed for all three readback modes before the fix. The classifier now strips only the pinned `WalletLoginTransportHandler` WARN envelope before checking the exact request-bound message. It retains every candidate and still rejects duplicate or malformed records, wrong logger/level/request, trailing text, unknown fixture markers, and contradictory modes. Repeated factory creation is already supported and was not changed. The all-mode scripted main/dispatch/fault/recovery test now uses the formatted logger line and passes through final checkpoint sanitization.
+
+The final canonical Python suite passes 354 tests; compilation, duplicate-test-name checks, and `git diff --check HEAD` pass. This was an offline-only correction: no image build, runtime probe, profile retry, commit, push, PR or GitHub issue update was performed. At that offline checkpoint the empty profile remained failed/incomplete and recovery remained unqualified; the later separately authorized retry is recorded below. Further live execution still requires explicit authorization; do not weaken the required exact request/provider/operation correlation or infer passing recovery from a fault response alone.
+
+## Separately authorized empty-readback retry
+
+After the offline correction, one explicitly approved retry of `issue7-user-readback-empty` passed with runner exit 0 and stage `complete`. It used the same readback image `0746a48323bf07f9b95f28c19bade48198705fca4909d91e56063873634907db` / digest `sha256:e0a0afcc1210651ecdef59a29376742a7e43128936ecc330b6085fed279bb22e`, source HEAD `7d308304b9516c51566710376fa096e026c86e7c`, source snapshot SHA-256 `de8be0a5d382eb18fe7f6539c758b92aa74debb3f706936bcc592337276e1cb4`, and corrected harness SHA-256 `19a24b76b8e2581fe11e1f65bf37e4e12a25af01633cd9addccb98c2be3e90eb`.
+
+The faulted request returned 503, browser status remained 200/pending, no callback/code was exposed, and one exact enabled account was retained. All strict fixture witnesses were observed: factory, request-bound `post_create_exact_attribute_read`, and `empty` outcome for `issue7-user-readback-fault`. One injection and one correlated production mapping failure were recorded. A distinct fresh explicit signup returned proof 202, reused the same local subject, retained exactly one enabled account (counts `[1, 1]`), completed callback 302 and PKCE 200. This is live wrapper-mediated application-path recovery on one node, not a production-provider-originated fault or a distributed guarantee.
+
+Cleanup was verified with matching pre/post inventories and no retained CID/admin env files; the shared network was preserved. The retry receipt is `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-user-readback-empty-retry-1.json`. At this checkpoint, two distinct profiles had passing live results and five remained unattempted. Approval covered only that next retry; no other profile ran at that time. Issue #7 was still open/unqualified at that checkpoint. Commit, push, PR, merge and closure remained separately gated.
+
+## Separately authorized throwing-readback profile
+
+The next separately approved profile, `issue7-user-readback-throw`, passed with runner exit 0 and stage `complete`. It used readback image `0746a48323bf07f9b95f28c19bade48198705fca4909d91e56063873634907db` / digest `sha256:e0a0afcc1210651ecdef59a29376742a7e43128936ecc330b6085fed279bb22e`, source HEAD `7d308304b9516c51566710376fa096e026c86e7c`, source snapshot `c1368f34429eeb3c7b16e6e57484665b2701e78be89e0dbfd5cc65e68f14bb7e`, and harness `19a24b76b8e2581fe11e1f65bf37e4e12a25af01633cd9addccb98c2be3e90eb` (SHA-256).
+
+The injected throwing readback returned 503, left browser status 200/pending with no callback/code disclosure, and retained one exact enabled account. Factory, exact request-bound operation, and `throw` outcome witnesses were observed; injection and correlated mapping failure counts were both one. Fresh explicit signup returned proof 202, reused the same subject with account counts `[1, 1]`, and completed callback 302 and PKCE 200. This is wrapper-mediated one-node application-path evidence, not a provider-originated failure or distributed guarantee. Cleanup matched the baseline, with no retained CID/admin env files and the shared network preserved.
+
+Receipt: `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-user-readback-throw.json`. Roll-up at that checkpoint: three distinct profiles had passed; overcap and the three store-recovery profiles remained unattempted. No additional live profile ran under that approval. Issue #7 remained open/unqualified at that checkpoint; no commit, push, PR, merge or closure occurred.
+
+## Remaining-profile continuation and stop
+
+The user approved continuing the remaining qualifications. `issue7-user-readback-overcap` passed: one request-bound injection exposed 65 distinct synthetic candidates, proof returned 503, browser remained pending without callback/code, and one exact account remained. Factory/operation/`over_cap` outcome witnesses and one correlated mapping failure were observed. Fresh explicit signup reused the same subject with account counts `[1, 1]`, proof 202, callback 302, and PKCE 200. This is wrapper-mediated application-path evidence; the 65 candidates are synthetic, not persisted user rows.
+
+The next profile, `issue7-consume-loss-recovery`, failed/incomplete at `proof_http_status`: intent 200, proof 202 instead of expected injected-fault 503, `store_provider_selected=false`, zero fault and correlated failure counts, and all fixture witnesses unavailable. Recovery was not reached. Advertised `issue7-fault-injection` factory availability does not prove selection or interception. Cause remains unknown. The campaign stopped; no receipt-write profile was attempted.
+
+Both runs used source HEAD `7d308304b9516c51566710376fa096e026c86e7c`, source snapshot SHA-256 `5d3854c457e9a7aa79cf4d237d8a24f615fccdc03903d9fb93e1a3d43a325ac0`, and harness SHA-256 `19a24b76b8e2581fe11e1f65bf37e4e12a25af01633cd9addccb98c2be3e90eb`. Overcap used readback image `0746a48323bf07f9b95f28c19bade48198705fca4909d91e56063873634907db` / digest `sha256:e0a0afcc1210651ecdef59a29376742a7e43128936ecc330b6085fed279bb22e`. Consume-loss used store image `2df8fb8e41a04b62bb15af811e540d4e0dc408a3be10e4472025ab127ed9fa59` / digest `sha256:b632afa671c67a91d683060f89d1bc917e1c7f8ffa018159a90b15cb5fa99ef6`.
+
+Both receipts verified cleanup with matching pre/post inventories, no retained CID/admin env files, and the shared network preserved. Durable receipts are `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-user-readback-overcap.json` and `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-consume-loss-recovery.json`.
+
+Roll-up at that checkpoint: four distinct profiles had passed; consume-loss had failed/incomplete; two receipt-write profiles were still unattempted at that point. The earlier empty failure and passing retry remain distinct historical runs. Issue #7 was still open/unqualified at that checkpoint; no PR/merge recommendation was made, and no commit, push, PR, merge, or closure occurred then.
+
+## Offline store startup-contract correction
+
+After the consume-loss failure, separately authorized offline diagnosis found the store profile still launched its prebuilt image with `start-dev`, unlike the corrected optimized readback path. The application's store is obtained from `session.singleUseObjects()` and the test builder includes the proper SingleUseObjectProviderFactory service entry. Factory advertisement does not establish which provider served the failed request.
+
+A launcher regression failed before changing the store profile to `start --optimized`, retaining its existing explicit HTTPS hostname, HTTP listener, proxy settings, `--db=dev-file`, and startup `--cache=local`. A second build-contract regression failed because the store target did not persist `/auth`; the target now includes `--http-relative-path=/auth` in `kc.sh build`. Both regressions and the canonical 354-test Python suite pass, along with compilation and diff checks. Normal production/default and Issue #6 launch behavior is unchanged.
+
+This corrects an offline-observed startup contract, not a proven reconstruction of the missing consume-loss injection. A separately authorized offline no-cache rebuild succeeded with `--pull=never --network=none`, producing store image `806dfe5346fcca38af690f028a16e3120d2dfb310fd727d51fe1f1dca4e23bde` / digest `sha256:2d7107022483a9ecfa0cfaeb04b5e1f40190744e41c5d40481bfd484f45838f3`. Image history confirms `/auth` and `issue7-fault-injection` in the final build command. This image was subsequently started once for an explicitly authorized consume-loss retry. The retry is recorded below. Cleanup left no containers or volumes; the shared network is unchanged. The consumed failed attempt remains unqualified; fresh runtime authorization is required. No Java production behavior or fault provider behavior was changed, and no additional profile was attempted.
+
+## Optimized-image consume-loss retry
+
+The separately authorized retry on image `806dfe5346fcca38af690f028a16e3120d2dfb310fd727d51fe1f1dca4e23bde` returned runner exit 1 at `store_correlation`, before recovery. Intent was 200, proof was 503, and one correlated production consume failure was observed. However, `store_provider_selected=false`, fault count zero, and factory/operation/outcome fixture witnesses were unavailable. The intended decorator fault is not established; HTTP 503 alone is not qualification. The raw log window was not retained, so the remaining cause is unknown.
+
+The run used source snapshot SHA-256 `a59e264c5fe43a9d666ddfca8dc5d92a6804d117005e23ddbdb155cccafc7bb9` and harness SHA-256 `d02b93c6344a681d0ccb4df4bd109401b852d31e515f2535415decf4cc41e699` at HEAD `7d308304b9516c51566710376fa096e026c86e7c`. Receipt: `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-consume-loss-recovery-retry-1.json`. Cleanup matched baseline with no retained CID/admin env files; the shared network was preserved. The live campaign stopped again, and neither receipt-write profile ran. Four distinct profiles pass; consume-loss remains incomplete; two receipt-write profiles remain unattempted. Further runtime activity requires fresh authorization after diagnosis.
+
+## Offline store-correlation correction after the optimized retry
+
+A real-store regression reproduced an injector defect: transaction and accepted-receipt storage keys already suffix `SHA-256(handle)` in hexadecimal. The injector passed that stored digest to the handler's raw-handle hashing helper, producing a second hash, while production/harness correlation uses the first 32 hex characters of the original handle digest. Previous injector unit fixtures incorrectly used unhashed storage-key suffixes.
+
+The new regression drives the actual `WalletLoginTransactionStore.issue`, consume, and receipt-publication seams through the test decorator for all three store modes. It failed on the request-correlated operation marker before the fix. The test-only injector now validates the 64-character lowercase hex storage digest and takes its first 32 characters without rehashing. Operation and exact fault/outcome markers now match the handler's raw-handle correlation. Existing test fixtures now use hashed key suffixes, and the full offline build passes 218 Maven tests with zero failures/errors/skips plus 354 Python tests, compilation and diff checks.
+
+No production behavior, failure response or correlation requirement was relaxed. This is a reproduced defect consistent with the failed witness receipt, not a claim that the failed run completed recovery. The corrected injector was then packaged by a separately authorized offline no-cache image build: image `1f559071f3494a764c4ebee9d2376aed325ff620c08c1b4299050ce74db8b5d7` / digest `sha256:ad008273417774219e2e8c0181f86bf799d3ec9074083d5a329ca2cf22b3309a`. At that offline build checkpoint, image inspection confirmed the identity; no containers or volumes remained and the shared network was unchanged. The image was subsequently used for receipt-write profiles and the corrected consume-loss gate, whose receipts appear above. The two prior consume-loss attempts remain historical failures; the later corrected pass does not erase them. No Java production behavior or fault provider behavior was changed.
+
+Durable sanitized receipts are retained at `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-signup-success.json` and `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-user-readback-empty.json`. They are local artifacts, not committed/public qualification receipts. Final evidence closeout and independent review remain pending; this branch is not recommended for merge.

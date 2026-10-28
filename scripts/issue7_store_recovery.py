@@ -25,7 +25,8 @@ FAILURE_GATES = {'unclassified', 'proof_http_status', 'account_readback', 'proof
     'signup_challenge', 'signup_intent', 'signup_authorization_request',
     'signup_login_page_decode', 'signup_login_page_parse', 'signup_intent_action_request',
     'signup_intent_response_decode', 'signup_intent_response_parse',
-    'signup_challenge_request', 'signup_challenge_decode', 'proof_prepare', 'token_exchange'}
+    'signup_challenge_request', 'signup_challenge_decode', 'proof_prepare', 'token_exchange',
+    'provider_witness'}
 FAILURE_CATEGORIES = {'runtime_error', 'assertion_failed'}
 CONFIRMED_PHASES = frozenset({'intent', 'proof', 'account', 'callback', 'token'})
 FACTORY_CREATE_MARKER = 'ISSUE7_TEST_PROVIDER: factory create invoked'
@@ -282,7 +283,8 @@ def run(api, client, key, identifier, container, admin_client, image, progress, 
         and recovered.get('callback_code_returned') is True)
   else:
     recovered = api.signup_wallet_flow(api.Client(), key, identifier, container,
-        admin_client, progress, image, reuse_existing=True)
+        admin_client, progress, image, reuse_existing=True,
+        retained_subject=failed['expected_existing_subject'])
     valid = recovered.get('signup_proof_http') == 202 and recovered.get('exact_mapped_users') == 1
   same_subject = recovered.get('local_subject_matches_expected') is True
   api.require(valid and same_subject and recovered.get('callback_http') in {302, 303}

@@ -1,0 +1,59 @@
+{
+  "cleanup_verified": true,
+  "evidence": [
+    {
+      "resolver_runtime": {
+        "cache_mode_configured": "local",
+        "cache_mode_effective": "local",
+        "cache_mode_effective_evidence": "infinispan_configuration_log",
+        "cache_stack_effective": null,
+        "database_mode_configured": "dev-file",
+        "database_mode_effective": "dev-file",
+        "harness_sha256": "035362b2071f2aa0d3e246728191c6af2f1bb5f54c4573aad4ed771417461404",
+        "identity_commit": "2caec24de52c2dbe241e72fe317281c051d03f89",
+        "image_digest": "sha256:8f9c1a5d3c3232674d048cb4d10d16e3bf251876be6da2f9ff8c764fb06f68b3",
+        "keycloak_config_fields_present": [
+          "database_mode_effective"
+        ],
+        "keycloak_config_read_status": "show_config_fields_missing",
+        "keycloak_nodes": "one",
+        "keycloak_version": "26.8.0",
+        "registry_commit": "628120989703d146da50af97b4602f1f4aa3a068",
+        "runtime_command_fields_present": [
+          "cache_mode_configured",
+          "database_mode_configured"
+        ],
+        "runtime_lock_sha256": "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff",
+        "runtime_manifest_sha256": "d0506c4d2e6a3bd5fa52e074417443243df597379c61d8c55ac6927e04e21f89",
+        "runtime_qualification_status": "open_runtime_facts_unavailable",
+        "single_use_object_provider_configured": "unavailable",
+        "single_use_object_provider_ids": [
+          "infinispan"
+        ],
+        "single_use_object_provider_path": "unavailable"
+      },
+      "signup_case": {
+        "callback_http": 302,
+        "callback_replay": true,
+        "evidence_provenance": "harness-application-path-only",
+        "exact_mapped_users": 1,
+        "oidc_state_preserved": true,
+        "pkce_token_http": 200,
+        "signup_intent_action_http": 200,
+        "signup_proof_http": 202,
+        "single_use_object_provider_id": "infinispan",
+        "stage": "complete"
+      }
+    }
+  ],
+  "finished_at": "2026-10-28T04:55:52.606380+00:00",
+  "harness_sha256": "035362b2071f2aa0d3e246728191c6af2f1bb5f54c4573aad4ed771417461404",
+  "image_digest": "sha256:8f9c1a5d3c3232674d048cb4d10d16e3bf251876be6da2f9ff8c764fb06f68b3",
+  "image_id": "8ee62173308c5351a46111d4e3d56119bcda7eb1ba0f529a6afa21de6c08bf56",
+  "profile": "issue7-signup-success",
+  "runner_exit": 0,
+  "source_head": "7d308304b9516c51566710376fa096e026c86e7c",
+  "source_snapshot_sha256": "a67dc52be7e7556a83437c645018be7f6d146b72db4300cdb2d0610fe72d594d",
+  "started_at": "2026-10-28T04:54:45.330616+00:00",
+  "state": "runner_returned"
+}

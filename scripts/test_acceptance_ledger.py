@@ -8,6 +8,24 @@ import unittest
 README = Path(__file__).parents[1] / "README.md"
 SECURITY_REVIEW = Path(__file__).parents[1] / "docs/security-review.md"
 
+# Historical executed gates only: mode, selected provider/wrapper, operation, outcome.
+# Ordinary signup has no injected fault operation or outcome.
+ISSUE7_ARCHIVED_PROFILES = {
+    'issue7-signup-success': (None, 'infinispan', None, None),
+    'issue7-user-readback-empty': (
+        'empty', 'issue7-user-readback-fault', 'post_create_exact_attribute_read', 'empty'),
+    'issue7-user-readback-throw': (
+        'throw', 'issue7-user-readback-fault', 'post_create_exact_attribute_read', 'throw'),
+    'issue7-user-readback-overcap': (
+        'over-cap', 'issue7-user-readback-fault', 'post_create_exact_attribute_read', 'over_cap'),
+    'issue7-consume-loss-recovery': (
+        'consume-loss', 'issue7-fault-injection', 'transaction_remove', 'committed_then_threw'),
+    'issue7-accepted-receipt-write-recovery': (
+        'accepted-receipt-write', 'issue7-fault-injection', 'accepted_replace', 'committed_then_threw'),
+    'issue7-accepted-receipt-write-false-recovery': (
+        'accepted-receipt-write-false', 'issue7-fault-injection', 'accepted_replace', 'returned_false_before_commit'),
+}
+
 class AcceptanceLedgerTest(unittest.TestCase):
   def test_issue7_store_recovery_is_merged_and_ceremonies_are_distinct(self):
     readme = README.read_text()
@@ -31,10 +49,10 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('does not observe current Registry verification', doc)
     self.assertIn('exactly one marker correlated to that request ID', doc)
     self.assertIn('This is fixture-backed offline application-path evidence only, not runtime/provider qualification.', doc)
-    self.assertIn('These are offline fixture-backed orchestration/parser signals only—not runtime provider qualification; Issue #7 remains OPEN.', readme)
+    self.assertIn('These are offline fixture-backed orchestration/parser tests, not standalone runtime qualification;', readme)
     self.assertIn('Failure checkpoints may include a transaction-consume provider ID only when one production-format consume marker in the scripted log fixture is exactly correlated to the request ID', readme)
     self.assertIn("This witness does not identify the later failure's cause or prove accepted-receipt persistence", readme)
-    self.assertIn('actual Keycloak/UserProvider/JPA runtime behavior remains unqualified', readme)
+    self.assertIn('arbitrary provider-originated UserProvider/JPA failure behavior remains unqualified', readme)
     self.assertIn('bounded last-confirmed signup progress', readme)
     self.assertIn('status alone never selects a gate', readme)
     self.assertNotIn('349 tests passed', readme)
@@ -42,58 +60,272 @@ class AcceptanceLedgerTest(unittest.TestCase):
     issue7_rows = [line for line in readme.splitlines() if line.startswith('| Keycloak #7 signup provisioning and recovery')]
     self.assertEqual(2, len(issue7_rows))
     self.assertNotEqual(issue7_rows[0], issue7_rows[1])
-    self.assertIn('PR #42 provides offline request-correlated fixture witnesses; PR #43\'s distinct-fresh-Identity correction remains not live-verified.', issue7_rows[0])
-    self.assertIn('The exact 13-module README/CI Python acceptance command passed 350 tests', issue7_rows[1])
+    self.assertIn('Scoped seven-profile one-node matrix passed', issue7_rows[0])
+    self.assertIn('four corrected-gate reruns', issue7_rows[0])
+    self.assertIn('Scoped 7/7 one-node profile matrix passed', issue7_rows[1])
+    self.assertIn('corrected original-subject continuity', issue7_rows[1])
+    self.assertNotIn('4/7', issue7_rows[0] + issue7_rows[1])
+    self.assertNotIn('Three profiles remain unattempted', issue7_rows[0] + issue7_rows[1])
+    self.assertIn('Historical 2026-10-27 seven-profile campaign checkpoint', readme)
+    self.assertIn('At this historical checkpoint, four profile names had been invoked', doc)
+    self.assertIn('later receipt-write passes and four corrected-gate continuity reruns', doc)
+    self.assertIn('This particular 2026-10-27 throw attempt remains failed/consumed', doc)
+    readback_doc = (README.parent / 'docs/acceptance/issue-7-user-readback-recovery-profile.md').read_text()
+    self.assertIn('timed out before discovery', readback_doc)
+    self.assertIn('marker counts for that run are unavailable, not zero', readback_doc)
+    self.assertIn('factory now calls `super.postInit(factory)`', readback_doc)
+    self.assertIn('image `82042abb87f89c7d493d85b685504554f21bf0acbe9df7624351670dfe8f0196`', readback_doc)
+    self.assertIn('zero factory/mode/operation/fault/outcome markers', readback_doc)
+    self.assertIn('A second authorized diagnostic-only run used the same exact image', readback_doc)
+    self.assertIn('sanitizer extracted no exception classes or stack frames', readback_doc)
+    self.assertIn('A third authorized startup-only diagnostic used `start --optimized --hostname=localhost --http-enabled=true`', readback_doc)
+    self.assertIn('reached OIDC discovery (`keycloak_started=true`, zero errors/exceptions)', readback_doc)
+    self.assertIn('Historical 2026-10-27 attempts:', readback_doc)
+    self.assertIn('corrected-gate reruns later passed', readback_doc)
+    self.assertIn('At this historical checkpoint, four profile names had been invoked', doc)
+    self.assertIn('later receipt-write passes and four corrected-gate continuity reruns', doc)
+    self.assertIn('intent 200/proof 202 instead of injected-fault 503', doc)
+    self.assertIn('startup factory marker absent (`user_readback_factory_selected=false`)', doc)
+    self.assertIn('This particular 2026-10-27 throw attempt remains failed/consumed', doc)
+    renewed = (README.parent / 'docs/acceptance/issue-7-renewed-qualification.md').read_text()
+    self.assertIn('Latest renewed campaign', readme)
+    self.assertIn('Passed the live profile assertions; runner exit 0', renewed)
+    self.assertIn('Failed/incomplete; runner exit 1', renewed)
+    self.assertIn('Two of seven renewed attempts are consumed', renewed)
+    self.assertIn('timestamp/WARN/logger/thread envelope', renewed)
+    self.assertIn('354 tests', renewed)
+    self.assertIn('not a proven reconstruction of its cause', renewed)
+    self.assertIn('recovery remained unqualified', renewed)
+    self.assertIn('passed with runner exit 0 and stage `complete`', renewed)
+    self.assertIn('At this checkpoint, two distinct profiles had passing live results and five remained unattempted.', renewed)
+    self.assertIn('counts `[1, 1]`', renewed)
+    self.assertIn('The retry receipt is `/home/ben/.hermes/artifacts/issue7-renewed-qualification/issue7-user-readback-empty-retry-1.json`', renewed)
+    self.assertIn('`issue7-user-readback-throw`, passed with runner exit 0', renewed)
+    self.assertIn('three distinct profiles had passed; overcap and the three store-recovery profiles remained unattempted', renewed)
+    self.assertIn('The seven-profile one-node matrix now passes', readme)
+    self.assertIn('passing seven-profile one-node matrix', renewed)
+    self.assertIn('## Corrected-gate live reruns (2026-10-28)', renewed)
+    self.assertIn('original failed-ceremony subject', renewed)
+    self.assertIn('All four full sanitized attempt receipts remain', renewed)
+    self.assertIn('The generic active SingleUseObjectProvider configuration path remains unavailable', renewed)
+    self.assertIn('Verification after corrected-gate evidence', renewed)
+    self.assertIn('canonical Python acceptance command passes **360 tests**', renewed)
+    self.assertIn('previous clean offline Maven run passed **218 tests**', renewed)
+    self.assertIn('Historical original seven-profile matrix', renewed)
+    self.assertIn('four corrected receipts above', renewed)
+    self.assertIn('`issue7-user-readback-overcap` passed', renewed)
+    self.assertIn('four distinct profiles had passed; consume-loss had failed/incomplete; two receipt-write profiles were still unattempted at that point', renewed)
+    self.assertIn('two receipt-write profiles were still unattempted at that point', renewed)
+    self.assertIn('proof 202 instead of expected injected-fault 503', renewed)
+    self.assertIn('Offline store startup-contract correction', renewed)
+    self.assertIn('store image `806dfe5346fcca38af690f028a16e3120d2dfb310fd727d51fe1f1dca4e23bde`', renewed)
+    self.assertIn('This image was subsequently started once', renewed)
+    self.assertIn('returned runner exit 1 at `store_correlation`', renewed)
+    self.assertIn('Intent was 200, proof was 503', renewed)
+    self.assertIn('neither receipt-write profile ran', renewed)
+    self.assertIn('218 Maven tests', renewed)
+    self.assertIn('first 32 characters without rehashing', renewed)
+    self.assertIn('image `1f559071f3494a764c4ebee9d2376aed325ff620c08c1b4299050ce74db8b5d7`', renewed)
+    self.assertIn('At that offline build checkpoint, image inspection confirmed the identity', renewed)
+    self.assertIn('not a proven reconstruction of the missing consume-loss injection', renewed)
+    self.assertIn('At that offline-fix checkpoint, no image build or live retry had occurred.', renewed)
+
+  def test_issue7_archived_live_matrix_has_exact_profiles_and_completed_evidence(self):
+    import json
+    root = README.parent / 'docs/acceptance/evidence/issue7'
+    records = [json.loads(path.read_text()) for path in sorted(root.glob('*.json'))]
+    expected = set(ISSUE7_ARCHIVED_PROFILES)
+    self.assertEqual(expected, {record['profile'] for record in records})
+    self.assertEqual(len(expected), len(records))
+    for record in records:
+      with self.subTest(profile=record['profile']):
+        self.assert_issue7_archived_record(record)
+
+  def test_issue7_corrected_gate_has_exact_four_profiles_and_original_subject_provenance(self):
+    import json
+    root = README.parent / 'docs/acceptance/evidence/issue7-corrected'
+    records = [json.loads(path.read_text()) for path in sorted(root.glob('*.json'))]
+    expected = {
+        'issue7-user-readback-empty', 'issue7-user-readback-throw',
+        'issue7-user-readback-overcap', 'issue7-consume-loss-recovery'}
+    self.assertEqual(expected, {record['profile'] for record in records})
+    self.assertEqual(len(expected), len(records))
+    source_hashes = set()
+    harness_hashes = set()
+    for record in records:
+      with self.subTest(profile=record['profile']):
+        self.assertEqual('corrected_original_subject_continuity', record['gate'])
+        self.assertEqual('7d308304b9516c51566710376fa096e026c86e7c', record['source_head'])
+        self.assertEqual('5adcfeb46c1af85119549b728cbaf47929389136231a45b85f2e662176220abb',
+            record['source_snapshot_sha256'])
+        self.assertEqual('e69609aae996f4df52dab07ebd2b68fe8b16de21ead8b5eeb05de53b1256c5a4',
+            record['harness_sha256'])
+        expected_image = ('0746a48323bf07f9b95f28c19bade48198705fca4909d91e56063873634907db'
+            if 'user-readback' in record['profile'] else
+            '1f559071f3494a764c4ebee9d2376aed325ff620c08c1b4299050ce74db8b5d7')
+        self.assertEqual(expected_image, record['image_id'])
+        self.assert_issue7_archived_record(record, require_original_subject=True)
+        source_hashes.add(record['source_snapshot_sha256'])
+        harness_hashes.add(record['harness_sha256'])
+    self.assertEqual(1, len(source_hashes))
+    self.assertEqual(1, len(harness_hashes))
+
+  def assert_issue7_archived_record(self, record, require_original_subject=False):
+    self.assertIn(record['profile'], ISSUE7_ARCHIVED_PROFILES)
+    mode, provider, operation, outcome = ISSUE7_ARCHIVED_PROFILES[record['profile']]
+    self.assertEqual(0, record['runner_exit'])
+    self.assertIs(True, record['cleanup_verified'])
+    self.assertRegex(record['image_id'], r'^[0-9a-f]{64}$')
+    self.assertRegex(record['image_digest'], r'^sha256:[0-9a-f]{64}$')
+    self.assertRegex(record['harness_sha256'], r'^[0-9a-f]{64}$')
+    evidence = record['evidence'][-1]
+    self.assertEqual('26.8.0', evidence['resolver_runtime']['keycloak_version'])
+    self.assertEqual('one', evidence['resolver_runtime']['keycloak_nodes'])
+    if record['profile'] == 'issue7-signup-success':
+      case = evidence['signup_case']
+      self.assertEqual(provider, case['single_use_object_provider_id'])
+      self.assertEqual(202, case['signup_proof_http'])
+      self.assertIs(True, case['callback_replay'])
+      self.assertIs(True, case['oidc_state_preserved'])
+    else:
+      readback = 'user-readback' in record['profile']
+      case = evidence['issue7_single_node_signup_recovery' if readback else 'issue7_store_recovery']
+      self.assertEqual('observed', case['fixture_factory_witness'])
+      self.assertEqual('observed', case['fixture_operation_witness'])
+      self.assertEqual(provider, case['fixture_selected_provider_id'])
+      self.assertEqual(operation, case['fixture_operation'])
+      self.assertEqual(outcome, case['fixture_mutation_outcome'])
+      self.assertIs(True, case['account_retained_after_failure'])
+      self.assertIs(True, case['failure_responses_no_callback_or_code'])
+      if require_original_subject:
+        self.assertIs(True, case['same_local_subject'])
+      if readback:
+        self.assertEqual(mode, case['user_readback_fault_mode'])
+        self.assertEqual(mode, case['effective_user_readback_fault_mode'])
+        self.assertEqual(503, case['provider_fault_http'])
+        self.assertEqual(202, case['fresh_signup_proof_http'])
+        self.assertEqual([1, 1], case['exact_enabled_local_accounts_after_each_signup'])
+        self.assertEqual(1, case['post_create_read_fault_count'])
+      else:
+        self.assertEqual(mode, case['store_fault_mode'])
+        self.assertEqual(503, case['signup_proof_http'])
+        self.assertEqual(404, case['browser_status_http'])
+        self.assertEqual(404, case['retry_http'])
+        self.assertEqual(1, case['store_fault_count'])
+        self.assertIs(True, case['store_provider_selected'])
+        self.assertEqual('signup' if 'consume-loss' in record['profile'] else 'login', case['recovery_intent'])
+    self.assertEqual('complete', case['stage'])
+    self.assertEqual(1, case['exact_mapped_users'])
+    self.assertEqual(302, case['callback_http'])
+    self.assertEqual(200, case['pkce_token_http'])
+
+  def test_issue7_archived_records_reject_wrong_profile_fault_evidence(self):
+    import copy
+    import json
+    roots = [
+        README.parent / 'docs/acceptance/evidence/issue7',
+        README.parent / 'docs/acceptance/evidence/issue7-corrected']
+    for root in roots:
+      for path in sorted(root.glob('*.json')):
+        record = json.loads(path.read_text())
+        corrected = record.get('gate') == 'corrected_original_subject_continuity'
+        self.assert_issue7_archived_record(record, require_original_subject=corrected)
+        profile = record['profile']
+        if profile == 'issue7-signup-success':
+          case_key = 'signup_case'
+          mutations = [('single_use_object_provider_id', 'issue7-fault-injection')]
+        else:
+          readback = 'user-readback' in profile
+          case_key = 'issue7_single_node_signup_recovery' if readback else 'issue7_store_recovery'
+          case = record['evidence'][-1][case_key]
+          modes = ['user_readback_fault_mode', 'effective_user_readback_fault_mode'] if readback else ['store_fault_mode']
+          mutations = [(field, 'throw' if case[field] != 'throw' else 'empty') for field in modes]
+          mutations.extend([
+              ('fixture_mutation_outcome', 'unavailable'),
+              ('fixture_mutation_outcome', 'empty' if case['fixture_mutation_outcome'] != 'empty' else 'throw'),
+              ('fixture_selected_provider_id', 'issue7-fault-injection' if readback else 'issue7-user-readback-fault'),
+              ('fixture_operation', 'transaction_remove' if readback else 'post_create_exact_attribute_read'),
+          ])
+          if corrected:
+            mutations.append(('same_local_subject', 'false'))
+        for field, wrong_value in mutations:
+          with self.subTest(profile=profile, corrected=corrected, field=field, wrong_value=wrong_value):
+            mutated = copy.deepcopy(record)
+            mutated['evidence'][-1][case_key][field] = wrong_value
+            with self.assertRaises(AssertionError, msg=f'{profile} accepted incorrect {field}={wrong_value}'):
+              self.assert_issue7_archived_record(mutated, require_original_subject=corrected)
 
   def test_issue7_ordinary_signup_failure_provenance_is_reconciled(self):
     readme = README.read_text()
     recovery = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
     boundary = (README.parent / 'docs/acceptance/issue-7-safe-retry-boundary.md').read_text()
-    previous_attempt = (
+    first_attempt = (
         '24f36d843774997193faee6cfe8f1ab9902ff93c',
         'baa747716f0e050e2a18e4089b701dccc7a9acf9b84ce99776eb8cbdeebea0ed',
         'fc83bfb91d11555f6be59f7aa4700ba4d0617137c7287fb1d3f111dfea5aacd2',
         'sha256:d6d184ad6ad6daa37e32ef0d5eb50202d2050e50c0ff958f672ce7ad146e3669')
-    for provenance in previous_attempt:
-      self.assertIn(provenance, recovery)
-    current_attempt = (
+    second_attempt = (
         '5310a2dc8944bd8c7cef8964e924ea4b07fb3ed0',
         '03ff2e3b7adac4a26471c0ba5065d9567e42b8b1ad1b8240416bd8b10e2067e2',
         '918defd28421a226c8d11b0b39445d99d7f805714e098c1dd68e332b30d43992',
         'sha256:79b4ec91b1482009a7f900c1d86336ff5e25702a6b826c87132a9a008f9c6aae',
         '2026-10-27T00:00:50Z', '2026-10-27T00:01:50Z')
+    latest_attempt = (
+        '7d308304b9516c51566710376fa096e026c86e7c',
+        '230bd45d918d15e55ad3a8784d916cdb02b5b0ffa71ee6548942dbf0f7b01e22',
+        '03ff2e3b7adac4a26471c0ba5065d9567e42b8b1ad1b8240416bd8b10e2067e2',
+        'b357506d52c3aa95f67d17d48a4b8a7dca09fdbfe439a72a430f32bdde4f80a1',
+        'sha256:249cd3d63121976afaf92b742e762f3d942e9a9c7f38152385d35964036bb8d8',
+        '628120989703d146da50af97b4602f1f4aa3a068')
+    for provenance in first_attempt:
+      self.assertIn(provenance, recovery)
+    for provenance in second_attempt:
+      self.assertIn(provenance, recovery)
+      self.assertIn(provenance, boundary)
+    self.assertIn(second_attempt[0], readme)
     for text in (readme, recovery, boundary):
-      for provenance in current_attempt:
+      for provenance in latest_attempt:
         self.assertIn(provenance, text)
       self.assertIn('exit code 1', text)
       self.assertIn('not timed out', text)
-      self.assertIn('no `signup_case` evidence', text)
-      self.assertIn('no request-correlated selected-provider witness', text)
-      self.assertIn('exact failure gate/cause is unavailable', text)
+      self.assertIn('request-correlated selected-provider', text)
       self.assertIn('Issue #7 remains OPEN', text)
       self.assertIn('Keycloak 26.8.0', text)
-      self.assertIn('configured/effective DB `dev-file`', text)
-      self.assertIn('configured/effective cache `local`', text)
-      self.assertIn('show_config_fields_missing', text)
-      self.assertIn('selected SingleUseObjectProvider configuration/path', text)
-      self.assertIn('unavailable', text)
-      self.assertIn('advertised as available only', text)
-    self.assertIn('account_readback', readme)
+    self.assertIn('request-correlated selected-provider witness requirement', recovery)
+    self.assertIn('proof HTTP 202', recovery)
+    self.assertIn('no `signup_case` evidence', recovery)
+    self.assertIn('failure gate/cause is unavailable', recovery)
+    self.assertIn('DB `dev-file`', recovery)
+    self.assertIn('cache `local`', recovery)
+    self.assertIn('show_config_fields_missing', recovery)
+    self.assertIn('Runtime provider configuration/path remains unavailable', recovery)
+    self.assertIn('infinispan` was advertised as available, not proven selected', recovery)
+    self.assertIn('one exact mapped account', recovery)
+    self.assertIn('callback replay denied', recovery)
+    self.assertIn('PKCE token HTTP 200', recovery)
+    self.assertIn('A separate one-attempt campaign followed on 2026-10-27', recovery)
+    self.assertIn('In that 2026-10-27 campaign, the signup runner exited 0 but detailed evidence was not retained', recovery)
+    self.assertIn('old success path performed a non-strict log read', recovery)
+    self.assertIn('provider_witness_status', (README.parent / 'scripts/wallet_login_live_e2e.py').read_text())
+    self.assertIn('classify_success_provider_witness', (README.parent / 'scripts/wallet_login_live_e2e.py').read_text())
+    self.assertIn('test_success_profile_missing_provider_witness_checkpoints_exact_gate_and_reason',
+        (README.parent / 'scripts/test_issue7_user_readback_profile.py').read_text())
+    self.assertIn('test_success_profile_distinguishes_provider_log_read_failure',
+        (README.parent / 'scripts/test_issue7_user_readback_profile.py').read_text())
     self.assertIn('account_readback', recovery)
-    self.assertIn('earlier attempt failed at `account_readback` after signup intent HTTP 200', readme)
-    self.assertIn('two authorized ordinary-signup attempts are distinct failures', readme)
+    self.assertIn('The first failed at `account_readback` after intent HTTP 200', readme)
+    self.assertIn('three distinct ordinary-signup attempts were consumed', readme)
     self.assertIn('fresh explicit authorization', readme)
-    self.assertIn('fresh explicit authorization', recovery)
-    self.assertIn('fresh explicit authorization', boundary)
-    self.assertIn('signup intent HTTP 200', readme)
+    self.assertIn('another runtime attempt requires fresh explicit authorization', recovery)
+    self.assertIn('any further runtime attempt requires fresh explicit authorization', boundary)
+    self.assertIn('after intent HTTP 200', readme)
     self.assertIn('before proof', readme)
-    self.assertIn('before proof', boundary)
     self.assertIn('no pass is claimed', recovery)
-    self.assertIn('only the ordinary `issue7-signup-success` profile receives a distinct fresh Identity after realm setup', readme)
+    self.assertIn('current uncommitted candidate extends that separation to the three UserProvider and three store recovery profiles', readme)
     self.assertIn('distinct fresh Identity after realm setup', recovery)
-    self.assertIn('not live-verified', readme)
-    self.assertIn('not a live-verified fix', recovery)
-    self.assertIn('Cleanup for the later attempt was verified by observed removal of the built image and build-stage image by exact IDs, with the post-run inventory returning to the 29-image baseline. This cleanup is not reported by the sanitized receipt', recovery)
+    self.assertIn('the third prior-campaign attempt exercised that wiring', recovery)
+    self.assertIn('Cleanup was verified after the third prior-campaign attempt', recovery)
+    self.assertIn('no run credential env file or CID directory remained', boundary)
     self.assertNotIn('349 tests passed', readme)
 
   def test_issue7_pr43_and_ci_evidence_are_separate_from_live_qualification(self):
@@ -116,7 +348,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn('corrected isolated candidate', readme + recovery + boundary)
     self.assertNotIn('No live/container/Registry invocation or image build was performed for this slice.', recovery)
     self.assertEqual(2, readme.count('| Keycloak #7 signup provisioning and recovery (single-node only) |'))
-    self.assertIn('No additional attempt or runtime operation is authorized here', readme)
+    self.assertIn('fresh authorization is consumed', readme)
 
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
     text = README.read_text()

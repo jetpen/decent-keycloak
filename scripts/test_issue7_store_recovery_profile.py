@@ -576,7 +576,7 @@ class MainCoordinatorTest(unittest.TestCase):
           'resolve_immutable_image': ('immutable-test-image', 'sha256:test'),
           '_prepare_resolver_runtime': {}, 'start_resolver_tools': 'resolver-tools',
           'start_registry': ('registry', 'bootstrap', 1234), 'free_port': 4321,
-          'write_identity': ('key', 'wrapper', 'identity'), 'start_keycloak': client,
+          'start_keycloak': client,
           'admin_token': 'token', 'keycloak_runtime_provenance': {
               'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
               'single_use_object_provider_ids': ['issue7-fault-injection']},
@@ -584,6 +584,9 @@ class MainCoordinatorTest(unittest.TestCase):
           'Client': client, 'cleanup_owned_resources': 0,
           'finish_owned_cleanup': None, 'wait_for_identity_lookup_cooldown': None}.items():
         mocks[name] = stack.enter_context(patch.object(probe, name, return_value=value))
+      mocks['write_identity'] = stack.enter_context(patch.object(probe, 'write_identity',
+          side_effect=[('seed-key', 'wrapper', 'seed-identity'),
+              ('recovery-key', 'wrapper', 'recovery-identity')]))
       signup_effect = failed if callable(failed) else ([failed] if receipt else [failed, recovered])
       signup = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
           side_effect=signup_effect))
@@ -605,7 +608,12 @@ class MainCoordinatorTest(unittest.TestCase):
         mocks['finish_owned_cleanup'].assert_called_once_with('registry', 'resolver-tools')
       self.assertEqual(probe.issue7_store_recovery.PROFILES[profile],
           mocks['start_keycloak'].call_args.kwargs['store_fault_mode'])
-      mocks['write_identity'].assert_called_once()
+      self.assertEqual(2, mocks['write_identity'].call_count)
+      self.assertEqual('wallet-login-issue7-recovery',
+          mocks['write_identity'].call_args_list[1].kwargs['label'])
+      self.assertTrue(signup.call_args_list)
+      self.assertTrue(all(call.args[2] == 'recovery-identity'
+          for call in signup.call_args_list))
     return checkpoints, signup, login, calls, mocks
 
   def test_production_main_preserves_failure_facts_in_final_sanitized_checkpoint(self):
@@ -939,6 +947,9 @@ class PackagingTest(unittest.TestCase):
     stage = dockerfile.split('FROM runtime AS issue7-store-recovery-test-runtime', 1)[1].split('FROM ', 1)[0]
     self.assertIn('COPY target/issue7-fault-provider.jar /opt/keycloak/providers/', stage)
     self.assertIn('--spi-single-use-object--provider-default=issue7-fault-injection', stage)
+    build = stage.split('kc.sh build', 1)[1].splitlines()[0]
+    self.assertIn('--db=dev-file', build)
+    self.assertIn('--http-relative-path=/auth', build)
     self.assertNotIn('issue7-fault-provider.jar', dockerfile.split('FROM runtime AS issue7-store-recovery-test-runtime')[0])
     client = Mock()
     client.request.return_value = (200, {}, json.dumps({'issuer': f'https://idp.example:{probe.KC_PORT}/auth/realms/master'}).encode())
@@ -953,7 +964,10 @@ class PackagingTest(unittest.TestCase):
           store_fault_mode='accepted-receipt-write')
       command = launch.call_args.args[0]
       self.assertIn('ISSUE7_TEST_FAULT_MODE=accepted-receipt-write', command)
-      self.assertEqual('start-dev', command[command.index('test-image') + 1])
+      self.assertEqual(['start', '--optimized'],
+          command[command.index('test-image') + 1:command.index('test-image') + 3])
+      self.assertIn('--http-relative-path=/auth', command)
+      self.assertIn('--cache=local', command)
       self.assertFalse(any(arg.startswith('--spi-single-use-object') for arg in command))
       self.assertEqual([], list(Path(directory).glob('*.env')))
 
@@ -986,11 +1000,19 @@ class PackagingTest(unittest.TestCase):
 
 class ProductionEntrypointRegressionTest(unittest.TestCase):
   def test_main_runs_real_store_recovery_flows_for_every_profile(self):
+    self.run_store_recovery_main()
+
+  def test_main_rejects_replacement_account_between_consume_loss_ceremonies(self):
+    self.run_store_recovery_main(replace_subject=True)
+
+  def run_store_recovery_main(self, replace_subject=False):
     profiles = probe.issue7_store_recovery.PROFILES
-    cases = [(profile, mode, 503) for profile, mode in profiles.items()]
+    cases = ([('issue7-consume-loss-recovery', 'consume-loss', 503)] if replace_subject else
+        [(profile, mode, 503) for profile, mode in profiles.items()])
     # A proof response that violates the expected-fault assertion must still
     # preserve the available bounded witness through main()'s final checkpoint.
-    cases.append(('issue7-consume-loss-recovery', 'consume-loss', 202))
+    if not replace_subject:
+      cases.append(('issue7-consume-loss-recovery', 'consume-loss', 202))
     for profile, mode, proof_status in cases:
       with self.subTest(profile=profile, proof_status=proof_status):
         subject, identifier = 'private-retained-subject', 'private-identity'
@@ -1157,7 +1179,8 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
           stack.enter_context(patch.object(probe,'Client',side_effect=make_client))
           admin_responses=[(200,{},b'[]'),(200,{},json.dumps([user]).encode())]
           if mode == 'consume-loss':
-            admin_responses.extend([(200,{},json.dumps([user]).encode()),(200,{},json.dumps([user]).encode())])
+            observed_user = {**user, 'id': 'replacement-subject'} if replace_subject else user
+            admin_responses.extend([(200,{},json.dumps([observed_user]).encode()),(200,{},json.dumps([observed_user]).encode())])
           stack.enter_context(patch.object(probe,'admin_call',side_effect=admin_responses))
           stack.enter_context(patch.object(probe,'read_provider_fault_log_window',return_value=logs))
           stack.enter_context(patch.object(probe,'read_provider_fault_log_tail',return_value=''))
@@ -1168,7 +1191,7 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
           stack.enter_context(patch.object(probe.subprocess,'run',side_effect=openssl))
           stack.enter_context(patch.object(probe,'run',return_value=Mock(returncode=0,stdout='',stderr='')))
           if mode == 'consume-loss':
-            verify = {'sub':subject,'decent_identity_id':identifier,'exp':10**12,'iss':issuer,
+            verify = {'sub':'replacement-subject' if replace_subject else subject,'decent_identity_id':identifier,'exp':10**12,'iss':issuer,
                 'aud':probe.CLIENT,'nonce':probe.b64url(b'x'*24)}
             stack.enter_context(patch.object(probe,'verify_id_token',return_value=verify))
           else:
@@ -1179,11 +1202,18 @@ class ProductionEntrypointRegressionTest(unittest.TestCase):
           cooldown=stack.enter_context(patch.object(probe,'wait_for_identity_lookup_cooldown',wraps=probe.wait_for_identity_lookup_cooldown))
           stack.enter_context(patch.object(Path,'write_text',capture))
           with redirect_stdout(stdout):
-            if proof_status == 503:
+            if proof_status == 503 and not replace_subject:
               probe.main()
             else:
               with self.assertRaises(RuntimeError):
                 probe.main()
+        if replace_subject:
+          self.assertFalse(any(item.get('issue7_store_recovery', {}).get('stage') == 'complete'
+              for item in checkpoints))
+          self.assertNotIn('fresh-wallet:proof', events)
+          self.assertNotIn('replacement-subject', json.dumps(checkpoints))
+          self.assertNotIn(subject, json.dumps(checkpoints))
+          continue
         self.assertIsNotNone(start_keycloak)
         start_keycloak.assert_called_once()
         self.assertEqual(mode,start_keycloak.call_args.kwargs['store_fault_mode'])
