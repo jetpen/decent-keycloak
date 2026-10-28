@@ -128,6 +128,38 @@ class IdentityLookupClassificationTest(unittest.TestCase):
             'unpublished Identity produced no accepted receipt, callback, or code'):
           self._run_missing_identity_probe(redirect_during)
 
+  def test_current_identity_attempt_retains_failed_auth_outcomes(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    statuses = iter((503, 202))
+    def auth_flow_runner(*_args):
+      status = next(statuses)
+      if status == 503:
+        raise live.AuthFlowFailure({
+            'proof_post_http': 503, 'status_poll_http': 200, 'status_pending': True})
+      return {'proof_post_http': 202, 'status_poll_http': 200}
+
+    def resolver_lookup(_attempt):
+      return SimpleNamespace(stdout='{"identity_id":"id-1","owner_public_key":"'
+          + 'ab' * 32 + '"}', returncode=0)
+
+    def public_key(*_args, **_kwargs):
+      return SimpleNamespace(returncode=0, stdout=b'\x00' * 32 + bytes.fromhex('ab' * 32))
+
+    with patch.object(live.subprocess, 'run', side_effect=public_key), \
+        patch.object(live, 'packaged_resolver_readback', return_value=True), \
+        patch.object(live, 'classify_identity_lookup', return_value=('resolved', [])), \
+        patch.object(live, 'Client', return_value=object()):
+      attempts = [live.invoke_current_identity_attempt('id-1', Path('/fixture.key'),
+          'kc', 'image', number, resolver_lookup, auth_flow_runner)
+          for number in (1, 2)]
+
+    self.assertEqual([503, 202], [attempt['provider_http'] for attempt in attempts])
+    self.assertEqual([200, 200], [attempt['status_http'] for attempt in attempts])
+    self.assertTrue(attempts[0]['status_pending'])
+    self.assertTrue(all(attempt['exact_readback'] for attempt in attempts))
+
   def test_live_probe_rotates_registry_identity_and_checks_old_and_new_keys(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
     start = source.index('def stale_key_rotation_flow(')
