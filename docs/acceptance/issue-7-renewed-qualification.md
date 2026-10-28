@@ -1,6 +1,6 @@
 # Issue #7 renewed one-node qualification campaign
 
-This campaign now has a **passing seven-profile one-node matrix**. The three readback modes and consume-loss profile each passed one corrected-gate rerun with original-subject continuity enforced; the other three profiles retain their original passing receipts. All four corrected runs completed exact fault witnesses, fail-closed outcomes, recovery through callback/PKCE, and verified cleanup. This qualifies wrapper-mediated application-path faults on one node only; it does not qualify arbitrary backend-originated faults, HA, restart, distributed behavior, or broad deployment. Issue #7 remains open; no PR, merge, or closure was authorized.
+The seven-profile one-node matrix passes. The three readback modes and consume-loss profile each passed one corrected-gate rerun with original-subject continuity enforced; the other three profiles retain their original passing receipts. All four corrected runs completed exact fault witnesses, fail-closed outcomes, recovery through callback/PKCE, and verified cleanup. Fault claims are wrapper-mediated application-path evidence on one node; arbitrary backend-originated faults, HA, restart, distributed behavior, and broad deployment are not qualified. PR #46 merged at `287584c079e2d1eddb5d982300dee964089bbfd3`; its updated source-pin/runtime build passed CI on both push and pull-request events. The accepted Issue #7 scope is complete; no broader guarantee is implied.
 
 ## Corrected-gate live reruns (2026-10-28)
 
@@ -17,7 +17,7 @@ The fault wrappers and request-correlated outcomes were observed. The generic ac
 
 ## Verification after corrected-gate evidence
 
-The documented canonical Python acceptance command passes **360 tests**. Python compilation and `git diff --check HEAD` pass. Java source was unchanged by the continuity/evidence updates; the previous clean offline Maven run passed **218 tests** with zero failures/errors/skips. No image build was performed for these harness-only reruns or evidence updates. Issue #7 remains open; no PR, merge, or closure was authorized.
+At the corrected-gate evidence snapshot, the documented canonical Python command passed 360 tests and the previous clean offline Maven package passed 218 tests with zero failures/errors/skips; no image build was performed at that snapshot. After PR #46 merged, the final Python suite passed 362 tests, Java 21 Maven passed 218 tests, Python compilation and `git diff --check HEAD` passed, and the temporary Git materializer verified both locked commits. Local no-cache `resolver-builder` build passed its 11 DHT and 7 Registry outcome tests. GitHub push run `40705200981` and pull_request run `40705208247` on head `35a2a94a1b58b06d2783231f2e89aa06c34ae6ea` both passed Maven, Python, pinned-source materialization, named-context network-isolated runtime-image build, temp-source cleanup, and Keycloak 26.8.0/JDK version smoke. The seven live-profile receipts remain tied to their recorded source/image/harness provenance; no new Keycloak live profile was run for the source-materializer change.
 
 ## Historical original seven-profile matrix (pre-continuity correction)
 
@@ -52,7 +52,7 @@ A new real-main/scripted-HTTP regression swaps the Admin user ID and token subje
 
 At that offline-fix checkpoint, no image build or live retry had occurred. The canonical Python suite at that snapshot passed **359 tests**, plus compilation and diff checks; the prior clean Maven suite remains 218 passing tests, with no Java code changed by the continuity correction. The later archive-test addition and corrected-gate live results are recorded separately above. The archive guard maps each profile to exact mode/wrapper/operation/outcome and rejects wrong/unavailable mutations.
 
-All original receipt/image/harness identities remain unchanged. The four corrected-gate receipts above supplement—not rewrite—the historical records, and replace the earlier evidence bundle's continuity caveat. Issue #7 remains open; no PR, merge, or closure was authorized.
+All original receipt/image/harness identities remain unchanged. The four corrected-gate receipts above supplement—not rewrite—the historical records, and replace the earlier evidence bundle's continuity caveat. At that offline continuity-correction checkpoint, Issue #7 was still open and no PR/merge/closure had yet been authorized; PR #46 later merged and the accepted one-node scope is now complete.
 
 ## Historical chronological record (superseded by the current matrix)
 
