@@ -3,7 +3,10 @@ FROM registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d670427930
 USER 0
 WORKDIR /resolver-build
 COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py
-COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./
+COPY --from=identity-src /.pinned-commit ./sources/identity/.pinned-commit
+COPY --from=identity-src /src ./sources/identity/src
+COPY --from=registry-src /.pinned-commit ./sources/registry/.pinned-commit
+COPY --from=registry-src /src ./sources/registry/src
 COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py
 COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./
 COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/
@@ -28,11 +31,11 @@ RUN --network=none mkdir -p /tmp/gmp-root /opt/decent-resolver/lib /usr/lib64 \
  && ln -s libgmp.so.10.4.0 /opt/decent-resolver/lib/libgmp.so.10 \
  && ln -s /opt/decent-resolver/lib/libgmp.so.10.4.0 /usr/lib64/libgmp.so
 
-RUN --network=none python3.11 verify_resolver_runtime_inputs.py --archives . --manifest resolver-runtime.lock.json \
+RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json \
  && mkdir -p /resolver-build/wheelhouse /opt/decent-resolver/identity-src /opt/decent-resolver/registry-src \
  && tar -xzf resolver-wheelhouse.tar.gz -C /resolver-build/wheelhouse \
- && tar -xzf identity.tar.gz --strip-components=1 -C /opt/decent-resolver/identity-src \
- && tar -xzf registry.tar.gz --strip-components=1 -C /opt/decent-resolver/registry-src
+ && cp -a /resolver-build/sources/identity/src /opt/decent-resolver/identity-src/ \
+ && cp -a /resolver-build/sources/registry/src /opt/decent-resolver/registry-src/
 RUN --network=none python3.11 -m venv --copies /opt/decent-resolver/venv \
  && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --require-hashes -r resolver-build-requirements.lock.txt \
  && /opt/decent-resolver/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-index --find-links=/resolver-build/wheelhouse --no-build-isolation --require-hashes -r resolver-requirements.lock.txt

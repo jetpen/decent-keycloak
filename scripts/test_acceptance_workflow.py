@@ -41,6 +41,26 @@ class AcceptanceWorkflowTest(unittest.TestCase):
 
     self.assertIn("--network=none", command)
 
+  def test_resolver_sources_are_materialized_outside_repo_and_cleaned_up(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+    materialize = workflow.split(
+        "      - name: Materialize pinned resolver Git sources and verify runtime provenance\n", 1)[1].split(
+        "      - name: Validate the submitted diff\n", 1)[0]
+    build = workflow.split(
+        "      - name: Build and check the immutable-base provider image\n", 1)[1].split(
+        "      - name: Remove temporary resolver Git checkouts\n", 1)[0]
+    cleanup = workflow.split("      - name: Remove temporary resolver Git checkouts\n", 1)[1]
+
+    self.assertIn("${{ runner.temp }}/decent-resolver-sources-${{ github.run_id }}", materialize)
+    self.assertIn("--materialize-sources", materialize)
+    self.assertIn("--sources \"$RESOLVER_SOURCE_DIR\"", materialize)
+    self.assertIn("--build-context identity-src=", build)
+    self.assertIn("--build-context registry-src=", build)
+    self.assertIn("if: always()", cleanup)
+    self.assertIn('rm -rf -- "$RESOLVER_SOURCE_DIR"', cleanup)
+    self.assertLess(workflow.index("Materialize pinned resolver Git sources"),
+        workflow.index("Build and check the immutable-base provider image"))
+
   def test_documented_local_image_builds_are_network_isolated(self):
     readme = (ROOT / "README.md").read_text()
     local_checks = readme.split("## Local checks", 1)[1].split(
@@ -56,7 +76,7 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     readme = (ROOT / "README.md").read_text()
     import re
 
-    commands = re.findall(r"python3(?:\.11)? -m unittest \\\n(.*?) -q", readme, re.DOTALL)
+    commands = re.findall(r"python3(?:\.11)? -m unittest " + re.escape(chr(92)) + "\n(.*?) -q", readme, re.DOTALL)
     self.assertEqual(2, len(commands), "README must document both interpreter variants")
     documented_lists = [re.findall(r"scripts\.test_[a-z0-9_]+", command) for command in commands]
     for documented in documented_lists:

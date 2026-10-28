@@ -44,16 +44,14 @@
   },
   "sources": {
     "identity": {
-      "url": "https://github.com/jetpen/decent-identity/archive/2caec24de52c2dbe241e72fe317281c051d03f89.tar.gz",
+      "git_url": "https://github.com/jetpen/decent-identity.git",
       "commit": "2caec24de52c2dbe241e72fe317281c051d03f89",
-      "archive_sha256": "0d86022748ee9c8d197718a833d819037e5a32bbe2aff7e3a545083c44dd78e2",
       "requirements_lock": "resolver-requirements.lock.txt",
       "requirements_source": "production imports against the pinned Registry runtime closure"
     },
     "registry": {
-      "url": "https://github.com/jetpen/decent-registry/archive/628120989703d146da50af97b4602f1f4aa3a068.tar.gz",
+      "git_url": "https://github.com/jetpen/decent-registry.git",
       "commit": "628120989703d146da50af97b4602f1f4aa3a068",
-      "archive_sha256": "f47d9219f751fd38f1c909ec224a25c3ffe9423bc173637b0e6628a900730ed2",
       "requirements_lock": "resolver-requirements.lock.txt",
       "requirements_source": "pyproject.toml runtime requirements constrained to its pinned uv.lock"
     }

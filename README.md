@@ -121,9 +121,13 @@ python3.11 -m unittest \
   scripts.test_issue7_store_recovery_profile \
   scripts.test_acceptance_ledger -q
 python3.11 -m py_compile scripts/*.py container/*.py
-python3.11 container/build_resolver_runtime.py
+source_parent="$(mktemp -d)"
+source_dir="$source_parent/sources"
+trap 'rm -rf -- "$source_parent"' EXIT
+python3.11 container/build_resolver_runtime.py \
+  --materialize-sources --sources-directory "$source_dir"
 python3.11 container/verify_resolver_runtime_inputs.py \
-  --archives container/source-archives --manifest container/resolver-runtime.lock.json
+  --sources "$source_dir" --manifest container/resolver-runtime.lock.json
 git diff --check HEAD
 ```
 
@@ -145,7 +149,7 @@ The legacy selector `issue4-not-found` is now named `provider-not-found-diagnost
 
 **Separate #5 matrix attempt (not the #4 loopback run).** It used the same image ID/digest but harness SHA `3743c2b44e2f40f9f4ad3179d1d9a9767b0797661ce6dd9d6fc8729d1a13a7a6`. Two current-Identity attempts had exact independent readback and accepted proof. The first missing-Identity attempt had exact CLI `not_found` but Keycloak returned 503; status remained pending with no receipt or callback (`provider_registry_inconsistent`). The second missing-Identity attempt stopped at owner-key generation; the cause is unknown. A per-attempt key-filename fix was added afterward and was not live-verified. This partial #5 evidence does not qualify provider `not_found` or the complete Registry matrix.
 
-**Resolver build-input provenance.** The prior pre-wheelhouse `container/resolver-runtime.lock.json` SHA-256 was `a9380af7777df65be522f0dda83ebef4a9aadd57a991694d58ec7adb4db3e699`. It pins Identity commit `2caec24de52c2dbe241e72fe317281c051d03f89` (archive SHA-256 `0d86022748ee9c8d197718a833d819037e5a32bbe2aff7e3a545083c44dd78e2`) and Registry commit `0fa9a6b631bd77725418e990ae9ea4d974dc546c` (archive SHA-256 `bf3e912ad18a9bf33f2d7aaebbc0ce43d34708e9d449e8daf81793a70917e098`), with dependency lock SHA-256 `6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff` and Registry constraints SHA-256 `70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539`. The lock targets Python 3.11.13 and the pinned UBI 9 builder. A prior pre-wheelhouse no-cache image was built from the #4 worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`; its image ID/digest and harness SHA are in the previous loopback row. The provider JAR inside that image has SHA-256 `4a2d1364180350fffc671a7f61812ecbea5e68f04c90df95f95c0b669d4fbbcd`; the current Maven target JAR SHA-256 is `c0f84827366911b7714f8590c2055c956fdd47d87cbcb01462f88ee8f5ac05c5`. Whole-archive hashes differ, but all 46 ZIP entry names and uncompressed contents match. That historical no-cache image build downloaded hash-locked dependency artifacts and was not network-isolated. On the later staging snapshot `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`, the wheelhouse `container/resolver-wheelhouse.tar.gz` (67 files, 32,102,893 bytes, SHA-256 `3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587`) was pinned in the manifest (SHA-256 `2b33744f150fb97f3679ec1b319006f7f60ca4652589f83450e64cc140b693ae`). The no-cache build used `--pull=never --network=none` and succeeded, producing runtime image ID `b142c93da454437ef8e74dc5ab57e8b5149c632ebb1ba73c412c95247d489157`, digest `sha256:05f150e5e9c85a89b2fe6df165d0c16f0b1bd9b0cdd5646d7a816dd2aa0eecdb`. On this `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` snapshot, the documented Python suite passed 150 tests; resolver input verification, py_compile, and diff checks passed. Exact-fingerprint Standards, Spec, and Security reviews matched that snapshot; no actionable standards/security findings, while Spec kept the live missing-ID criterion open. A bounded live probe on this exact image passed positive readback, OIDC discovery, and the separate stopped-Registry `unavailable` case; the missing-ID lookup still returned `unavailable` because `dial_warning` diagnostics accompanied terminal `not found`. The subsequent README/ledger reconciliation updated this evidence and added a regression; the full Python suite passed 151 tests on the documentation/test-only follow-up. Runtime source, Dockerfile, lock manifest, wheelhouse, and image inputs were unchanged by that follow-up.
+**Resolver build-input provenance.** The prior pre-wheelhouse `container/resolver-runtime.lock.json` SHA-256 was `a9380af7777df65be522f0dda83ebef4a9aadd57a991694d58ec7adb4db3e699`. The intermediate design pinned Identity commit `2caec24de52c2dbe241e72fe317281c051d03f89` and Registry commit `0fa9a6b631bd77725418e990ae9ea4d974dc546c` with source archive hashes; that mechanism was removed. The current lock records GitHub repository URLs and exact commits, materialized into temporary shallow checkouts on demand. Dependency lock SHA-256 `6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff` and Registry constraints SHA-256 `70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539`. The lock targets Python 3.11.13 and the pinned UBI 9 builder. A prior pre-wheelhouse no-cache image was built from the #4 worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`; its image ID/digest and harness SHA are in the previous loopback row. The provider JAR inside that image has SHA-256 `4a2d1364180350fffc671a7f61812ecbea5e68f04c90df95f95c0b669d4fbbcd`; the current Maven target JAR SHA-256 is `c0f84827366911b7714f8590c2055c956fdd47d87cbcb01462f88ee8f5ac05c5`. Whole-archive hashes differ, but all 46 ZIP entry names and uncompressed contents match. That historical no-cache image build downloaded hash-locked dependency artifacts and was not network-isolated. On the later staging snapshot `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`, the wheelhouse `container/resolver-wheelhouse.tar.gz` (67 files, 32,102,893 bytes, SHA-256 `3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587`) was pinned in the manifest (SHA-256 `2b33744f150fb97f3679ec1b319006f7f60ca4652589f83450e64cc140b693ae`). The no-cache build used `--pull=never --network=none` and succeeded, producing runtime image ID `b142c93da454437ef8e74dc5ab57e8b5149c632ebb1ba73c412c95247d489157`, digest `sha256:05f150e5e9c85a89b2fe6df165d0c16f0b1bd9b0cdd5646d7a816dd2aa0eecdb`. On this `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a` snapshot, the documented Python suite passed 150 tests; resolver input verification, py_compile, and diff checks passed. Exact-fingerprint Standards, Spec, and Security reviews matched that snapshot; no actionable standards/security findings, while Spec kept the live missing-ID criterion open. A bounded live probe on this exact image passed positive readback, OIDC discovery, and the separate stopped-Registry `unavailable` case; the missing-ID lookup still returned `unavailable` because `dial_warning` diagnostics accompanied terminal `not found`. The subsequent README/ledger reconciliation updated this evidence and added a regression; the full Python suite passed 151 tests on the documentation/test-only follow-up. Runtime source, Dockerfile, lock manifest, wheelhouse, and image inputs were unchanged by that follow-up.
 
 
 
@@ -208,7 +212,7 @@ A missing setting does not enable fallback authentication: missing Registry conf
 
 Keycloak creates or loads exactly one local account with the exact raw `decent_identity_id` only after a fresh, valid wallet proof and before consuming the pending login transaction. Explicit `login` requires exactly one existing enabled match; explicit server-bound `signup` may provision a local account after proof. Concurrent provisioning is accepted only after a fresh exact-ID lookup finds one unique enabled winner; ambiguous mappings fail closed. Keycloak retains its opaque user ID as stable OIDC `sub` and releases `decent_identity_id` only as a signed ID-token claim for configured relying parties. The disposable single-node harness verifies the claim value after JWKS signature validation; relying-party Registry verification and returning-login `(iss, sub)` mapping are external consumer responsibilities and remain unqualified here.
 
-Latest #4 artifact provenance: the build-input verifier parses `container/resolver-runtime.lock.json`; `container/build_resolver_runtime.py` verifies/materializes inputs, and `container/Dockerfile` builds the runtime. The tracked source archives and repo-extracted copies match the lockfile SHA-256 values. Older untracked source-tree dumps are not build inputs; only the archives and explicit lock/requirements files are consumed by the Docker build.
+Latest #4 artifact provenance: the build-input verifier parses `container/resolver-runtime.lock.json`; `container/build_resolver_runtime.py` verifies/materializes inputs, and `container/Dockerfile` builds the runtime. The lock records GitHub repository URLs and exact Identity/Registry commits. CI shallow-clones them into a run-scoped temporary directory, verifies each checkout marker against the lock, supplies only the source trees as Docker build contexts, and removes the temporary checkouts after the image smoke; no Identity or Registry source archive is tracked or used. The separate wheelhouse remains SHA-256-locked.
 
 ## Local checks
 
@@ -221,16 +225,29 @@ git diff --check
 
 For the standalone local Registry rotation/readback probe, use the invocation documented above; it is a local integration check, not proof of production or network-wide Registry reliability.
 
-After `mvn -q -o clean package`, build both the resolver inputs and the full provider/runtime image from this worktree without using cached layers:
+After `mvn -q -o clean package`, materialize the exact Identity/Registry commits into a fresh temporary Git checkout, verify both commit markers, and pass the directories as named build contexts. The source clones are never committed and are removed when the shell exits:
 
 ```bash
-podman build --no-cache --pull=never --target resolver-builder -f container/Dockerfile --network=none \
+source_parent="$(mktemp -d)"
+source_dir="$source_parent/sources"
+trap 'rm -rf -- "$source_parent"' EXIT
+python3.11 container/build_resolver_runtime.py \
+  --materialize-sources --sources-directory "$source_dir"
+python3.11 container/verify_resolver_runtime_inputs.py \
+  --sources "$source_dir" --manifest container/resolver-runtime.lock.json
+podman build --no-cache --pull=never --target resolver-builder --network=none \
+  --build-context identity-src="$source_dir/identity" \
+  --build-context registry-src="$source_dir/registry" \
+  -f container/Dockerfile \
   -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-resolver-check .
-podman build --no-cache --pull=never --target runtime -f container/Dockerfile --network=none \
+podman build --no-cache --pull=never --target runtime --network=none \
+  --build-context identity-src="$source_dir/identity" \
+  --build-context registry-src="$source_dir/registry" \
+  -f container/Dockerfile \
   -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-current-check .
 ```
 
-`--network=none` disables networking for Dockerfile `RUN` instructions; it does not block BuildKit from pulling base images when `--pull` is used. These local commands use `--pull=never`, so the pinned base images must already be present in the local image store.
+The Git fetches run on the host before the image build and are constrained to the locked commit IDs. `--network=none` disables networking for Dockerfile `RUN` instructions; it does not block BuildKit from pulling base images when `--pull` is used. These local commands use `--pull=never`, so the pinned base images must already be present in the local image store.
 
 A successful Maven or image build is not live wallet-login qualification. Read Surefire XML totals from the current build and use the immutable image ID/digest in the live probe.
 

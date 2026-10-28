@@ -94,11 +94,14 @@ jobs:
       - name: Compile Python sources
         run: python -m py_compile scripts/*.py container/*.py
 
-      - name: Verify pinned resolver sources and runtime provenance
+      - name: Materialize pinned resolver Git sources and verify runtime provenance
+        env:
+          RESOLVER_SOURCE_DIR: ${{ runner.temp }}/decent-resolver-sources-${{ github.run_id }}
         run: |
-          python container/build_resolver_runtime.py
+          python container/build_resolver_runtime.py \
+            --materialize-sources --sources-directory "$RESOLVER_SOURCE_DIR"
           python container/verify_resolver_runtime_inputs.py \
-            --archives container/source-archives \
+            --sources "$RESOLVER_SOURCE_DIR" \
             --manifest container/resolver-runtime.lock.json
 
       - name: Validate the submitted diff
@@ -121,12 +124,26 @@ jobs:
             | grep -Fx 'org.decentwallet.keycloak.wallet.WalletChallengeAuthenticatorFactory'
 
       - name: Build and check the immutable-base provider image
+        env:
+          RESOLVER_SOURCE_DIR: ${{ runner.temp }}/decent-resolver-sources-${{ github.run_id }}
         run: |
           image=decent-keycloak-wallet-provider:acceptance
+          test -d "$RESOLVER_SOURCE_DIR/identity" && test -d "$RESOLVER_SOURCE_DIR/registry"
           docker buildx build --platform linux/amd64 --pull --no-cache --load \
             --network=none \
+            --build-context identity-src="$RESOLVER_SOURCE_DIR/identity" \
+            --build-context registry-src="$RESOLVER_SOURCE_DIR/registry" \
             --file container/Dockerfile --target runtime --tag "$image" .
           version_output=$(docker run --rm --entrypoint /opt/keycloak/bin/kc.sh "$image" --version)
           printf '%s\n' "$version_output"
           printf '%s\n' "$version_output" | grep -Fx 'Keycloak 26.8.0'
           printf '%s\n' "$version_output" | grep -Fx 'JVM: 21.0.12.1 (Red Hat, Inc. OpenJDK 64-Bit Server VM 21.0.12.1+1-LTS)'
+
+      - name: Remove temporary resolver Git checkouts
+        if: always()
+        env:
+          RESOLVER_SOURCE_DIR: ${{ runner.temp }}/decent-resolver-sources-${{ github.run_id }}
+        run: |
+          expected="$RUNNER_TEMP/decent-resolver-sources-$GITHUB_RUN_ID"
+          test "$RESOLVER_SOURCE_DIR" = "$expected"
+          rm -rf -- "$RESOLVER_SOURCE_DIR"
