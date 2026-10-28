@@ -18,7 +18,7 @@ import org.keycloak.models.UserProviderFactory;
 /** Test-only decorator: injects one exact post-addUser attribute readback failure. */
 public final class Issue7FaultInjectingUserProviderFactory implements UserProviderFactory<UserProvider> {
   static final String IDENTITY_ATTRIBUTE = "decent_identity_id";
-  private static final String PROVIDER_ID = "issue7-user-readback-fault";
+  static final String PROVIDER_ID = "issue7-user-readback-fault";
   private static final String POST_CREATE_EXACT_ATTRIBUTE_READ = "post_create_exact_attribute_read";
   private static final String MODE = System.getenv().getOrDefault("ISSUE7_USER_READBACK_FAULT_MODE", "disabled");
   private final String mode;
@@ -28,10 +28,14 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
   }
 
   Issue7FaultInjectingUserProviderFactory(String mode) {
+    validateMode(mode);
+    this.mode = mode;
+  }
+
+  static void validateMode(String mode) {
     if (!"disabled".equals(mode) && !"empty".equals(mode) && !"throw".equals(mode) && !"over-cap".equals(mode)) {
       throw new IllegalArgumentException("unsupported Issue #7 user readback fault mode");
     }
-    this.mode = mode;
   }
 
   @Override
@@ -40,6 +44,10 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
     System.err.println("ISSUE7_USER_READBACK_PROVIDER: fault mode=" + mode);
     UserProvider delegate = session.getProvider(UserProvider.class, "jpa");
     if (delegate == null) throw new IllegalStateException("Keycloak local jpa UserProvider unavailable");
+    return decorate(delegate, mode);
+  }
+
+  static UserProvider decorate(UserProvider delegate, String mode) {
     AtomicBoolean armed = new AtomicBoolean();
     AtomicReference<UserModel> created = new AtomicReference<>();
     return (UserProvider) Proxy.newProxyInstance(UserProvider.class.getClassLoader(),
@@ -49,9 +57,10 @@ public final class Issue7FaultInjectingUserProviderFactory implements UserProvid
               && IDENTITY_ATTRIBUTE.equals(args[1]) && added != null && args[2] instanceof String identity
               && identity.equals(added.getFirstAttribute(IDENTITY_ATTRIBUTE)) && armed.compareAndSet(true, false)) {
             String requestId = WalletRequestCorrelation.current();
-            if (WalletRequestCorrelation.isValidRequestId(requestId))
+            boolean validRequestId = WalletRequestCorrelation.isValidRequestId(requestId);
+            if (validRequestId)
               System.err.println("ISSUE7_USER_READBACK_OPERATION: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " request=" + requestId);
-            if (WalletRequestCorrelation.isValidRequestId(requestId))
+            if (validRequestId)
               System.err.println("ISSUE7_USER_READBACK_FAULT: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " post-create exact attribute read intercepted request=" + requestId);
             if ("empty".equals(mode)) {
               if (WalletRequestCorrelation.isValidRequestId(requestId)) System.err.println("ISSUE7_USER_READBACK_OUTCOME: provider=" + PROVIDER_ID + " operation=" + POST_CREATE_EXACT_ATTRIBUTE_READ + " empty request=" + requestId);

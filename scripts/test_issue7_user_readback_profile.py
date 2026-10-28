@@ -95,6 +95,52 @@ class UserReadbackProfileTest(unittest.TestCase):
       with self.subTest(logs=logs):
         self.assertEqual(expected, probe.user_readback_fixture_witness(logs, 'empty', request_id))
 
+  def test_readback_witness_accepts_keycloak_formatted_production_failure(self):
+    request_id = '1234567890abcdef1234567890abcdef'
+    for mode in ('empty', 'throw', 'over-cap'):
+      startup = ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked\n'
+          f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}\n') * 3
+      operation = (f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault '
+          f'operation=post_create_exact_attribute_read request={request_id}')
+      fault = (f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault '
+          f'operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}')
+      outcome = (f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault '
+          f'operation=post_create_exact_attribute_read {mode} request={request_id}')
+      message = (f'Wallet account mapping lookup unavailable (request={request_id}, '
+          'IdentityMappingUnavailableException)')
+      prefix = ('2026-10-28 04:56:55,123 WARN  '
+          '[org.decentwallet.keycloak.wallet.WalletLoginTransportHandler] (executor-thread-7) ')
+      logs = '\n'.join((operation, fault, outcome, prefix + message))
+      with self.subTest(mode=mode):
+        witness = probe.user_readback_fixture_witness(logs, mode, request_id, startup_logs=startup)
+        self.assertEqual('observed', witness['fixture_operation_witness'])
+        self.assertEqual('over_cap' if mode == 'over-cap' else mode,
+            witness['fixture_mutation_outcome'])
+        safe = probe.sanitize_live_checkpoint({'issue7_single_node_signup_recovery': {
+            'stage': 'faulted_signup', 'scope': 'one-keycloak-node',
+            'user_readback_fault_mode': mode, **witness}})
+        self.assertEqual('observed', safe['issue7_single_node_signup_recovery']['fixture_operation_witness'])
+        self.assertNotIn(request_id, json.dumps(safe))
+        self.assertNotIn('executor-thread', json.dumps(safe))
+      for bad in (logs + '\n' + prefix + message,
+          logs + '\n' + prefix + message + ' malformed',
+          logs.replace(request_id, 'f' * 32),
+          logs.replace('WalletLoginTransportHandler]', 'UntrustedLogger]'),
+          logs.replace('WARN  ', 'INFO  '),
+          logs.replace(message, message + ' trailing'),
+          logs.replace(prefix, 'untrusted-prefix ')):
+        with self.subTest(mode=mode, invalid=True):
+          self.assertEqual('unavailable', probe.user_readback_fixture_witness(
+              bad, mode, request_id, startup_logs=startup)['fixture_operation_witness'])
+
+  def test_signup_recovery_requires_original_subject_before_any_request(self):
+    for retained_subject in (None, '', False):
+      client = Mock()
+      with self.subTest(retained_subject=retained_subject), self.assertRaises(ValueError):
+        probe.signup_wallet_flow(client, Path('key'), 'identity', 'a' * 64, Mock(),
+            lambda *_: None, 'image', reuse_existing=True, retained_subject=retained_subject)
+      client.request.assert_not_called()
+
   def test_subject_match_predicate_compares_exact_claim_without_returning_it(self):
     self.assertTrue(probe.subject_matches_expected({'sub': 'retained-subject'},
         'retained-subject'))
@@ -278,7 +324,7 @@ class UserReadbackProfileTest(unittest.TestCase):
     progress_events, checkpoints = [], []
     with ExitStack() as stack:
       stack.enter_context(patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup))
-      stack.enter_context(patch.object(probe, 'read_provider_success_log_window',
+      stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
           return_value='Wallet proof transaction consumed (request=' + '0' * 32 + ', provider=infinispan)'))
       evidence = probe.run_issue7_signup_success_profile(
           Mock(), Path('key'), 'private-identity', 'container', Mock(), 'ordinary-image',
@@ -411,7 +457,7 @@ class UserReadbackProfileTest(unittest.TestCase):
       stack.enter_context(patch.object(probe, 'verify_id_token', side_effect=lambda *_args, **_kwargs: {
           'sub': 'private-subject', 'decent_identity_id': next(iter(user_reads))}))
       request_id = probe.account_policy_request_id(locator)
-      stack.enter_context(patch.object(probe, 'read_provider_success_log_window',
+      stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
           return_value=f'Wallet proof transaction consumed (request={request_id}, provider=infinispan)'))
       stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
       stack.enter_context(patch.object(Path, 'write_text', autospec=True, side_effect=capture))
@@ -722,9 +768,10 @@ class UserReadbackProfileTest(unittest.TestCase):
       if path.name == 'live-evidence.json':
         checkpoints.append(json.loads(data))
       return original_write_text(path, data, *args, **kwargs)
-    fault_window = '\n'.join((
+    startup_window = '\n'.join((
         'ISSUE7_USER_READBACK_PROVIDER: factory create invoked',
-        'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty',
+        'ISSUE7_USER_READBACK_PROVIDER: fault mode=empty'))
+    fault_window = '\n'.join((
         f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read request={request_id}',
         f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}',
         f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read empty request={request_id}',
@@ -757,6 +804,8 @@ class UserReadbackProfileTest(unittest.TestCase):
       stack.enter_context(patch.object(probe, 'Client', side_effect=[browser, wallet]))
       stack.enter_context(patch.object(probe.subprocess, 'run',
           return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
+      startup_log = stack.enter_context(patch.object(probe, 'read_provider_fault_log_tail',
+          return_value=startup_window))
       log_window = stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
           return_value=fault_window))
       stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
@@ -774,7 +823,13 @@ class UserReadbackProfileTest(unittest.TestCase):
     self.assertEqual(1, signup.call_count)
     self.assertEqual(1, dispatcher.call_count)
     self.assertEqual(profile, dispatcher.call_args.args[0])
+    self.assertEqual(1, startup_log.call_count)
     self.assertEqual(1, log_window.call_count)
+    self.assertTrue(any(
+        item.get('issue7_single_node_signup_recovery', {}).get('user_readback_factory_selected') is True
+        and item.get('issue7_single_node_signup_recovery', {}).get('effective_user_readback_fault_mode') == 'empty'
+        and 'signup_proof_http' not in item.get('issue7_single_node_signup_recovery', {})
+        for item in checkpoints))
     self.assertEqual(2, admin_call.call_count)
     self.assertEqual(['GET', 'POST', 'GET'], [method for method, _ in browser.requests])
     self.assertEqual(['GET', 'POST'], [method for method, _ in wallet.requests])
@@ -796,6 +851,12 @@ class UserReadbackProfileTest(unittest.TestCase):
       self.assertNotIn(forbidden, serialized)
 
   def test_production_main_runs_real_readback_failure_and_fresh_signup_for_each_mode(self):
+    self.run_readback_recovery_main()
+
+  def test_production_main_rejects_replacement_account_between_readback_ceremonies(self):
+    self.run_readback_recovery_main(replace_subject=True)
+
+  def run_readback_recovery_main(self, replace_subject=False):
     profiles = {
         'issue7-user-readback-empty': 'empty',
         'issue7-user-readback-throw': 'throw',
@@ -817,7 +878,10 @@ class UserReadbackProfileTest(unittest.TestCase):
             + '/login-actions/authenticate?' + callback_query)
         subject = 'private-subject'
         identifier = 'private-identity'
-        user = {'attributes': {'decent_identity_id': [identifier]},
+        signup_identifier = 'private-signup-identity'
+        seed_user = {'attributes': {'decent_identity_id': [identifier]},
+            'enabled': True, 'id': 'seed-subject'}
+        user = {'attributes': {'decent_identity_id': [signup_identifier]},
             'enabled': True, 'id': subject}
         events = []
 
@@ -889,12 +953,19 @@ class UserReadbackProfileTest(unittest.TestCase):
         client_factory = Mock(side_effect=[browser_failed, wallet_failed,
             browser_recovered, wallet_recovered])
         admin = Mock(wallet_container_id='a' * 64)
-        admin_reads = [
-            (200, {}, b'[]'),
-            (200, {}, json.dumps([user]).encode()),
-            (200, {}, json.dumps([user]).encode()),
-            (200, {}, json.dumps([user]).encode()),
-        ]
+        flow_lookup_count = 0
+        def user_lookup(client, token, method, path):
+          nonlocal flow_lookup_count
+          query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get('q', [''])[0]
+          requested_identifier = query.partition(':')[2]
+          if requested_identifier == identifier:
+            return 200, {}, json.dumps([seed_user]).encode()
+          if requested_identifier != signup_identifier:
+            raise AssertionError('unexpected Identity account lookup')
+          flow_lookup_count += 1
+          observed_user = {**user, 'id': 'replacement-subject'} if replace_subject and flow_lookup_count >= 3 else user
+          return (200, {}, json.dumps([] if flow_lookup_count == 1 else [observed_user]).encode())
+
         request_id = hashlib.sha256(('A' * 43).encode('ascii')).hexdigest()[:32]
         fault_tail = ('ISSUE7_USER_READBACK_PROVIDER: factory create invoked' + chr(10)
             + f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}')
@@ -904,7 +975,9 @@ class UserReadbackProfileTest(unittest.TestCase):
             f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read request={request_id}',
             f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read post-create exact attribute read intercepted request={request_id}',
             f'ISSUE7_USER_READBACK_OUTCOME: provider=issue7-user-readback-fault operation=post_create_exact_attribute_read {mode} request={request_id}',
-            f'Wallet account mapping lookup unavailable (request={request_id}, '
+            '2026-10-28 04:56:55,123 WARN  '
+                '[org.decentwallet.keycloak.wallet.WalletLoginTransportHandler] (executor-thread-7) '
+                f'Wallet account mapping lookup unavailable (request={request_id}, '
                 'IdentityMappingUnavailableException)'))
         checkpoints = []
         original_write_text = Path.write_text
@@ -928,8 +1001,9 @@ class UserReadbackProfileTest(unittest.TestCase):
           stack.enter_context(patch.object(probe, 'start_registry',
               return_value=('registry', 'bootstrap', 1234)))
           stack.enter_context(patch.object(probe, 'free_port', return_value=4321))
-          identity = stack.enter_context(patch.object(probe, 'write_identity',
-              return_value=(key_path, Path(scratch) / 'wrapper', identifier)))
+          identity = stack.enter_context(patch.object(probe, 'write_identity', side_effect=[
+              (key_path, Path(scratch) / 'wrapper', identifier),
+              (Path(scratch) / 'signup-identity.pem', Path(scratch) / 'wrapper', signup_identifier)]))
           stack.enter_context(patch.object(probe, 'start_keycloak', return_value=admin))
           stack.enter_context(patch.object(probe, 'admin_token', return_value='[REDACTED]'))
           stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value={
@@ -937,12 +1011,12 @@ class UserReadbackProfileTest(unittest.TestCase):
               'keycloak_version': '26.8.0', 'keycloak_nodes': 'one'}))
           stack.enter_context(patch.object(probe, 'configure_realm'))
           stack.enter_context(patch.object(probe, 'enable_keycloak_login_events'))
-          admin_call = stack.enter_context(patch.object(probe, 'admin_call', side_effect=admin_reads))
+          admin_call = stack.enter_context(patch.object(probe, 'admin_call', side_effect=user_lookup))
           stack.enter_context(patch.object(probe, 'Client', client_factory))
           stack.enter_context(patch.object(probe.subprocess, 'run',
               return_value=SimpleNamespace(returncode=0, stdout=b's' * 64)))
           stack.enter_context(patch.object(probe, 'verify_id_token', return_value={
-              'sub': subject, 'decent_identity_id': identifier}))
+              'sub': 'replacement-subject' if replace_subject else subject, 'decent_identity_id': signup_identifier}))
           stack.enter_context(patch.object(probe, 'read_provider_fault_log_tail',
               return_value=fault_tail))
           window = stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
@@ -951,12 +1025,31 @@ class UserReadbackProfileTest(unittest.TestCase):
           stack.enter_context(patch.object(probe, 'finish_owned_cleanup'))
           stack.enter_context(patch.object(Path, 'write_text', autospec=True,
               side_effect=capture_checkpoint))
+          signup = stack.enter_context(patch.object(probe, 'signup_wallet_flow',
+              wraps=probe.signup_wallet_flow))
           dispatcher = stack.enter_context(patch.object(probe, 'dispatch_live_profile',
               wraps=probe.dispatch_live_profile))
           printed = stack.enter_context(patch('builtins.print'))
-          probe.main()
+          stack.enter_context(patch.object(probe, 'cleanup_after_failure'))
+          if replace_subject:
+            with self.assertRaises(RuntimeError):
+              probe.main()
+          else:
+            probe.main()
 
-        identity.assert_called_once()
+        if replace_subject:
+          self.assertFalse(any(item.get('issue7_single_node_signup_recovery', {}).get('stage') == 'complete'
+              for item in checkpoints))
+          self.assertNotIn('wallet-2:proof', events)
+          self.assertNotIn(subject, json.dumps(checkpoints))
+          self.assertNotIn('replacement-subject', json.dumps(checkpoints))
+          continue
+        self.assertEqual(2, identity.call_count)
+        self.assertEqual('wallet-login-e2e', identity.call_args_list[0].kwargs.get(
+            'label', 'wallet-login-e2e'))
+        self.assertEqual('wallet-login-issue7-recovery',
+            identity.call_args_list[1].kwargs['label'])
+        self.assertEqual(signup_identifier, signup.call_args.args[2])
         self.assertEqual(4, client_factory.call_count)
         self.assertEqual(4, admin_call.call_count)
         self.assertEqual(1, window.call_count)
@@ -1011,7 +1104,7 @@ class UserReadbackProfileTest(unittest.TestCase):
         self.assertEqual(302, evidence['fresh_signup_callback_http'])
         self.assertEqual(200, evidence['fresh_signup_pkce_token_http'])
         serialized = json.dumps(checkpoints)
-        for forbidden in (identifier, subject, locators[1], locators[2], 'opaque-code',
+        for forbidden in (identifier, signup_identifier, subject, locators[1], locators[2], 'opaque-code',
             'challenge-1', 'challenge-2', 'unused-token', 'A' * 43,
             'expected_existing_subject', 'IdentityMappingUnavailableException'):
           self.assertNotIn(forbidden, serialized)
@@ -1054,8 +1147,25 @@ class UserReadbackProfileTest(unittest.TestCase):
     self.assertIsNone(parse(marker.replace(request_id, 'f' * 32), request_id))
     self.assertIsNone(parse(marker + '\n' + marker, request_id))
     self.assertIsNone(parse(marker + ' private-identity private-handle proof', request_id))
+    self.assertEqual({'status': 'observed', 'provider_id': 'infinispan'},
+        probe.classify_success_provider_witness(
+            '2026-10-27T12:00:00.000000Z [org.keycloak] INFO ' + marker, request_id))
+    self.assertEqual('marker_missing', probe.classify_success_provider_witness('', request_id)['status'])
+    self.assertEqual('log_output_unavailable',
+        probe.classify_success_provider_witness(None, request_id)['status'])
+    self.assertEqual('request_mismatch', probe.classify_success_provider_witness(
+        marker.replace(request_id, 'f' * 32), request_id)['status'])
+    self.assertEqual('provider_unknown', probe.classify_success_provider_witness(
+        marker.replace('infinispan', 'unknown'), request_id)['status'])
+    self.assertEqual('marker_ambiguous', probe.classify_success_provider_witness(
+        marker + chr(10) + marker, request_id)['status'])
+    malformed_duplicate = marker + chr(10) + 'prefix Wallet proof transaction consumed missing-request-fields'
+    self.assertEqual('marker_ambiguous', probe.classify_success_provider_witness(
+        malformed_duplicate, request_id)['status'])
+    self.assertEqual('marker_malformed', probe.classify_success_provider_witness(
+        'prefix Wallet proof transaction consumed missing-request-fields', request_id)['status'])
 
-  def test_success_profile_rejects_missing_provider_witness_and_checkpoints_projection(self):
+  def test_success_profile_missing_provider_witness_checkpoints_exact_gate_and_reason(self):
     def ordinary_signup(*args, **kwargs):
       args[5]('intent', {'signup_intent_action_http': 200})
       args[5]('proof', {'signup_proof_http': 202, 'provider_request_id': '0' * 32})
@@ -1066,17 +1176,52 @@ class UserReadbackProfileTest(unittest.TestCase):
       return {'signup_intent_action_http': 200, 'signup_proof_http': 202,
           'exact_mapped_users': 1, 'callback_http': 302, 'callback_replay': True,
           'oidc_state_preserved': True, 'pkce_token_http': 200,
-          'provider_request_id': '0' * 32, 'provider_log': 'unrelated marker'}
+          'provider_request_id': '0' * 32}
     checkpoints = []
     with ExitStack() as stack:
       stack.enter_context(patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup))
-      stack.enter_context(patch.object(probe, 'read_provider_success_log_window', return_value='', create=True))
+      stack.enter_context(patch.object(probe, 'read_provider_fault_log_window', return_value='', create=True))
       with self.assertRaisesRegex(RuntimeError, 'provider witness'):
         probe.run_issue7_signup_success_profile(
             Mock(), Path('key'), 'private-identity', 'a' * 64, Mock(), 'image',
             lambda *_: None, checkpoints.append)
-    self.assertEqual([], checkpoints)
+    self.assertEqual(1, len(checkpoints))
+    projected = probe.sanitize_live_checkpoint({'signup_case': checkpoints[0]})['signup_case']
+    self.assertEqual('token', projected['stage'])
+    self.assertEqual('signup_proof', projected['failure_stage'])
+    self.assertEqual('provider_witness', projected['failure_gate'])
+    self.assertEqual('assertion_failed', projected['failure_category'])
+    self.assertEqual('observed', projected['provider_witness_log_read_status'])
+    self.assertEqual('marker_missing', projected['provider_witness_status'])
+    self.assertEqual(202, projected['signup_proof_http'])
+    self.assertEqual(200, projected['pkce_token_http'])
     self.assertNotIn('private-identity', json.dumps(checkpoints))
+
+  def test_success_profile_distinguishes_provider_log_read_failure(self):
+    def ordinary_signup(*args, **kwargs):
+      args[5]('intent', {'signup_intent_action_http': 200})
+      args[5]('proof', {'signup_proof_http': 202, 'provider_request_id': '0' * 32})
+      args[5]('account', {'exact_mapped_users': 1})
+      args[5]('callback', {'callback_http': 302, 'callback_replay': True,
+          'oidc_state_preserved': True})
+      args[5]('token', {'pkce_token_http': 200})
+      return {'signup_intent_action_http': 200, 'signup_proof_http': 202,
+          'exact_mapped_users': 1, 'callback_http': 302, 'callback_replay': True,
+          'oidc_state_preserved': True, 'pkce_token_http': 200,
+          'provider_request_id': '0' * 32}
+    checkpoints = []
+    with ExitStack() as stack:
+      stack.enter_context(patch.object(probe, 'signup_wallet_flow', side_effect=ordinary_signup))
+      stack.enter_context(patch.object(probe, 'read_provider_fault_log_window',
+          side_effect=RuntimeError('private container details'), create=True))
+      with self.assertRaisesRegex(RuntimeError, 'provider witness'):
+        probe.run_issue7_signup_success_profile(
+            Mock(), Path('key'), 'private-identity', 'a' * 64, Mock(), 'image',
+            lambda *_: None, checkpoints.append)
+    projected = probe.sanitize_live_checkpoint({'signup_case': checkpoints[0]})['signup_case']
+    self.assertEqual('unavailable', projected['provider_witness_log_read_status'])
+    self.assertEqual('log_output_unavailable', projected['provider_witness_status'])
+    self.assertNotIn('private container details', json.dumps(checkpoints))
 
   def test_fault_diagnostics_are_correlated_bounded_and_sanitized(self):
     request_id = '0123456789abcdef0123456789abcdef'
@@ -1122,12 +1267,57 @@ class UserReadbackProfileTest(unittest.TestCase):
         probe.read_provider_fault_log_window(container_id, '--tail 160')
       unused.assert_not_called()
 
+  def test_log_tail_combines_stdout_and_stderr(self):
+    result = probe._bounded_command_tail([sys.executable, '-c',
+        "import sys; print('stdout-marker', flush=True); "
+        "print('ISSUE7_USER_READBACK_PROVIDER: factory create invoked', file=sys.stderr, flush=True)"],
+        timeout=5, max_bytes=1024)
+    self.assertEqual(0, result.returncode)
+    self.assertIn('stdout-marker', result.stdout)
+    self.assertIn('ISSUE7_USER_READBACK_PROVIDER: factory create invoked', result.stdout)
+
+  def test_readback_launch_preserves_optimized_image_settings_and_https_issuer(self):
+    image = 'sha256:' + 'b' * 64
+    for mode in ('empty', 'throw', 'over-cap', None):
+      with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+        client = Mock()
+        client.request.return_value = (200, {}, json.dumps({
+            'issuer': f'https://idp.example:{probe.KC_PORT}/auth/realms/master'}).encode())
+        stack.enter_context(patch.object(probe, 'SCRATCH', directory))
+        stack.enter_context(patch.object(probe, '_cid_file', return_value=Path(directory) / 'cid'))
+        stack.enter_context(patch.object(probe, 'run', return_value=Mock(returncode=0, stdout='')))
+        stack.enter_context(patch.object(probe, 'Client', return_value=client))
+        launch = stack.enter_context(patch.object(probe, 'start_owned_container',
+            return_value=(subprocess.CompletedProcess([], 0, ''), 'a' * 64)))
+        result = probe.start_keycloak('container', 'fixture-password', 'wrapper', 1234,
+            'bootstrap', image, user_readback_fault_mode=mode)
+        command = launch.call_args.args[0]
+        startup = command[command.index(image) + 1:]
+        if mode is None:
+          self.assertEqual('start-dev', startup[0])
+          self.assertNotIn('--optimized', startup)
+        else:
+          self.assertEqual(['start', '--optimized'], startup[:2])
+          self.assertNotIn('start-dev', startup)
+          self.assertIn('ISSUE7_USER_READBACK_FAULT_MODE=' + mode, command)
+        for setting in ('--http-enabled=true', f'--http-port={probe.KC_PORT}',
+            '--http-relative-path=/auth', f'--hostname=https://idp.example:{probe.KC_PORT}/auth',
+            '--proxy-headers=xforwarded', '--proxy-trusted-addresses=127.0.0.1',
+            '--db=dev-file', '--cache=local'):
+          self.assertIn(setting, startup)
+        self.assertFalse(any(arg.startswith('--spi-') for arg in startup))
+        self.assertNotIn('fixture-password', command)
+        self.assertEqual([], list(Path(directory).glob('*.env')))
+        self.assertIs(client, result)
+        self.assertEqual('a' * 64, result.wallet_container_id)
+        client.request.assert_called_once_with('GET',
+            '/auth/realms/master/.well-known/openid-configuration', timeout=2)
+
   def test_fault_launch_args_are_test_only_and_failures_expose_no_callback(self):
     command = ['podman', 'run', '--env-file', 'admin.env']
     probe.add_test_user_readback_fault_args(command, 'test-image', 'empty')
     self.assertIn('ISSUE7_USER_READBACK_FAULT_MODE=empty', command)
-    self.assertEqual('test-image', command[-2])
-    self.assertEqual('start-dev', command[-1])
+    self.assertEqual(['test-image', 'start', '--optimized'], command[-3:])
     with self.assertRaises(ValueError):
       probe.add_test_user_readback_fault_args([], 'image', 'production')
     self.assertFalse(probe.failure_response_has_no_callback_or_code(
@@ -1154,18 +1344,21 @@ class UserReadbackProfileTest(unittest.TestCase):
     sleep.assert_called_once_with(shared_duration)
 
   def test_provider_packager_emits_exact_test_factory_and_spi_registration(self):
-    relative_factory = 'org/decentwallet/keycloak/wallet/Issue7FaultInjectingUserProviderFactory.class'
-    service_name = 'META-INF/services/org.keycloak.models.UserProviderFactory'
+    relative_factory = 'org/decentwallet/keycloak/wallet/Issue7FaultInjectingDatastoreProviderFactory.class'
+    relative_datastore = 'org/decentwallet/keycloak/wallet/Issue7FaultInjectingDatastoreProvider.class'
+    relative_user_factory = 'org/decentwallet/keycloak/wallet/Issue7FaultInjectingUserProviderFactory.class'
+    service_name = 'META-INF/services/org.keycloak.storage.DatastoreProviderFactory'
     with tempfile.TemporaryDirectory() as temporary:
       root = Path(temporary)
       scripts = root / 'scripts'
       classes = root / 'target/test-classes'
       scripts.mkdir()
       (classes / relative_factory).parent.mkdir(parents=True)
-      (classes / 'META-INF/services').mkdir(parents=True)
-      (classes / relative_factory).write_bytes(b'fixture-bytecode')
+      for relative_class in (relative_factory, relative_datastore, relative_user_factory):
+        (classes / relative_class).write_bytes(relative_class.encode('utf-8'))
+      (classes / service_name).parent.mkdir(parents=True)
       (classes / service_name).write_text(
-          'org.decentwallet.keycloak.wallet.Issue7FaultInjectingUserProviderFactory\\n',
+          'org.decentwallet.keycloak.wallet.Issue7FaultInjectingDatastoreProviderFactory\\n',
           encoding='utf-8')
       shutil.copy2(ROOT / 'scripts/build_issue7_user_readback_provider.py', scripts)
       result = subprocess.run([sys.executable,
@@ -1175,16 +1368,24 @@ class UserReadbackProfileTest(unittest.TestCase):
       jar_path = root / 'target/issue7-user-readback-provider.jar'
       self.assertEqual(str(jar_path), result.stdout.strip())
       with zipfile.ZipFile(jar_path) as archive:
-        self.assertEqual({relative_factory, service_name}, set(archive.namelist()))
-        self.assertEqual(b'fixture-bytecode', archive.read(relative_factory))
-        self.assertEqual('org.decentwallet.keycloak.wallet.Issue7FaultInjectingUserProviderFactory\\n',
+        self.assertEqual({relative_factory, relative_datastore, relative_user_factory, service_name},
+            set(archive.namelist()))
+        for relative_class in (relative_factory, relative_datastore, relative_user_factory):
+          self.assertEqual(relative_class.encode('utf-8'), archive.read(relative_class))
+        self.assertEqual('org.decentwallet.keycloak.wallet.Issue7FaultInjectingDatastoreProviderFactory\\n',
             archive.read(service_name).decode('utf-8'))
 
   def test_test_provider_image_is_separate_from_normal_runtime(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     self.assertIn('FROM runtime AS issue7-user-readback-test-runtime', dockerfile)
     self.assertIn('issue7-user-readback-provider.jar', dockerfile)
-    self.assertIn('--spi-user--provider-default=issue7-user-readback-fault', dockerfile)
+    self.assertIn('--spi-datastore--provider-default=issue7-user-readback-fault', dockerfile)
+    test_runtime = dockerfile.split('FROM runtime AS issue7-user-readback-test-runtime', 1)[1]
+    test_runtime_build = test_runtime.split('kc.sh build', 1)[1].splitlines()[0]
+    self.assertIn('--db=dev-file', test_runtime_build)
+    self.assertIn('--http-relative-path=/auth', test_runtime_build)
+    self.assertIn('--cache=local', test_runtime_build)
+    self.assertIn('--spi-single-use-object--provider-default=infinispan', test_runtime_build)
     normal_runtime = dockerfile.split('FROM runtime AS issue7-user-readback-test-runtime')[0]
     self.assertNotIn('issue7-user-readback-provider.jar', normal_runtime)
 
@@ -1208,6 +1409,8 @@ class UserReadbackProfileTest(unittest.TestCase):
     self.assertEqual(2, signup.call_count)
     self.assertTrue(signup.call_args_list[0].kwargs['expect_user_readback_fault'])
     self.assertTrue(signup.call_args_list[1].kwargs['reuse_existing'])
+    self.assertEqual(failed['expected_existing_subject'],
+        signup.call_args_list[1].kwargs['retained_subject'])
     self.assertTrue(evidence['same_local_subject'])
     self.assertEqual([1, 1], evidence['exact_enabled_local_accounts_after_each_signup'])
     self.assertEqual(65, evidence['synthetic_candidate_count'])

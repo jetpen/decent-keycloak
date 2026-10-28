@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify source archives against the resolver runtime manifest before extraction."""
+"""Verify temporary commit-pinned resolver Git checkouts and runtime inputs."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +16,11 @@ def sha256(path: Path) -> str:
     for block in iter(lambda: stream.read(1024 * 1024), b""):
       digest.update(block)
   return digest.hexdigest()
+
+
+def is_pinned_git_url(value: object) -> bool:
+  return isinstance(value, str) and re.fullmatch(
+      r"https://github\.com/[^/]+/[^/]+\.git", value) is not None
 
 
 def verify_repo_overlays(directory: Path, manifest: dict) -> None:
@@ -36,45 +41,44 @@ def verify_repo_overlays(directory: Path, manifest: dict) -> None:
       raise RuntimeError(f"resolver overlay checksum mismatch: {name}")
 
 
-def verify_source_archives(archive_directory: Path, manifest_path: Path) -> None:
+def verify_source_checkouts(source_directory: Path, manifest_path: Path) -> None:
   manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
   verify_repo_overlays(manifest_path.parent, manifest)
   sources = manifest.get("sources")
   if not isinstance(sources, dict) or set(sources) != {"identity", "registry"}:
-    raise RuntimeError("resolver manifest must lock Identity and Registry sources")
+    raise RuntimeError("resolver manifest must lock Identity and Registry Git sources")
+  if source_directory.is_symlink() or not source_directory.is_dir():
+    raise RuntimeError("temporary resolver source directory is unavailable")
 
+  packages = {"identity": "decent_identity", "registry": "decent_registry"}
   for name in ("identity", "registry"):
     source = sources[name]
+    if not isinstance(source, dict):
+      raise RuntimeError(f"Git source entry is invalid: {name}")
     commit = source.get("commit")
-    expected_hash = source.get("archive_sha256")
+    git_url = source.get("git_url")
     if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
       raise RuntimeError(f"source commit is invalid: {name}")
-    if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
-      raise RuntimeError(f"source archive checksum is invalid: {name}")
-
-    archive = archive_directory / f"{name}.tar.gz"
-    if sha256(archive) != expected_hash:
-      raise RuntimeError(f"source archive checksum mismatch: {name}")
-
-    with tarfile.open(archive, "r:gz") as bundle:
-      members = bundle.getmembers()
-    if not members or any(member.issym() or member.islnk() for member in members):
-      raise RuntimeError(f"source archive must contain regular files only: {name}")
-    roots = {member.name.split("/", 1)[0] for member in members}
-    if len(roots) != 1:
-      raise RuntimeError(f"source archive contains multiple roots: {name}")
-    root = next(iter(roots))
-    if commit not in root:
-      raise RuntimeError(f"source archive root does not match locked commit: {name}")
-    for member in members:
-      relative = Path(member.name).relative_to(root)
-      if relative.is_absolute() or ".." in relative.parts:
-        raise RuntimeError(f"source archive path escaped extraction root: {name}")
-      if not (member.isfile() or member.isdir()):
-        raise RuntimeError(f"source archive contains an unsupported entry: {name}")
+    if not is_pinned_git_url(git_url):
+      raise RuntimeError(f"source Git URL is invalid: {name}")
+    archive = source.get("archive_sha256")
+    if archive is not None or "url" in source:
+      raise RuntimeError(f"source lock must pin a Git commit, not an archive: {name}")
+    checkout = source_directory / name
+    if checkout.is_symlink() or not checkout.is_dir():
+      raise RuntimeError(f"pinned source checkout is unavailable: {name}")
+    if (checkout / ".git").exists():
+      raise RuntimeError(f"temporary source context contains Git metadata: {name}")
+    marker = checkout / ".pinned-commit"
+    if marker.is_symlink() or not marker.is_file() or marker.read_text(encoding="ascii") != commit + "\n":
+      raise RuntimeError(f"pinned commit marker mismatch: {name}")
+    source_root = checkout / "src"
+    package_root = source_root / packages[name]
+    if source_root.is_symlink() or not source_root.is_dir() or not package_root.is_dir():
+      raise RuntimeError(f"pinned source checkout is missing package source: {name}")
 
   if "wheelhouse" in manifest:
-    # --archives selects the Identity/Registry inputs; the wheelhouse is locked beside its manifest.
+    # The wheelhouse is a third-party dependency bundle, separate from source checkouts.
     verify_wheelhouse_archive(manifest_path.parent, manifest_path)
 
 
@@ -139,14 +143,14 @@ def verify_wheelhouse_archive(archive_directory: Path, manifest_path: Path) -> N
 
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--archives", type=Path, default=Path(__file__).resolve().parent,
-      help="directory containing identity.tar.gz and registry.tar.gz")
+  parser.add_argument("--sources", type=Path, required=True,
+      help="temporary directory containing pinned identity and registry Git checkouts")
   parser.add_argument("--manifest", type=Path,
       default=Path(__file__).resolve().with_name("resolver-runtime.lock.json"),
       help="resolver source and dependency lock manifest")
   args = parser.parse_args()
-  verify_source_archives(args.archives, args.manifest)
-  print("resolver_source_archives_verified")
+  verify_source_checkouts(args.sources, args.manifest)
+  print("resolver_git_sources_verified")
   if "wheelhouse" in json.loads(args.manifest.read_text(encoding="utf-8")):
     print("resolver_wheelhouse_archive_verified")
 

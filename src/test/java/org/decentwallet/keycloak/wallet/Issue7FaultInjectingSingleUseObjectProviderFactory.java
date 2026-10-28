@@ -89,8 +89,14 @@ public final class Issue7FaultInjectingSingleUseObjectProviderFactory
     };
   }
 
-  private static String requestCorrelationId(String handle) {
-    return WalletLoginTransportHandler.requestCorrelationId(handle);
+  private static String requestCorrelationId(String storedHandleDigest) {
+    // Transaction/accepted keys already contain SHA-256(handle). The handler's
+    // request ID is the first 32 hex characters of that same digest, not a hash
+    // of the stored digest. Never log the storage key or raw handle.
+    if (!storedHandleDigest.matches("[0-9a-f]{64}")) {
+      throw new IllegalArgumentException("invalid test storage-key digest");
+    }
+    return storedHandleDigest.substring(0, 32);
   }
 
   private boolean claim() {

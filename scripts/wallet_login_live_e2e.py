@@ -40,6 +40,12 @@ SUPPORTED_LIVE_PROFILES = {
     *ISSUE7_USER_READBACK_FAULT_MODES,
     *issue7_store_recovery.PROFILES,
 }
+SUCCESS_PROVIDER_WITNESS_STATUSES = frozenset({
+    'observed', 'request_id_unavailable', 'log_output_unavailable', 'marker_missing',
+    'marker_ambiguous', 'marker_malformed', 'request_mismatch', 'provider_unknown',
+    'provider_unrecognized',
+})
+PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS = frozenset({'infinispan', 'jpa', 'remote'})
 
 
 def selected_live_profile():
@@ -68,7 +74,9 @@ def user_readback_fault_mode(profile):
 def add_test_user_readback_fault_args(command, image, mode):
   if mode not in {'empty', 'throw', 'over-cap'}:
     raise ValueError('unsupported UserProvider fault mode')
-  command.extend(['--env', 'ISSUE7_USER_READBACK_FAULT_MODE=' + mode, image, 'start-dev'])
+  # Keep the test image's build-time datastore selection; do not re-augment in dev mode.
+  command.extend(['--env', 'ISSUE7_USER_READBACK_FAULT_MODE=' + mode,
+      image, 'start', '--optimized'])
 
 
 def utc_log_cursor():
@@ -138,17 +146,38 @@ def read_provider_fault_log_window(container_id, cursor, *, strict=False):
   return logs.stdout
 
 
+def classify_success_provider_witness(logs, expected_request_id):
+  """Classify a bounded log window without exposing the marker or request ID."""
+  if not isinstance(expected_request_id, str) or re.fullmatch(
+      r'[0-9a-f]{32}', expected_request_id) is None:
+    return {'status': 'request_id_unavailable', 'provider_id': None}
+  if not isinstance(logs, str):
+    return {'status': 'log_output_unavailable', 'provider_id': None}
+  marker_lines = [line for line in logs.splitlines()
+      if 'Wallet proof transaction consumed' in line]
+  if not marker_lines:
+    return {'status': 'marker_missing', 'provider_id': None}
+  if len(marker_lines) != 1:
+    return {'status': 'marker_ambiguous', 'provider_id': None}
+  pattern = re.compile(r'^[^\r\n]*Wallet proof transaction consumed '
+      r'\(request=([0-9a-f]{32}), provider=([A-Za-z0-9_.-]{1,96})\)$')
+  match = pattern.fullmatch(marker_lines[0])
+  if match is None:
+    return {'status': 'marker_malformed', 'provider_id': None}
+  request_id, provider_id = match.groups()
+  if request_id != expected_request_id:
+    return {'status': 'request_mismatch', 'provider_id': None}
+  if provider_id == 'unknown':
+    return {'status': 'provider_unknown', 'provider_id': None}
+  if provider_id not in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS:
+    return {'status': 'provider_unrecognized', 'provider_id': None}
+  return {'status': 'observed', 'provider_id': provider_id}
+
+
 def sanitize_success_provider_witness(logs, expected_request_id):
   """Return one allowlisted selected-provider ID only for an exact request marker."""
-  if (not isinstance(logs, str) or not isinstance(expected_request_id, str)
-      or re.fullmatch(r'[0-9a-f]{32}', expected_request_id) is None):
-    return None
-  pattern = re.compile(r'^[^\r\n]*Wallet proof transaction consumed \(request=([0-9a-f]{32}), provider=(infinispan|jpa|remote|unknown)\)$', re.MULTILINE)
-  matches = pattern.findall(logs)
-  correlated = [provider for request_id, provider in matches if request_id == expected_request_id]
-  if len(matches) != 1 or len(correlated) != 1 or correlated[0] == 'unknown':
-    return None
-  return correlated[0]
+  witness = classify_success_provider_witness(logs, expected_request_id)
+  return witness['provider_id'] if witness['status'] == 'observed' else None
 
 
 def read_provider_success_log_window(container_id, cursor):
@@ -180,17 +209,36 @@ def sanitize_user_readback_fault_diagnostics(logs, expected_request_id=None):
       'correlated_mapping_failure_count': min(5, failure_count)}
 
 
-def user_readback_fixture_witness(logs, mode, expected_request_id=None):
+def user_readback_fixture_witness(logs, mode, expected_request_id=None, startup_logs=None):
   unavailable = {'fixture_factory_witness': 'unavailable',
       'fixture_operation_witness': 'unavailable', 'fixture_mutation_outcome': 'unavailable'}
-  if not isinstance(logs, str) or mode not in {'empty', 'throw', 'over-cap'}:
+  if (not isinstance(logs, str) or mode not in {'empty', 'throw', 'over-cap'}
+      or startup_logs is not None and not isinstance(startup_logs, str)):
     return unavailable
   recognized = ('ISSUE7_USER_READBACK_PROVIDER:', 'ISSUE7_USER_READBACK_OPERATION:',
       'ISSUE7_USER_READBACK_FAULT:', 'ISSUE7_USER_READBACK_OUTCOME:')
   lines = [line for line in logs.splitlines()
       if 'ISSUE7_USER_READBACK_' in line or 'Wallet account mapping lookup unavailable' in line]
+  # Keycloak's console formatter prefixes application logger messages, whereas
+  # the test decorator writes bare markers to stderr. Strip only this pinned
+  # logger's WARN envelope; retain every candidate (including malformed ones)
+  # so duplicates and foreign/malformed records still fail the exact checks.
+  production_prefix = (r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} WARN\s+'
+      r'\[org\.decentwallet\.keycloak\.wallet\.WalletLoginTransportHandler\] '
+      r'\([A-Za-z0-9_-]{1,96}\) ')
+  lines = [re.sub('^' + production_prefix, '', line, count=1)
+      if 'Wallet account mapping lookup unavailable' in line else line for line in lines]
+  selection_logs = logs if startup_logs is None else startup_logs
+  selection_lines = selection_logs.splitlines()
   selected = 'ISSUE7_USER_READBACK_PROVIDER: factory create invoked'
   selected_mode = f'ISSUE7_USER_READBACK_PROVIDER: fault mode={mode}'
+  provider_lines = [line for line in selection_lines
+      if line.startswith('ISSUE7_USER_READBACK_PROVIDER:')]
+  observed_modes = {line for line in provider_lines if line.startswith(
+      'ISSUE7_USER_READBACK_PROVIDER: fault mode=')}
+  if (selected not in provider_lines or observed_modes != {selected_mode}
+      or any(line not in {selected, selected_mode} for line in provider_lines)):
+    return unavailable
   operation = (f'ISSUE7_USER_READBACK_OPERATION: provider=issue7-user-readback-fault '
       f'operation=post_create_exact_attribute_read request={expected_request_id}')
   fault = (f'ISSUE7_USER_READBACK_FAULT: provider=issue7-user-readback-fault '
@@ -202,18 +250,18 @@ def user_readback_fixture_witness(logs, mode, expected_request_id=None):
       'IdentityMappingUnavailableException)'
       if isinstance(expected_request_id, str)
       and re.fullmatch(r'[0-9a-f]{32}', expected_request_id) else None)
-  allowed = {selected, selected_mode, operation, fault, outcome}
+  allowed = {operation, fault, outcome, selected, selected_mode}
   if production_failure is not None:
     allowed.add(production_failure)
   if any(not line.startswith(recognized) and not line.startswith(
       'Wallet account mapping lookup unavailable') or line not in allowed for line in lines):
     return unavailable
-  if (lines.count(selected_mode) != 1
+  if (selected not in selection_lines or selected_mode not in selection_lines
       or lines.count(operation) != 1 or lines.count(fault) != 1
       or lines.count(outcome) != 1 or production_failure is None
       or lines.count(production_failure) != 1):
     return unavailable
-  return {'fixture_factory_witness': 'observed' if selected in lines else 'unavailable',
+  return {'fixture_factory_witness': 'observed',
       'fixture_operation_witness': 'observed',
       'fixture_mutation_outcome': 'over_cap' if mode == 'over-cap' else mode,
       'fixture_selected_provider_id': 'issue7-user-readback-fault',
@@ -723,7 +771,8 @@ def checkpoint_signup_stage(result, stage, fields, checkpoint):
   checkpoint()
 
 
-def checkpoint_signup_failure(result, failure, checkpoint, transaction_consume_provider_id=None):
+def checkpoint_signup_failure(result, failure, checkpoint, transaction_consume_provider_id=None,
+    provider_witness_status=None, provider_witness_log_read_status=None):
   """Merge bounded failure facts into the last confirmed ordinary-signup checkpoint."""
   current = dict(result.get('signup_case', {}))
   stage = current.get('stage')
@@ -740,10 +789,14 @@ def checkpoint_signup_failure(result, failure, checkpoint, transaction_consume_p
           else 'unclassified',
       'failure_category': failure_category if failure_category in issue7_store_recovery.FAILURE_CATEGORIES
           else 'runtime_error'}
-  if transaction_consume_provider_id in {'infinispan', 'jpa', 'remote'}:
+  if transaction_consume_provider_id in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS:
     evidence.pop('provider_operation_witness', None)
     evidence['transaction_consume_witness'] = 'observed'
     evidence['transaction_consume_provider_id'] = transaction_consume_provider_id
+  if provider_witness_status in SUCCESS_PROVIDER_WITNESS_STATUSES:
+    evidence['provider_witness_status'] = provider_witness_status
+  if provider_witness_log_read_status in {'observed', 'unavailable'}:
+    evidence['provider_witness_log_read_status'] = provider_witness_log_read_status
   status = getattr(failure, 'failure_http_status', None)
   if type(status) is int and 100 <= status <= 599:
     status_field = ('signup_proof_http' if evidence['failure_gate'] in
@@ -1023,8 +1076,9 @@ def sanitize_live_checkpoint(candidate):
           'already_logged_in', 'cookie_not_found', 'invalid_request', 'invalid_redirect_uri',
           'access_denied', 'user_not_found'},
       'failure_category': {'runtime_error', 'timeout', 'value_error', 'other'},
-      'single_use_object_provider_path': {'infinispan', 'jpa', 'remote', 'unavailable',
-          'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure'},
+      'single_use_object_provider_path': PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS | {
+          'unavailable', 'issue6-postconsume-receipt-failure',
+          'issue6-postconsume-callback-gate-failure'},
       'selected_provider_path': {'issue6-postconsume-receipt-failure',
           'issue6-postconsume-callback-gate-failure'},
       'keycloak_config_read_status': {
@@ -1085,8 +1139,9 @@ def sanitize_live_checkpoint(candidate):
     if field == 'single_use_object_provider_configured':
       return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', value) is not None
     if field == 'single_use_object_provider_path':
-      return value in {'infinispan', 'jpa', 'remote', 'unavailable',
-          'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure'}
+      return value in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS | {
+          'unavailable', 'issue6-postconsume-receipt-failure',
+          'issue6-postconsume-callback-gate-failure'}
     if field == 'keycloak_config_fields_present':
       allowed_config_fields = {'database_mode_effective', 'cache_mode_effective',
           'cache_stack_effective', 'single_use_object_provider_configured'}
@@ -1515,8 +1570,13 @@ def sanitize_live_checkpoint(candidate):
         safe['failure_category'] = value['failure_category']
       if value.get('provider_operation_witness') == 'unavailable':
         safe['provider_operation_witness'] = 'unavailable'
+      if value.get('provider_witness_status') in SUCCESS_PROVIDER_WITNESS_STATUSES:
+        safe['provider_witness_status'] = value['provider_witness_status']
+      if value.get('provider_witness_log_read_status') in {'observed', 'unavailable'}:
+        safe['provider_witness_log_read_status'] = value['provider_witness_log_read_status']
       if (value.get('transaction_consume_witness') == 'observed'
-          and value.get('transaction_consume_provider_id') in {'infinispan', 'jpa', 'remote'}):
+          and value.get('transaction_consume_provider_id')
+              in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS):
         safe['transaction_consume_witness'] = 'observed'
         safe['transaction_consume_provider_id'] = value['transaction_consume_provider_id']
       if (type(value.get('failure_http_status')) is int
@@ -1526,7 +1586,8 @@ def sanitize_live_checkpoint(candidate):
       if value.get('evidence_provenance') == 'harness-application-path-only':
         safe['evidence_provenance'] = 'harness-application-path-only'
       if (stage == 'complete'
-          and value.get('single_use_object_provider_id') in {'infinispan', 'jpa', 'remote'}):
+          and value.get('single_use_object_provider_id')
+              in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS):
         safe['single_use_object_provider_id'] = value['single_use_object_provider_id']
       safe.update({field: item for field, item in value.items()
           if field in {'signup_intent_action_http', 'signup_proof_http',
@@ -1875,7 +1936,7 @@ def expiry_acceptance_passes(evidence):
 def _parse_expiry_denial_provider(line, request_id, available_provider_ids):
   if not isinstance(line, str) or not isinstance(request_id, str):
     return None
-  providers = ('infinispan', 'jpa', 'remote')
+  providers = tuple(sorted(PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS))
   provider_pattern = '|'.join(re.escape(provider_id) for provider_id in providers)
   match = re.search(r'Wallet transaction proof rejected \(request=' + re.escape(request_id)
       + r', reason=transaction_unavailable, provider=(' + provider_pattern + r')\)', line)
@@ -2278,6 +2339,8 @@ SIGNUP_FAILURE_CONTEXTS = {
     'signup returns created opaque Keycloak subject': ('token', 'pkce'),
     'signup ID token contains exact signed wallet Identity claim': ('token', 'pkce'),
     'fresh explicit signup starts with one exact retained enabled account':
+        ('account_readback', 'account_readback'),
+    'fresh explicit signup retains the original failed-ceremony subject':
         ('account_readback', 'account_readback'),
     'failed signup browser status remains pending and exposes no callback or code':
         ('signup_proof', 'proof_status'),
@@ -2819,7 +2882,8 @@ def start_keycloak(container, password, wrapper_path, resolver_port, bootstrap, 
         '--env', 'KC_BOOTSTRAP_ADMIN_USERNAME=wallet-admin',
     ]
     if store_fault_mode is not None:
-      cmd.extend(['--env', 'ISSUE7_TEST_FAULT_MODE=' + store_fault_mode, image, 'start-dev'])
+      cmd.extend(['--env', 'ISSUE7_TEST_FAULT_MODE=' + store_fault_mode,
+          image, 'start', '--optimized'])
     elif user_readback_fault_mode is not None:
       add_test_user_readback_fault_args(cmd, image, user_readback_fault_mode)
     else:
@@ -4745,7 +4809,9 @@ def signup_form_action(html_body, idp_origin, realm, required_action=False, prof
 
 def signup_wallet_flow(client, key, identifier, container, admin_client, progress, image,
     expect_user_readback_fault=False, reuse_existing=False, expected_fault_mode=None,
-    store_fault_mode=None):
+    store_fault_mode=None, retained_subject=None):
+  if reuse_existing and (not isinstance(retained_subject, str) or not retained_subject):
+    raise ValueError('original retained subject is required for signup recovery')
   if store_fault_mode is not None and (store_fault_mode not in issue7_store_recovery.PROFILES.values()
       or expect_user_readback_fault or reuse_existing):
     raise ValueError('unsupported or conflicting signup store fault mode')
@@ -4851,7 +4917,10 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
   if reuse_existing:
     require(len(existing_exact_users) == 1 and existing_exact_users[0].get('enabled') is True,
         'fresh explicit signup starts with one exact retained enabled account')
-    expected_subject = existing_exact_users[0].get('id')
+    require(existing_exact_users[0].get('id') == retained_subject,
+        'fresh explicit signup retains the original failed-ceremony subject',
+        failure_stage='account_readback', failure_gate='account_readback')
+    expected_subject = retained_subject
   else:
     require(not existing_exact_users, 'no exact Keycloak account exists before signup proof')
     expected_subject = None
@@ -4861,9 +4930,10 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       'post_create_read_fault_count': 0, 'correlated_mapping_failure_count': 0}
   request_id = ''
   log_cursor = ''
+  startup_fault_logs = ''
   if expect_user_readback_fault:
-    startup_diagnostics = sanitize_user_readback_fault_diagnostics(
-        read_provider_fault_log_tail(container))
+    startup_fault_logs = read_provider_fault_log_tail(container)
+    startup_diagnostics = sanitize_user_readback_fault_diagnostics(startup_fault_logs)
     factory_selected = startup_diagnostics['factory_selected']
     effective_fault_mode = startup_diagnostics['effective_fault_mode']
     if expected_fault_mode not in {'empty', 'throw', 'over-cap'}:
@@ -4871,6 +4941,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     handle = urllib.parse.urlsplit(signup_locator).path.rsplit('/', 1)[-1]
     request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
     log_cursor = utc_log_cursor()
+    progress('proof', {'user_readback_factory_selected': factory_selected,
+        'effective_user_readback_fault_mode': effective_fault_mode})
   if store_fault_mode is not None:
     log_cursor = utc_log_cursor()
   redirects_before_proof = len(wallet.redirects)
@@ -4893,7 +4965,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
           raise ValueError('diagnostic log result unavailable')
         setattr(failure, 'issue7_diagnostics', {
             'store_diagnostic_read_status': 'observed',
-            **user_readback_fixture_witness(fault_logs, expected_fault_mode, request_id)})
+            **user_readback_fixture_witness(fault_logs, expected_fault_mode, request_id,
+                startup_logs=startup_fault_logs)})
       except Exception:
         setattr(failure, 'issue7_diagnostics', {
             'store_diagnostic_read_status': 'unavailable',
@@ -4908,7 +4981,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
     fault_logs = read_provider_fault_log_window(container, log_cursor, strict=True)
     diagnostics = sanitize_user_readback_fault_diagnostics(
         fault_logs, expected_request_id=request_id)
-    user_readback_witness = user_readback_fixture_witness(fault_logs, expected_fault_mode, request_id)
+    user_readback_witness = user_readback_fixture_witness(fault_logs, expected_fault_mode,
+        request_id, startup_logs=startup_fault_logs)
     progress('proof', user_readback_witness)
   progress('proof', {'signup_proof_http': proof_status})
   progress('proof', {'provider_request_id': provider_request_id})
@@ -5120,9 +5194,23 @@ def run_issue7_signup_success_profile(client, key, identifier, container,
           transaction_consume_provider_id=transaction_consume_provider_id)
     raise
   request_id = evidence.get('provider_request_id')
-  logs = read_provider_success_log_window(container, log_cursor)
-  provider_id = sanitize_success_provider_witness(logs, request_id)
-  require(provider_id is not None, 'Issue #7 request-correlated selected provider witness')
+  try:
+    logs = read_provider_fault_log_window(container, log_cursor, strict=True)
+    log_read_status = 'observed'
+    witness = classify_success_provider_witness(logs, request_id)
+  except Exception:
+    log_read_status = 'unavailable'
+    witness = classify_success_provider_witness(None, request_id)
+  provider_id = witness['provider_id']
+  if provider_id is None:
+    failure = RuntimeError('Issue #7 request-correlated selected provider witness unavailable')
+    setattr(failure, 'failure_stage', 'signup_proof')
+    setattr(failure, 'failure_gate', 'provider_witness')
+    setattr(failure, 'failure_category', 'assertion_failed')
+    checkpoint_signup_failure({'signup_case': last_confirmed}, failure, checkpoint,
+        provider_witness_status=witness['status'],
+        provider_witness_log_read_status=log_read_status)
+    raise failure
   require(evidence.get('signup_intent_action_http') == 200
       and evidence.get('signup_proof_http') == 202
       and evidence.get('exact_mapped_users') == 1
@@ -5172,7 +5260,8 @@ def run_issue7_single_node_signup_recovery_profile(client, key, identifier, cont
   wait_for_identity_lookup_cooldown()
   phase = 'fresh_signup'
   recovered = signup_wallet_flow(Client(), key, identifier, container, admin_client,
-      phase_progress, image, reuse_existing=True)
+      phase_progress, image, reuse_existing=True,
+      retained_subject=failed.get('expected_existing_subject'))
   same_subject = (failed.get('expected_existing_subject') is not None
       and recovered.get('local_subject_matches_expected') is True)
   require(same_subject, 'fresh signup reused the retained exact local account subject')
@@ -6619,6 +6708,10 @@ def main():
         issue7_setup_stage('events_configuring')
         enable_keycloak_login_events(client, token)
         issue7_setup_stage('events_configured')
+        recovery_key, recovery_identifier = key, identifier
+        if fault_mode is not None or store_fault_mode is not None:
+          recovery_key, _, recovery_identifier = write_identity(
+              temp, bootstrap, IMAGE, label='wallet-login-issue7-recovery')
         if store_fault_mode is not None:
           require('issue7-fault-injection' in runtime_provenance.get('single_use_object_provider_ids', []),
               'dedicated store fault provider is registered')
@@ -6632,7 +6725,7 @@ def main():
             if current.get('stage') != 'recovery':
               current['stage'] = 'faulted_signup'
             save_store_checkpoint(current)
-          issue7_store_recovery.run(sys.modules[__name__], Client(), key, identifier, container,
+          issue7_store_recovery.run(sys.modules[__name__], Client(), recovery_key, recovery_identifier, container,
               client, IMAGE, store_progress, save_store_checkpoint, profile)
           print('issue7-store-recovery-evidence=',
               json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
@@ -6678,7 +6771,7 @@ def main():
             merge_issue7_checkpoint(result, 'issue7_single_node_signup_recovery', evidence, checkpoint)
           handlers = {
               profile_name: lambda profile_name=profile_name: run_issue7_single_node_signup_recovery_profile(
-                  Client(), key, identifier, container, client, IMAGE, progress,
+                  Client(), recovery_key, recovery_identifier, container, client, IMAGE, progress,
                   save_issue7_checkpoint, profile_name)
               for profile_name in ISSUE7_USER_READBACK_FAULT_MODES
           }

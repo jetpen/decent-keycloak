@@ -488,12 +488,13 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertEqual({'identity', 'registry'}, set(lock['sources']))
     self.assertEqual('2caec24de52c2dbe241e72fe317281c051d03f89',
         lock['sources']['identity']['commit'])
-    self.assertEqual('0fa9a6b631bd77725418e990ae9ea4d974dc546c',
+    self.assertEqual('628120989703d146da50af97b4602f1f4aa3a068',
         lock['sources']['registry']['commit'])
     for source in lock['sources'].values():
       self.assertRegex(source['commit'], re.compile(r'^[0-9a-f]{40}$'))
-      self.assertRegex(source['archive_sha256'], re.compile(r'^[0-9a-f]{64}$'))
-      self.assertTrue(source['url'].startswith('https://github.com/'))
+      self.assertNotIn('archive_sha256', source)
+      self.assertNotIn('url', source)
+      self.assertRegex(source['git_url'], re.compile(r'^https://github\.com/[^/]+/[^/]+\.git$'))
       self.assertTrue(source['requirements_lock'])
 
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
@@ -536,35 +537,94 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('TIMEOUT_SECONDS = 10', resolver)
     self.assertIn('isConfirmedIdentityNotFound(outputText, exactRegistryObjectKeyHex(identityId))', resolver)
 
-  def test_pinned_source_archives_are_bundled_and_checked_before_extraction(self):
-    dockerfile = (ROOT / 'container/Dockerfile').read_text()
+  def test_source_inputs_are_commit_pinned_git_contexts_not_source_archives(self):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
-    self.assertIn('COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./', dockerfile)
-    self.assertIn('COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py', dockerfile)
-    self.assertIn('COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./', dockerfile)
-    self.assertIn('COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/', dockerfile)
-    self.assertIn('/resolver-build/scripts/test_pinned_dht_peer_outcomes.py', dockerfile)
-    self.assertIn('/resolver-build/scripts/test_pinned_registry_lookup_outcomes.py', dockerfile)
-    self.assertNotIn('/tmp/resolver-tests/', dockerfile)
-    self.assertIn('python3.11 verify_resolver_runtime_inputs.py', dockerfile)
-    self.assertNotIn('ARG IDENTITY_ARCHIVE_SHA256=', dockerfile)
-    self.assertNotIn('ARG REGISTRY_ARCHIVE_SHA256=', dockerfile)
-    self.assertNotIn('ARG PYTHON_BUILDER=', dockerfile)
-    self.assertNotIn('ARG KEYCLOAK_BASE=', dockerfile)
-    self.assertIn("FROM quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad", dockerfile)
-    self.assertIn("FROM registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c", dockerfile)
-    self.assertIn('tar -xzf identity.tar.gz --strip-components=1', dockerfile)
-    self.assertIn('tar -xzf registry.tar.gz --strip-components=1', dockerfile)
-    self.assertNotIn('RUN ./download_resolver_sources.sh', dockerfile)
-    for name in ('identity', 'registry'):
-      archive = ROOT / 'container/source-archives' / f'{name}.tar.gz'
-      self.assertTrue(archive.is_file())
-      self.assertEqual(lock['sources'][name]['archive_sha256'],
-          hashlib.sha256(archive.read_bytes()).hexdigest())
+    self.assertEqual({'identity', 'registry'}, set(lock['sources']))
+    for name, commit in (
+        ('identity', '2caec24de52c2dbe241e72fe317281c051d03f89'),
+        ('registry', '628120989703d146da50af97b4602f1f4aa3a068')):
+      source = lock['sources'][name]
+      self.assertEqual(commit, source['commit'])
+      self.assertIsInstance(source.get('git_url'), str)
+      self.assertRegex(source['git_url'], re.compile(r'^https://github\.com/[^/]+/[^/]+\.git$'))
+      self.assertNotIn('archive_sha256', source)
+      self.assertFalse((ROOT / 'container/source-archives' / f'{name}.tar.gz').exists())
 
-  def test_container_source_archive_verifier_binds_hashes_and_commits(self):
+    dockerfile = (ROOT / 'container/Dockerfile').read_text()
+    self.assertIn('COPY --from=identity-src /src ./sources/identity/src', dockerfile)
+    self.assertIn('COPY --from=registry-src /src ./sources/registry/src', dockerfile)
+    self.assertIn('COPY --from=identity-src /.pinned-commit', dockerfile)
+    self.assertIn('COPY --from=registry-src /.pinned-commit', dockerfile)
+    self.assertNotIn('source-archives', dockerfile)
+    workflow = (ROOT / '.github/workflows/acceptance.yml').read_text()
+    self.assertIn('--materialize-sources', workflow)
+    self.assertIn('--build-context identity-src=', workflow)
+    self.assertIn('--build-context registry-src=', workflow)
+
+  def test_materializer_clones_each_locked_commit_without_overwriting_existing_paths(self):
+    import importlib.util
+    from unittest.mock import patch
+
+    path = ROOT / 'container/build_resolver_runtime.py'
+    spec = importlib.util.spec_from_file_location('build_resolver_runtime_git_materializer', path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+
+    def git(cwd, *args):
+      return subprocess.check_output(['git', *args], cwd=cwd, text=True).strip()
+
+    with tempfile.TemporaryDirectory() as directory:
+      work = Path(directory)
+      upstream = work / 'upstream'
+      upstream.mkdir()
+      (upstream / 'README.md').write_text('not needed in the build context')
+      git(upstream, 'init', '-b', 'main')
+      git(upstream, 'config', 'user.email', 'test@example.invalid')
+      git(upstream, 'config', 'user.name', 'Resolver Test')
+      (upstream / 'src').mkdir()
+      payload = upstream / 'src' / 'value.py'
+      payload.write_text('VALUE = "first"\n')
+      git(upstream, 'add', 'README.md', 'src/value.py')
+      git(upstream, 'commit', '-m', 'first source state')
+      pinned = git(upstream, 'rev-parse', 'HEAD')
+      payload.write_text('VALUE = "later"\n')
+      git(upstream, 'add', 'src/value.py')
+      git(upstream, 'commit', '-m', 'later source state')
+
+      lock = {'sources': {
+          'identity': {'git_url': upstream.as_uri(), 'commit': pinned},
+          'registry': {'git_url': upstream.as_uri(), 'commit': pinned}}}
+      sources = work / 'temporary-source-checkouts'
+      protected_identity = work / 'protected-identity'
+      protected_registry = work / 'protected-registry'
+      protected_identity.mkdir()
+      protected_registry.mkdir()
+      (protected_identity / 'keep.txt').write_text('preserve')
+      (protected_registry / 'keep.txt').write_text('preserve')
+      with patch.object(builder, 'validate_repo_owned_lock', return_value=lock):
+        try:
+          builder.materialize_sources(sources)
+        except Exception as error:
+          self.fail(f'expected temporary git clone materialization, got {type(error).__name__}')
+
+      for name in ('identity', 'registry'):
+        checkout = sources / name
+        self.assertEqual(pinned, (checkout / '.pinned-commit').read_text().strip())
+        self.assertFalse((checkout / '.git').exists())
+        self.assertFalse((checkout / 'README.md').exists())
+        self.assertEqual('VALUE = "first"\n', (checkout / 'src' / 'value.py').read_text())
+      self.assertEqual('preserve', (protected_identity / 'keep.txt').read_text())
+      self.assertEqual('preserve', (protected_registry / 'keep.txt').read_text())
+      self.assertFalse(list(sources.rglob('*.tar.gz')))
+
+  def test_git_source_checkout_verifier_binds_commit_markers_and_overlays(self):
+    import contextlib
+    import io
     import importlib.util
     import tempfile
+    from unittest.mock import patch
 
     path = ROOT / 'container/verify_resolver_runtime_inputs.py'
     spec = importlib.util.spec_from_file_location('verify_resolver_runtime_inputs', path)
@@ -577,13 +637,17 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
 
     with tempfile.TemporaryDirectory() as directory:
       work = Path(directory)
-      archives = work / 'archives'
-      archives.mkdir()
+      sources = work / 'sources'
+      sources.mkdir()
       manifest_directory = work / 'manifest'
       manifest_directory.mkdir()
       for name in ('identity', 'registry'):
-        source = ROOT / 'container/source-archives' / f'{name}.tar.gz'
-        (archives / f'{name}.tar.gz').write_bytes(source.read_bytes())
+        source_dir = sources / name
+        package = 'decent_identity' if name == 'identity' else 'decent_registry'
+        package_dir = source_dir / 'src' / package
+        package_dir.mkdir(parents=True)
+        (package_dir / '__init__.py').write_text('')
+        (source_dir / '.pinned-commit').write_text(original_lock['sources'][name]['commit'] + '\n')
       for name, filename in (
           ('pinned_lookup_outcomes', 'pinned_lookup_outcomes.py'),
           ('runtime_patcher', 'patch_resolver_runtime.py'),
@@ -596,54 +660,33 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         }
       manifest = manifest_directory / 'resolver-runtime.lock.json'
       manifest.write_text(json.dumps(original_lock))
-      verifier.verify_source_archives(archives, manifest)
+
+      def verify_cli():
+        output = io.StringIO()
+        with patch.object(sys, 'argv', [str(path), '--sources', str(sources), '--manifest', str(manifest)]):
+          with contextlib.redirect_stdout(output):
+            try:
+              verifier.main()
+            except SystemExit as error:
+              self.assertEqual(0, error.code, output.getvalue())
+        return output.getvalue()
+
+      self.assertIn('resolver_git_sources_verified', verify_cli())
+      marker = sources / 'identity' / '.pinned-commit'
+      marker.write_text('f' * 40 + '\n')
+      with self.assertRaisesRegex(RuntimeError, 'pinned commit marker mismatch'):
+        verify_cli()
+      marker.write_text(original_lock['sources']['identity']['commit'] + '\n')
+
       overlay_path = manifest_directory / 'pinned_lookup_outcomes.py'
       overlay_bytes = overlay_path.read_bytes()
       overlay_path.write_bytes(overlay_bytes + b'altered')
       with self.assertRaisesRegex(RuntimeError, 'resolver overlay checksum mismatch'):
-        verifier.verify_source_archives(archives, manifest)
-      overlay_path.write_bytes(overlay_bytes)
+        verify_cli()
 
-      import io
-      import tarfile
-      wheelhouse_archive = manifest_directory / 'wheelhouse.tar.gz'
-      payload = b'pinned-wheel'
-      info = tarfile.TarInfo('wheelhouse/example.whl')
-      info.size = len(payload)
-      info.mode = 0o644
-      info.mtime = 0
-      with tarfile.open(wheelhouse_archive, 'w:gz') as bundle:
-        bundle.addfile(info, io.BytesIO(payload))
-      lock_with_wheelhouse = json.loads(manifest.read_text())
-      lock_with_wheelhouse['wheelhouse'] = {
-          'archive': 'wheelhouse.tar.gz',
-          'archive_sha256': hashlib.sha256(wheelhouse_archive.read_bytes()).hexdigest(),
-          'file_count': 1,
-      }
-      manifest.write_text(json.dumps(lock_with_wheelhouse))
-      verifier.verify_source_archives(archives, manifest)
-      wheelhouse_archive.write_bytes(wheelhouse_archive.read_bytes() + b'altered')
-      with self.assertRaisesRegex(RuntimeError, 'wheelhouse archive checksum mismatch'):
-        verifier.verify_source_archives(archives, manifest)
-
-      changed_archive = archives / 'identity.tar.gz'
-      changed_archive.write_bytes(changed_archive.read_bytes() + b'changed')
-      with self.assertRaisesRegex(RuntimeError, 'checksum'):
-        verifier.verify_source_archives(archives, manifest)
-      source = ROOT / 'container/source-archives/identity.tar.gz'
-      changed_archive.write_bytes(source.read_bytes())
-
-      altered_lock = json.loads(manifest.read_text())
-      altered_lock['sources']['identity']['commit'] = 'f' * 40
-      manifest.write_text(json.dumps(altered_lock))
-      with self.assertRaisesRegex(RuntimeError, 'commit'):
-        verifier.verify_source_archives(archives, manifest)
-
-  def test_source_archive_extraction_rejects_symlink_destination(self):
+  def test_materializer_rejects_symlink_destination_without_touching_target(self):
     import importlib.util
-    import io
-    import tarfile
-    import tempfile
+    from unittest.mock import patch
 
     path = ROOT / 'container/build_resolver_runtime.py'
     spec = importlib.util.spec_from_file_location('build_resolver_runtime_symlink_test', path)
@@ -656,20 +699,20 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       work = Path(directory)
       outside = work / 'outside'
       outside.mkdir()
+      sentinel = outside / 'keep.txt'
+      sentinel.write_text('preserve')
       destination = work / 'source-destination'
       destination.symlink_to(outside, target_is_directory=True)
-      archive = work / 'source.tar.gz'
-      with tarfile.open(archive, 'w:gz') as bundle:
-        payload = b'archive payload'
-        info = tarfile.TarInfo('repo-abc123/payload.txt')
-        info.size = len(payload)
-        info.mode = 0o644
-        bundle.addfile(info, io.BytesIO(payload))
-
-      with self.assertRaisesRegex(RuntimeError, 'destination must not be a symlink'):
-        builder.extract_pinned_archive(archive, destination, 'abc123')
-
-      self.assertFalse((outside / 'payload.txt').exists())
+      lock = {'sources': {'identity': {}, 'registry': {}}}
+      with patch.object(builder, 'validate_repo_owned_lock', return_value=lock):
+        try:
+          builder.materialize_sources(destination)
+        except Exception as error:
+          self.assertEqual('RuntimeError', type(error).__name__)
+          self.assertIn('must be a new temporary directory', str(error))
+        else:
+          self.fail('materializer accepted a symlink output path')
+      self.assertEqual('preserve', sentinel.read_text())
 
   def test_wheelhouse_verifier_rejects_duplicate_normalized_member_paths(self):
     import importlib.util
@@ -710,12 +753,19 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertTrue(run_lines)
     self.assertTrue(all(line.startswith('RUN --network=none ') for line in run_lines), run_lines)
 
-  def test_build_downloads_no_unpinned_sources(self):
+  def test_build_materializes_git_pins_before_building_without_source_archives(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
-    download_script = ROOT / 'container/download_resolver_sources.sh'
-    self.assertFalse(download_script.exists())
+    workflow = (ROOT / '.github/workflows/acceptance.yml').read_text()
+    builder = (ROOT / 'container/build_resolver_runtime.py').read_text()
+    self.assertNotIn('source-archives', dockerfile)
     self.assertNotIn('curl ', dockerfile)
-    self.assertIn('COPY container/source-archives/identity.tar.gz container/source-archives/registry.tar.gz ./', dockerfile)
+    self.assertIn('--filter=blob:none', builder)
+    self.assertIn('checkout', builder)
+    self.assertIn('--materialize-sources', workflow)
+    self.assertIn('--build-context identity-src=', workflow)
+    self.assertIn('--build-context registry-src=', workflow)
+    self.assertFalse((ROOT / 'container/source-archives/identity.tar.gz').exists())
+    self.assertFalse((ROOT / 'container/source-archives/registry.tar.gz').exists())
 
   def test_gmp_layer_does_not_continue_into_source_download_run(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
@@ -723,7 +773,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     link_index = next(index for index, line in enumerate(lines)
         if 'ln -s libgmp.so.10.4.0 /opt/decent-resolver/lib/libgmp.so.10' in line)
     self.assertTrue(lines[link_index].rstrip().endswith(chr(92)))
-    self.assertEqual('RUN --network=none python3.11 verify_resolver_runtime_inputs.py --archives . --manifest resolver-runtime.lock.json \\', lines[link_index + 3])
+    self.assertEqual('RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json \\', lines[link_index + 3])
 
   def test_runtime_target_installs_provider_and_builds_keycloak(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()

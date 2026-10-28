@@ -6,7 +6,7 @@ scripts/__pycache__/
 container/__pycache__/
 .pytest_cache/
 
-# Local materializations of checksum-pinned resolver source archives
+# Legacy local resolver source materializations (not pinned build inputs)
 container/.cache/resolver-downloads/
 container/identity-src/
 container/registry-src/
