@@ -106,6 +106,36 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertEqual(0, result)
     remove.assert_called_once_with("podman", "run-unique-tag", image_id)
 
+  def make_git_worktree(self, root: Path):
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Lifecycle Test"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "lifecycle@example.invalid"], check=True)
+    (root / "tracked.txt").write_text("baseline\n")
+    subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "baseline"], check=True)
+
+  def test_local_diff_check_catches_tracked_worktree_edits(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      self.make_git_worktree(root)
+      (root / "tracked.txt").write_text("changed \n")
+      with mock.patch.object(lifecycle, "ROOT", root):
+        with mock.patch.dict(lifecycle.os.environ, {"PR_BASE_SHA": ""}):
+          result = lifecycle.diff_check()
+
+    self.assertNotEqual(0, result)
+
+  def test_local_diff_check_catches_untracked_files_before_staging(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      self.make_git_worktree(root)
+      (root / "new.py").write_text("untracked \n")
+      with mock.patch.object(lifecycle, "ROOT", root):
+        with mock.patch.dict(lifecycle.os.environ, {"PR_BASE_SHA": ""}):
+          result = lifecycle.diff_check()
+
+    self.assertNotEqual(0, result)
+
   def test_lists_named_profiles_and_distinguishes_live_qualification(self):
     result = self.run_cli("profiles", "--json")
 

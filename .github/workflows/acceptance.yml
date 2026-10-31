@@ -1,7 +1,6 @@
 name: Wallet-login acceptance
 
 on:
-  push:
   pull_request:
   workflow_dispatch:
 
@@ -42,5 +41,4 @@ jobs:
         env:
           CONTAINER_ENGINE: docker
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BASE_SHA: ${{ github.event.before }}
         run: python scripts/lifecycle.py run ci

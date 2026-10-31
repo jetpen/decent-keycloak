@@ -97,7 +97,7 @@ def plan(profile: str) -> dict:
     {"name": "provider-service-registration", "command": [sys.executable, "scripts/lifecycle.py", "verify-provider"]},
     {"name": "provider-image", "action": "build runtime image with named resolver contexts, no-cache, and network-isolated RUN steps"},
     {"name": "image-smoke", "action": "run pinned Keycloak/JVM version smoke against the immutable built image"},
-    {"name": "diff-check", "command": ["git", "diff", "--check"]},
+    {"name": "diff-check", "command": [sys.executable, "scripts/lifecycle.py", "diff-check"]},
   ])
   if profile == "issue5-live":
     steps.append({"name": "issue5-live-matrix", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
@@ -118,6 +118,32 @@ def run(command: list[str], *, env: dict[str, str] | None = None) -> int:
 def capture_command(command: list[str]) -> subprocess.CompletedProcess[str]:
   print("+ " + shlex.join(command), flush=True)
   return subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+
+
+def diff_check() -> int:
+  pull_request_base = os.environ.get("PR_BASE_SHA")
+  if pull_request_base:
+    return run(["git", "diff", "--check", f"{pull_request_base}...HEAD"])
+
+  result = run(["git", "diff", "--check", "HEAD"])
+  if result:
+    return result
+  untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                             cwd=ROOT, capture_output=True, check=False)
+  if untracked.returncode:
+    return untracked.returncode
+  for raw_path in sorted(filter(None, untracked.stdout.split(bytes((0,))))):
+    path = os.fsdecode(raw_path)
+    command = ["git", "diff", "--no-index", "--check", "--", "/dev/null", path]
+    print("+ " + shlex.join(command), flush=True)
+    checked = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+    if checked.stdout:
+      print(checked.stdout, end="", flush=True)
+    if checked.stderr:
+      print(checked.stderr, end="", file=sys.stderr, flush=True)
+    if checked.returncode not in (0, 1):
+      return checked.returncode
+  return 0
 
 
 def check_tool(name: str, command: list[str], expected: str) -> bool:
@@ -477,16 +503,7 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
       return smoke_status or 1
     _record_step(receipt, receipt_path, "image-smoke", "pass")
     current_step = "diff-check"
-
-    pull_request_base = os.environ.get("PR_BASE_SHA")
-    push_base = os.environ.get("PUSH_BASE_SHA")
-    if pull_request_base:
-      diff_command = ["git", "diff", "--check", f"{pull_request_base}...HEAD"]
-    elif push_base and push_base != "0" * 40:
-      diff_command = ["git", "diff", "--check", f"{push_base}...HEAD"]
-    else:
-      diff_command = ["git", "diff", "--check", "HEAD^", "HEAD"]
-    result = run(diff_command)
+    result = diff_check()
     if result:
       _record_step(receipt, receipt_path, "diff-check", "fail", detail=f"exit_{result}")
       return result
@@ -581,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
   subparsers.add_parser("python-compile", help="compile all lifecycle Python sources")
   subparsers.add_parser("verify-surefire", help="require nonempty passing Surefire reports")
   subparsers.add_parser("verify-provider", help="verify production provider SPI registration")
+  subparsers.add_parser("diff-check", help="validate committed-base, staged, unstaged and untracked whitespace")
   run_parser = subparsers.add_parser("run", help="run a named lifecycle profile")
   run_parser.add_argument("profile", choices=sorted(PROFILES))
   run_parser.add_argument("--plan", action="store_true", help="print the plan without running it")
@@ -604,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
     return verify_surefire()
   if args.action == "verify-provider":
     return verify_provider()
+  if args.action == "diff-check":
+    return diff_check()
   if args.profile == "issue5-live" and not args.allow_live:
     parser.error("issue5-live requires explicit --allow-live authorization")
   execution_plan = plan(args.profile)

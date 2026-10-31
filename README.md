@@ -216,11 +216,13 @@ Latest #4 artifact provenance: the build-input verifier parses `container/resolv
 
 ## Local checks
 
-With the pinned Java 21 and Python 3.11 toolchain available, run the shared offline software lifecycle locally:
+Use the lifecycle CLI throughout implementation, then finish acceptance locally before committing, pushing, or opening a PR. While iterating, run the narrow test module(s) that cover the change; before delivery, run the complete offline lifecycle from the working tree:
 
 ```bash
 python3.11 scripts/lifecycle.py run offline
 ```
+
+This final local run checks Maven/Surefire, the canonical Python acceptance suite, compilation, pinned resolver sources, provider registration, the runtime image build and smoke test, and whitespace across tracked, staged, unstaged, and untracked changes. Inspect the receipt under `target/lifecycle/evidence/`; do not use a later PR CI result as a substitute for these local acceptance checks.
 
 Inspect the ordered plan without executing it:
 
@@ -228,7 +230,7 @@ Inspect the ordered plan without executing it:
 python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-The offline profile runs Maven/Surefire, the canonical Python acceptance suite and compile check, verifies and materializes the pinned resolver sources in a temporary directory, verifies provider registration, builds and smoke-tests the runtime image with network-isolated build steps, records sanitized evidence under `target/lifecycle/evidence/`, and tears down only resources owned by that run. Local Podman builds use `--pull=never`; pinned base images must already exist locally. CI invokes the same lifecycle using the Docker engine.
+CI invokes the same profile on the pull request as an independent verification layer. The acceptance workflow does not run on push-only events, avoiding a push→CI→PR testing loop; `workflow_dispatch` remains available for deliberate CI runs. Local Podman builds use `--pull=never`; pinned base images must already exist locally. CI uses Docker Buildx.
 
 A successful offline lifecycle is not live wallet-login qualification. To run the full loopback matrix, request separate authorization first; the command requires `--allow-live`:
 

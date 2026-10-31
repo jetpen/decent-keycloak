@@ -16,14 +16,18 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
 
-  def test_push_validation_checks_all_commits_since_the_previous_ref(self):
+  def test_pr_workflow_checks_commits_while_local_runs_check_the_worktree(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
+    events = workflow.split("permissions:", 1)[0]
 
+    self.assertNotIn("  push:", events)
+    self.assertIn("  pull_request:", events)
     self.assertIn('os.environ.get("PR_BASE_SHA")', lifecycle)
-    self.assertIn('os.environ.get("PUSH_BASE_SHA")', lifecycle)
     self.assertIn('f"{pull_request_base}...HEAD"', lifecycle)
-    self.assertIn('f"{push_base}...HEAD"', lifecycle)
-    self.assertIn('["git", "diff", "--check"]', lifecycle)
+    self.assertIn('["git", "diff", "--check", "HEAD"]', lifecycle)
+    self.assertIn('["git", "ls-files", "--others", "--exclude-standard", "-z"]', lifecycle)
+    self.assertIn('"--no-index", "--check"', lifecycle)
 
   def test_provider_image_build_uses_repository_dockerfile_path(self):
     lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
