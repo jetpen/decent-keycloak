@@ -39,14 +39,168 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       self.assertEqual(overlay_copy.resolve(), patcher['OVERLAY'])
       self.assertEqual(overlay_copy.read_bytes(), patcher['OVERLAY'].read_bytes())
 
-  def test_runtime_lock_pins_wheelhouse_archive_and_exact_size(self):
+  def test_runtime_lock_pins_wheelhouse_artifact_count_not_a_tracked_archive(self):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
     wheelhouse = lock.get('wheelhouse')
     self.assertIsInstance(wheelhouse, dict)
     self.assertEqual(67, wheelhouse.get('file_count'))
-    archive = ROOT / 'container' / wheelhouse.get('archive', '')
-    self.assertTrue(archive.is_file())
-    self.assertEqual(wheelhouse.get('archive_sha256'), hashlib.sha256(archive.read_bytes()).hexdigest())
+    self.assertEqual('resolver-wheelhouse.tar.gz', wheelhouse.get('archive'))
+    self.assertNotIn('archive_sha256', wheelhouse)
+    self.assertFalse((ROOT / 'container' / wheelhouse['archive']).exists())
+
+  def test_binary_dependency_inventory_pins_each_upstream_artifact(self):
+    lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
+    inventory_path = ROOT / 'container/resolver-binary-dependencies.lock.json'
+    inventory_bytes = inventory_path.read_bytes()
+    inventory = json.loads(inventory_bytes)
+    provenance = lock['binary_dependency_provenance']
+    self.assertEqual(inventory_path.name, provenance['manifest'])
+    self.assertEqual(provenance['sha256'], hashlib.sha256(inventory_bytes).hexdigest())
+    artifacts = inventory['wheelhouse']['artifacts']
+    self.assertEqual(lock['wheelhouse']['file_count'], inventory['wheelhouse']['artifact_count'])
+    self.assertEqual(67, len(artifacts))
+    package_locks = ((ROOT / 'container/resolver-requirements.lock.txt').read_text()
+        + (ROOT / 'container/resolver-build-requirements.lock.txt').read_text())
+    for artifact in artifacts:
+      self.assertTrue(artifact['url'].startswith('https://files.pythonhosted.org/packages/'))
+      self.assertTrue(artifact['url'].endswith('/' + artifact['filename']))
+      self.assertIn(artifact['sha256'], package_locks)
+    rpms = inventory['rpms']
+    self.assertEqual({'cpio', 'gmp-devel'}, {rpm['package'] for rpm in rpms})
+    for rpm in rpms:
+      self.assertTrue(rpm['url'].startswith('https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/'))
+      self.assertTrue(rpm['url'].endswith('/' + rpm['filename']))
+      path = ROOT / 'container' / rpm['filename']
+      self.assertFalse(path.exists(), 'RPM binaries must be fetched into run-scoped storage, not tracked')
+    self.assertFalse((ROOT / 'container' / lock['wheelhouse']['archive']).exists(),
+        'the wheelhouse archive must be fetched/materialized at runtime, not tracked')
+
+  def test_binary_dependency_verifier_rejects_an_untrusted_distribution_url(self):
+    import importlib.util
+    import shutil
+
+    verifier_path = ROOT / 'container/verify_resolver_runtime_inputs.py'
+    spec = importlib.util.spec_from_file_location('resolver_dependency_verifier_test', verifier_path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    with tempfile.TemporaryDirectory() as temporary:
+      work = Path(temporary)
+      for filename in ('resolver-requirements.lock.txt', 'resolver-build-requirements.lock.txt'):
+        shutil.copyfile(ROOT / 'container' / filename, work / filename)
+      inventory_path = work / 'resolver-binary-dependencies.lock.json'
+      inventory = json.loads((ROOT / 'container/resolver-binary-dependencies.lock.json').read_text())
+      inventory['wheelhouse']['artifacts'][0]['url'] = 'https://example.invalid/' + inventory['wheelhouse']['artifacts'][0]['filename']
+      inventory_path.write_text(json.dumps(inventory))
+      runtime_lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
+      runtime_lock['binary_dependency_provenance']['sha256'] = hashlib.sha256(
+          inventory_path.read_bytes()).hexdigest()
+      runtime_lock_path = work / 'resolver-runtime.lock.json'
+      runtime_lock_path.write_text(json.dumps(runtime_lock))
+
+      with self.assertRaisesRegex(RuntimeError, 'binary dependency source URL is invalid'):
+        verifier.verify_binary_dependency_provenance(work, runtime_lock_path, verify_files=False)
+
+  def test_binary_dependency_verifier_rejects_hash_from_another_package_lock(self):
+    import importlib.util
+    import shutil
+
+    verifier_path = ROOT / 'container/verify_resolver_runtime_inputs.py'
+    spec = importlib.util.spec_from_file_location('resolver_dependency_hash_verifier_test', verifier_path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    with tempfile.TemporaryDirectory() as temporary:
+      work = Path(temporary)
+      for filename in ('resolver-requirements.lock.txt', 'resolver-build-requirements.lock.txt'):
+        shutil.copyfile(ROOT / 'container' / filename, work / filename)
+      inventory = json.loads((ROOT / 'container/resolver-binary-dependencies.lock.json').read_text())
+      artifact = inventory['wheelhouse']['artifacts'][0]
+      foreign = next(candidate for candidate in inventory['wheelhouse']['artifacts'][1:]
+          if candidate['package'] != artifact['package'])
+      artifact['sha256'] = foreign['sha256']
+      inventory_path = work / 'resolver-binary-dependencies.lock.json'
+      inventory_path.write_text(json.dumps(inventory))
+      runtime_lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
+      runtime_lock['binary_dependency_provenance']['sha256'] = hashlib.sha256(
+          inventory_path.read_bytes()).hexdigest()
+      runtime_lock_path = work / 'resolver-runtime.lock.json'
+      runtime_lock_path.write_text(json.dumps(runtime_lock))
+
+      with self.assertRaisesRegex(RuntimeError, 'checksum is not in the hash lock for'):
+        verifier.verify_binary_dependency_provenance(work, runtime_lock_path, verify_files=False)
+
+  def test_binary_dependency_materialization_refuses_an_existing_destination(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      destination = Path(temporary) / 'dependencies'
+      destination.mkdir()
+      marker = destination / 'keep.txt'
+      marker.write_text('preserve existing directory')
+      result = subprocess.run([
+          sys.executable, str(ROOT / 'container/build_resolver_runtime.py'),
+          '--materialize-binary-dependencies', '--binary-dependencies-directory', str(destination)],
+          cwd=ROOT, text=True, capture_output=True, check=False)
+
+      self.assertNotEqual(0, result.returncode)
+      self.assertIn('binary dependency directory must be a new temporary directory', result.stderr)
+      self.assertEqual('preserve existing directory', marker.read_text())
+
+  def test_binary_dependency_download_verifies_bytes_before_publishing_file(self):
+    import importlib.util
+    import io
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(ROOT / 'container'))
+    builder_path = ROOT / 'container/build_resolver_runtime.py'
+    spec = importlib.util.spec_from_file_location('resolver_dependency_builder_test', builder_path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    filename = 'fixture-1.0-py3-none-any.whl'
+    url = 'https://files.pythonhosted.org/packages/aa/' + filename
+    payload = b'locked artifact bytes'
+    request = builder.urllib.request.Request(url)
+    self.assertIsNone(builder._SameHostRedirect().redirect_request(request, io.BytesIO(),
+        302, 'Found', {}, 'https://example.invalid/' + filename))
+
+    class Response(io.BytesIO):
+      headers = {'Content-Length': str(len(payload))}
+
+      def geturl(self) -> str:
+        return url
+
+    class Opener:
+      def open(self, request, timeout):
+        self.request = request
+        self.timeout = timeout
+        return Response(payload)
+
+    with tempfile.TemporaryDirectory() as temporary:
+      destination = Path(temporary) / filename
+      with patch('urllib.request.build_opener', return_value=Opener()):
+        builder._download_verified(url, destination, hashlib.sha256(payload).hexdigest(),
+            host='files.pythonhosted.org', path_prefix='/packages/')
+      self.assertEqual(payload, destination.read_bytes())
+
+      mismatch_destination = Path(temporary) / 'mismatch.whl'
+      bad_url = 'https://files.pythonhosted.org/packages/bb/mismatch.whl'
+      class MismatchResponse(Response):
+        def geturl(self) -> str:
+          return bad_url
+      class MismatchOpener:
+        def open(self, request, timeout):
+          return MismatchResponse(payload)
+      with patch('urllib.request.build_opener', return_value=MismatchOpener()):
+        with self.assertRaisesRegex(RuntimeError, 'binary dependency checksum mismatch'):
+          builder._download_verified(bad_url, mismatch_destination, '0' * 64,
+              host='files.pythonhosted.org', path_prefix='/packages/')
+      self.assertFalse(mismatch_destination.exists())
+      self.assertFalse(mismatch_destination.with_name(mismatch_destination.name + '.part').exists())
 
   def test_live_harness_checkpoints_evidence_before_failure(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
@@ -514,7 +668,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     self.assertNotRegex(dockerfile, r'(?m)^RUN dnf\\b')
     self.assertNotRegex(dockerfile, r'(?m)^RUN yum\\b')
-    self.assertIn('rpm2cpio gmp-devel.rpm | /usr/bin/cpio -idm', dockerfile)
+    self.assertIn('rpm2cpio gmp-devel-6.2.0-13.el9.x86_64.rpm | /usr/bin/cpio -idm', dockerfile)
     self.assertNotIn('curl ', dockerfile)
     self.assertNotIn('openssl', dockerfile)
 
@@ -635,6 +789,7 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     spec.loader.exec_module(verifier)
     original_lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
     original_lock.pop('wheelhouse', None)
+    original_lock.pop('binary_dependency_provenance', None)
 
     with tempfile.TemporaryDirectory() as directory:
       work = Path(directory)
@@ -742,7 +897,6 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       manifest = work / 'resolver-runtime.lock.json'
       manifest.write_text(json.dumps({'wheelhouse': {
           'archive': archive.name,
-          'archive_sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
           'file_count': 2}}))
       with self.assertRaisesRegex(RuntimeError, 'duplicate normalized path'):
         verifier.verify_wheelhouse_archive(work, manifest)
@@ -764,18 +918,20 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('checkout', builder)
     self.assertIn('container/build_resolver_runtime.py', lifecycle)
     self.assertIn('--materialize-sources', lifecycle)
+    self.assertIn('--materialize-binary-dependencies', lifecycle)
+    self.assertIn('binary-dependencies={dependencies}', lifecycle)
     self.assertIn('f"identity-src={identity}"', lifecycle)
     self.assertIn('f"registry-src={registry}"', lifecycle)
     self.assertFalse((ROOT / 'container/source-archives/identity.tar.gz').exists())
     self.assertFalse((ROOT / 'container/source-archives/registry.tar.gz').exists())
 
-  def test_gmp_layer_does_not_continue_into_source_download_run(self):
+  def test_gmp_layer_does_not_continue_into_dependency_verification_run(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
     lines = dockerfile.splitlines()
     link_index = next(index for index, line in enumerate(lines)
         if 'ln -s libgmp.so.10.4.0 /opt/decent-resolver/lib/libgmp.so.10' in line)
     self.assertTrue(lines[link_index].rstrip().endswith(chr(92)))
-    self.assertEqual('RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json \\', lines[link_index + 3])
+    self.assertEqual('RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json --dependencies /resolver-build \\', lines[link_index + 3])
 
   def test_runtime_target_installs_provider_and_builds_keycloak(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
@@ -990,7 +1146,9 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
 
   def test_runtime_build_installs_hash_locked_dependencies_offline_from_wheelhouse(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
-    self.assertIn('COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz', dockerfile)
+    self.assertIn('COPY --from=binary-dependencies /resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz', dockerfile)
+    self.assertIn('COPY --from=binary-dependencies /cpio-2.13-16.el9.x86_64.rpm', dockerfile)
+    self.assertNotIn('COPY container/resolver-wheelhouse.tar.gz', dockerfile)
     self.assertIn('--no-index', dockerfile)
     self.assertIn('--find-links=/resolver-build/wheelhouse', dockerfile)
     self.assertIn('--require-hashes', dockerfile)

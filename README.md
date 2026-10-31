@@ -18,7 +18,7 @@ The repository's lifecycle command is the canonical build and offline-acceptance
 python3.11 scripts/lifecycle.py run offline
 ```
 
-The lifecycle checks prerequisites, runs Maven/Surefire and the canonical Python acceptance suite, compiles Python sources, verifies pinned resolver sources and provider registration, builds and smoke-tests the Keycloak image, checks whitespace, writes a sanitized receipt under `target/lifecycle/evidence/`, and tears down its run-owned image tag. Inspect the receipt; a successful offline run is not live Registry or wallet qualification. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and the contributor workflow.
+The lifecycle checks prerequisites, runs Maven/Surefire and the canonical Python acceptance suite, compiles Python sources, verifies pinned resolver sources and every recorded binary dependency provenance entry, checks provider registration, builds and smoke-tests the Keycloak image, checks whitespace, writes a sanitized receipt under `target/lifecycle/evidence/`, and tears down its run-owned image tag. Inspect the receipt; a successful offline run is not live Registry or wallet qualification. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and the contributor workflow.
 
 To inspect the steps without running them:
 
@@ -32,11 +32,11 @@ CI invokes the same lifecycle with `ci` on pull requests. `issue5-live` is a sep
 python3.11 scripts/lifecycle.py run issue5-live --allow-live
 ```
 
-Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial.
+Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry.
 
 ## Build an installable local image
 
-No release image is published by this repository. The offline lifecycle deliberately removes its temporary image after smoke testing. To keep a local image for evaluation, first run the offline lifecycle above, then build a separately tagged image from the same pinned sources. The following Podman example assumes the lifecycle prerequisites are installed and pinned base images are already present locally; it leaves the resulting image in Podman and removes only its temporary source checkout:
+No release image is published by this repository. The offline lifecycle deliberately removes its temporary image after smoke testing. To keep a local image for evaluation, first run the offline lifecycle above, then build a separately tagged image from the same pinned sources. The following Podman example assumes the lifecycle prerequisites are installed and pinned base images are already present locally; it leaves the resulting image in Podman and removes its temporary source and dependency downloads:
 
 ```bash
 set -eu
@@ -44,12 +44,17 @@ mvn --batch-mode --no-transfer-progress clean package
 source_parent="$(mktemp -d)"
 trap 'rm -rf -- "$source_parent"' EXIT
 sources="$source_parent/sources"
+dependencies="$source_parent/binary-dependencies"
 python3.11 container/build_resolver_runtime.py \
   --materialize-sources --sources-directory "$sources"
-python3.11 container/verify_resolver_runtime_inputs.py --sources "$sources"
+python3.11 container/build_resolver_runtime.py \
+  --materialize-binary-dependencies --binary-dependencies-directory "$dependencies"
+python3.11 container/verify_resolver_runtime_inputs.py --sources "$sources" \
+  --dependencies "$dependencies"
 podman build --no-cache --pull=never --network=none \
   --build-context "identity-src=$sources/identity" \
   --build-context "registry-src=$sources/registry" \
+  --build-context "binary-dependencies=$dependencies" \
   --file container/Dockerfile --target runtime \
   --tag localhost/decent-keycloak-wallet-provider:local .
 podman run --rm --entrypoint /opt/keycloak/bin/kc.sh \

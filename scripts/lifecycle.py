@@ -94,6 +94,7 @@ def plan(profile: str) -> dict:
   steps.extend({"name": name, "command": command} for name, command in core_test_stages())
   steps.extend([
     {"name": "resolver-sources", "action": "materialize and verify pinned Identity/Registry commits in a run-owned temporary directory"},
+    {"name": "resolver-dependencies", "action": "download and hash-verify locked PyPI/UBI artifacts in a run-owned temporary directory"},
     {"name": "provider-service-registration", "command": [sys.executable, "scripts/lifecycle.py", "verify-provider"]},
     {"name": "provider-image", "action": "build runtime image with named resolver contexts, no-cache, and network-isolated RUN steps"},
     {"name": "image-smoke", "action": "run pinned Keycloak/JVM version smoke against the immutable built image"},
@@ -105,7 +106,7 @@ def plan(profile: str) -> dict:
                   "requires": ["--allow-live"]})
   steps.extend([
     {"name": "evidence", "action": "retain the finalized sanitized lifecycle receipt"},
-    {"name": "teardown", "action": "remove only the run-owned immutable image tag and temporary source checkouts"},
+    {"name": "teardown", "action": "remove only the run-owned immutable image tag and temporary source/dependency inputs"},
   ])
   return {"profile": profile, "steps": steps}
 
@@ -277,6 +278,7 @@ def fingerprint_source() -> dict:
     "untracked_inputs_sha256": untracked_hash.hexdigest(),
     "harness_sha256": digest_file(ROOT / "scripts/wallet_login_live_e2e.py"),
     "resolver_manifest_sha256": digest_file(ROOT / "container/resolver-runtime.lock.json"),
+    "resolver_dependency_provenance_sha256": digest_file(ROOT / "container/resolver-binary-dependencies.lock.json"),
     "resolver_requirements_sha256": digest_file(ROOT / "container/resolver-requirements.lock.txt"),
   }
 
@@ -293,6 +295,8 @@ def run_python_tests() -> int:
     run_dir = Path(temporary)
     install_dir = run_dir / "site-packages"
     sources = run_dir / "resolver-sources"
+    env = dict(os.environ)
+    env["PIP_CACHE_DIR"] = str(run_dir / "pip-cache")
     commands = (
       [sys.executable, "container/build_resolver_runtime.py", "--materialize-sources",
        "--sources-directory", str(sources)],
@@ -301,7 +305,7 @@ def run_python_tests() -> int:
        "--target", str(install_dir), "-r", "container/resolver-requirements.lock.txt"],
     )
     for command in commands:
-      result = run(command)
+      result = run(command, env=env)
       if result:
         return result
     registry_file = sources / "registry/src/decent_registry/dht/libp2p_dht.py"
@@ -330,17 +334,19 @@ def _record_step(receipt: dict, path: Path, name: str, status: str, *, detail: s
   write_receipt(path, receipt)
 
 
-def _engine_command(engine: str, tag: str, sources: Path) -> list[str]:
+def _engine_command(engine: str, tag: str, sources: Path, dependencies: Path) -> list[str]:
   identity = str(sources / "identity")
   registry = str(sources / "registry")
   if engine == "docker":
     return ["docker", "buildx", "build", "--platform", "linux/amd64", "--pull",
             "--no-cache", "--load", "--network=none", "--build-context",
             f"identity-src={identity}", "--build-context", f"registry-src={registry}",
+            "--build-context", f"binary-dependencies={dependencies}",
             "--file", "container/Dockerfile", "--target", "runtime", "--tag", tag, "."]
   return ["podman", "build", "--no-cache", "--pull=never", "--network=none",
           "--build-context", f"identity-src={identity}", "--build-context",
-          f"registry-src={registry}", "--file", "container/Dockerfile", "--target",
+          f"registry-src={registry}", "--build-context", f"binary-dependencies={dependencies}",
+          "--file", "container/Dockerfile", "--target",
           "runtime", "--tag", tag, "."]
 
 
@@ -447,17 +453,28 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
 
     current_step = "resolver-sources"
     source_parent = tempfile.TemporaryDirectory(prefix=f"decent-resolver-{run_id}-")
-    sources = Path(source_parent.name) / "sources"
+    run_inputs = Path(source_parent.name)
+    sources = run_inputs / "sources"
     result = run([sys.executable, "container/build_resolver_runtime.py", "--materialize-sources",
                   "--sources-directory", str(sources)])
     if result:
       _record_step(receipt, receipt_path, "resolver-sources", "fail", detail=f"exit_{result}")
       return result
-    result = run([sys.executable, "container/verify_resolver_runtime_inputs.py", "--sources", str(sources)])
-    if result:
-      _record_step(receipt, receipt_path, "resolver-sources", "fail", detail=f"exit_{result}")
-      return result
     _record_step(receipt, receipt_path, "resolver-sources", "pass")
+    current_step = None
+    dependencies = run_inputs / "binary-dependencies"
+    current_step = "resolver-dependencies"
+    result = run([sys.executable, "container/build_resolver_runtime.py",
+        "--materialize-binary-dependencies", "--binary-dependencies-directory", str(dependencies)])
+    if result:
+      _record_step(receipt, receipt_path, "resolver-dependencies", "fail", detail=f"exit_{result}")
+      return result
+    result = run([sys.executable, "container/verify_resolver_runtime_inputs.py", "--sources", str(sources),
+                  "--dependencies", str(dependencies)])
+    if result:
+      _record_step(receipt, receipt_path, "resolver-dependencies", "fail", detail=f"exit_{result}")
+      return result
+    _record_step(receipt, receipt_path, "resolver-dependencies", "pass")
     current_step = None
 
     current_step = "provider-service-registration"
@@ -473,7 +490,7 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
     if before.returncode == 0:
       _record_step(receipt, receipt_path, "provider-image", "fail", detail="run_owned_tag_collision")
       return 2
-    build_command = _engine_command(engine, tag, sources)
+    build_command = _engine_command(engine, tag, sources, dependencies)
     if engine == "podman" and pull_base:
       build_command[build_command.index("--pull=never")] = "--pull=always"
     image_build_started = True
