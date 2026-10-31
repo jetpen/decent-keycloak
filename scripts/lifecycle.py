@@ -277,6 +277,7 @@ def fingerprint_source() -> dict:
     "untracked_inputs_sha256": untracked_hash.hexdigest(),
     "harness_sha256": digest_file(ROOT / "scripts/wallet_login_live_e2e.py"),
     "resolver_manifest_sha256": digest_file(ROOT / "container/resolver-runtime.lock.json"),
+    "resolver_dependency_provenance_sha256": digest_file(ROOT / "container/resolver-binary-dependencies.lock.json"),
     "resolver_requirements_sha256": digest_file(ROOT / "container/resolver-requirements.lock.txt"),
   }
 

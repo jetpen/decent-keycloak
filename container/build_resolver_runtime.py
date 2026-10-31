@@ -43,6 +43,7 @@ def validate_repo_owned_lock() -> dict:
   from verify_resolver_runtime_inputs import (
       is_pinned_git_url,
       verify_repo_overlays,
+      verify_binary_dependency_provenance,
       verify_wheelhouse_archive,
   )
 
@@ -60,6 +61,7 @@ def validate_repo_owned_lock() -> dict:
 
   verify_repo_overlays(LOCK_PATH.parent, lock)
   verify_wheelhouse_archive(LOCK_PATH.parent, LOCK_PATH)
+  verify_binary_dependency_provenance(LOCK_PATH.parent, LOCK_PATH)
   return lock
 
 

@@ -24,9 +24,13 @@
     "python_version": "3.11.13",
     "platform": "x86_64-linux-gnu"
   },
+  "binary_dependency_provenance": {
+    "manifest": "resolver-binary-dependencies.lock.json",
+    "sha256": "72c9afb4b0b90fbdce7069aacb639972bdac73f73b5931460ce24dec598815c4"
+  },
   "gmp": {
     "version": "6.2.0-13.el9",
-    "devel_rpm_url": "https://dl.rockylinux.org/pub/rocky/9/devel/x86_64/os/Packages/g/gmp-devel-6.2.0-13.el9.x86_64.rpm",
+    "devel_rpm_url": "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/appstream/os/Packages/g/gmp-devel-6.2.0-13.el9.x86_64.rpm",
     "devel_rpm_sha256": "8dae9819eeba660528c52e7c5a3ac1e354084ea5782088160d9b46e9d43dde97",
     "runtime_library": "libgmp.so.10.4.0",
     "runtime_library_sha256": "b9d1265de01c92a6565272aa3ffa30034fe3656c73c348fc988a2e65389d6782",

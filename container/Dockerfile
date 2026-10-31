@@ -11,19 +11,21 @@ COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_input
 COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./
 COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/
 COPY container/resolver-runtime.lock.json container/registry-lock-constraints.txt container/resolver-requirements.in container/resolver-requirements.lock.txt container/resolver-build-requirements.lock.txt ./
+COPY container/resolver-binary-dependencies.lock.json ./
 COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
-COPY container/gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel.rpm
-COPY container/cpio-2.13-16.el9.x86_64.rpm ./cpio.rpm
+COPY container/gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel-6.2.0-13.el9.x86_64.rpm
+COPY container/cpio-2.13-16.el9.x86_64.rpm ./cpio-2.13-16.el9.x86_64.rpm
+RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json
 RUN --network=none printf '%s  %s\n' "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff" resolver-requirements.lock.txt | sha256sum --check \
  && printf '%s  %s\n' "70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539" registry-lock-constraints.txt | sha256sum --check \
  && printf '%s  %s\n' "6f209b51694b56c0d4bd9760004303349c6b23217e828b85c07a7e778844fe9c" resolver-build-requirements.lock.txt | sha256sum --check \
- && printf '%s  %s\n' "d9b53fda4b8757fd63b53a415f533ab876c18c28a94fd21d10658de85978f254" cpio.rpm | sha256sum --check \
- && rpm -i --nodeps cpio.rpm \
+ && printf '%s  %s\n' "d9b53fda4b8757fd63b53a415f533ab876c18c28a94fd21d10658de85978f254" cpio-2.13-16.el9.x86_64.rpm | sha256sum --check \
+ && rpm -i --nodeps cpio-2.13-16.el9.x86_64.rpm \
  && test "$(sha256sum resolver-requirements.lock.txt | cut -d ' ' -f 1)" = "$(python3.11 -c 'import json; print(json.load(open("resolver-runtime.lock.json"))["runtime_requirements"]["lock_sha256"])')" \
  && test "$(sha256sum registry-lock-constraints.txt | cut -d ' ' -f 1)" = "$(python3.11 -c 'import json; print(json.load(open("resolver-runtime.lock.json"))["registry_dependency_lock"]["registry_lock_constraints_sha256"])')"
 RUN --network=none mkdir -p /tmp/gmp-root /opt/decent-resolver/lib /usr/lib64 \
- && printf '%s  %s\n' "8dae9819eeba660528c52e7c5a3ac1e354084ea5782088160d9b46e9d43dde97" gmp-devel.rpm | sha256sum --check \
- && rpm2cpio gmp-devel.rpm | /usr/bin/cpio -idm --quiet -D /tmp/gmp-root \
+ && printf '%s  %s\n' "8dae9819eeba660528c52e7c5a3ac1e354084ea5782088160d9b46e9d43dde97" gmp-devel-6.2.0-13.el9.x86_64.rpm | sha256sum --check \
+ && rpm2cpio gmp-devel-6.2.0-13.el9.x86_64.rpm | /usr/bin/cpio -idm --quiet -D /tmp/gmp-root \
  && cp /tmp/gmp-root/usr/include/gmp.h /usr/include/gmp.h \
  && cp /tmp/gmp-root/usr/include/gmp-x86_64.h /usr/include/gmp-x86_64.h \
  && cp /lib64/libgmp.so.10.4.0 /opt/decent-resolver/lib/libgmp.so.10.4.0 \
