@@ -557,12 +557,10 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn("Latest loopback from the current code state", text)
     self.assertIn("Prior #4 run (image predates d700)", text)
 
-  def test_disposable_probe_documents_immutable_image_invocation(self):
+  def test_disposable_probe_uses_the_explicit_lifecycle_live_profile(self):
     text = README.read_text()
-    self.assertIn("podman build --no-cache --pull=never --target resolver-builder", text)
-    self.assertIn("podman build --no-cache --pull=never --target runtime", text)
-    self.assertIn("podman image inspect --format '{{.Id}}'", text)
-    self.assertIn('WALLET_IT_IMAGE="$IMAGE_ID" python3 scripts/wallet_login_live_e2e.py', text)
+    self.assertIn("python3.11 scripts/lifecycle.py run issue5-live --allow-live", text)
+    self.assertIn("WALLET_IT_IMAGE", (README.parent / "scripts/lifecycle.py").read_text())
 
   def test_runtime_configuration_documents_bundled_executable_default(self):
     text = README.read_text()

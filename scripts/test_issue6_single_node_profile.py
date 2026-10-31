@@ -777,12 +777,12 @@ class Issue6SingleNodeProfileTest(unittest.TestCase):
       self.assertEqual(['auth_flow', 'expiry_flow'], events)
       cleanup.assert_called_once_with(registry_node, 'resolver-tools-id')
 
-  def test_ci_and_documented_unittest_commands_include_profile_module(self):
+  def test_ci_and_documented_lifecycle_include_profile_module(self):
     root = Path(probe.__file__).parents[1]
-    workflow = (root / '.github/workflows/acceptance.yml').read_text()
+    lifecycle = (root / 'scripts/lifecycle.py').read_text()
     readme = (root / 'README.md').read_text()
-    self.assertIn('scripts.test_issue6_single_node_profile', workflow)
-    self.assertGreaterEqual(readme.count('scripts.test_issue6_single_node_profile'), 2)
+    self.assertIn('scripts.test_issue6_single_node_profile', lifecycle)
+    self.assertIn('python3.11 scripts/lifecycle.py run offline', readme)
 
 
 if __name__ == '__main__':

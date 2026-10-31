@@ -16,77 +16,53 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
 
-  def test_push_validation_checks_all_commits_since_the_previous_ref(self):
+  def test_pr_workflow_checks_commits_while_local_runs_check_the_worktree(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
-    validation = workflow.split("      - name: Validate the submitted diff\n", 1)[1]
+    lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
+    events = workflow.split("permissions:", 1)[0]
 
-    self.assertIn("PUSH_BASE_SHA: ${{ github.event.before }}", validation)
-    pr_base = 'if [ -n "$PR_BASE_SHA" ]'
-    push_base = 'elif [ -n "$PUSH_BASE_SHA" ]'
-    self.assertLess(validation.index(pr_base), validation.index(push_base))
-    self.assertIn('git diff --check "$PR_BASE_SHA...HEAD"', validation)
-    self.assertIn('git diff --check "$PUSH_BASE_SHA...HEAD"', validation)
-    self.assertIn('"0000000000000000000000000000000000000000"', validation)
-    self.assertIn("git diff --check HEAD^ HEAD", validation)
+    self.assertNotIn("  push:", events)
+    self.assertIn("  pull_request:", events)
+    self.assertIn('os.environ.get("PR_BASE_SHA")', lifecycle)
+    self.assertIn('f"{pull_request_base}...HEAD"', lifecycle)
+    self.assertIn('["git", "diff", "--check", "HEAD"]', lifecycle)
+    self.assertIn('["git", "ls-files", "--others", "--exclude-standard", "-z"]', lifecycle)
+    self.assertIn('"--no-index", "--check"', lifecycle)
 
   def test_provider_image_build_uses_repository_dockerfile_path(self):
-    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
-    build = workflow.split("      - name: Build and check the immutable-base provider image\n", 1)[1]
-    self.assertIn("--file container/Dockerfile", build)
+    lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
+
+    self.assertIn('"--file", "container/Dockerfile"', lifecycle)
+    self.assertIn('"--target", "runtime"', lifecycle)
 
   def test_provider_image_build_is_network_isolated(self):
-    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
-    build = workflow.split("      - name: Build and check the immutable-base provider image\n", 1)[1]
-    command = build.split("docker buildx build", 1)[1].split("version_output", 1)[0]
+    lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
 
-    self.assertIn("--network=none", command)
+    self.assertEqual(2, lifecycle.count('"--network=none"'))
 
-  def test_resolver_sources_are_materialized_outside_repo_and_cleaned_up(self):
-    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
-    materialize = workflow.split(
-        "      - name: Materialize pinned resolver Git sources and verify runtime provenance\n", 1)[1].split(
-        "      - name: Validate the submitted diff\n", 1)[0]
-    build = workflow.split(
-        "      - name: Build and check the immutable-base provider image\n", 1)[1].split(
-        "      - name: Remove temporary resolver Git checkouts\n", 1)[0]
-    cleanup = workflow.split("      - name: Remove temporary resolver Git checkouts\n", 1)[1]
+  def test_resolver_sources_are_run_scoped_and_cleaned_up(self):
+    lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
 
-    self.assertIn("${{ runner.temp }}/decent-resolver-sources-${{ github.run_id }}", materialize)
-    self.assertIn("--materialize-sources", materialize)
-    self.assertIn("--sources \"$RESOLVER_SOURCE_DIR\"", materialize)
-    self.assertIn("--build-context identity-src=", build)
-    self.assertIn("--build-context registry-src=", build)
-    self.assertIn("if: always()", cleanup)
-    self.assertIn('rm -rf -- "$RESOLVER_SOURCE_DIR"', cleanup)
-    self.assertLess(workflow.index("Materialize pinned resolver Git sources"),
-        workflow.index("Build and check the immutable-base provider image"))
+    self.assertIn("tempfile.TemporaryDirectory", lifecycle)
+    self.assertIn("--materialize-sources", lifecycle)
+    self.assertIn("source_parent.cleanup()", lifecycle)
+    self.assertIn("finally:", lifecycle)
 
-  def test_documented_local_image_builds_are_network_isolated(self):
+  def test_local_checks_use_the_shared_lifecycle_instead_of_duplicate_image_builds(self):
     readme = (ROOT / "README.md").read_text()
     local_checks = readme.split("## Local checks", 1)[1].split(
-        "### Disposable local integration probe", 1)[0]
-    build_commands = [line for line in local_checks.splitlines()
-        if line.lstrip().startswith("podman build ")]
+        "## Issue #6 expiry-profile", 1)[0]
 
-    self.assertEqual(2, len(build_commands))
-    self.assertTrue(all("--network=none" in command for command in build_commands))
-
-  def test_acceptance_job_and_documented_commands_have_same_unique_modules(self):
+    self.assertIn("python3.11 scripts/lifecycle.py run offline", local_checks)
+    self.assertNotIn("podman build ", local_checks)
+  def test_acceptance_workflow_uses_the_shared_ci_profile(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
-    readme = (ROOT / "README.md").read_text()
-    import re
+    lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
 
-    commands = re.findall(r"python3(?:\.11)? -m unittest " + re.escape(chr(92)) + "\n(.*?) -q", readme, re.DOTALL)
-    self.assertEqual(2, len(commands), "README must document both interpreter variants")
-    documented_lists = [re.findall(r"scripts\.test_[a-z0-9_]+", command) for command in commands]
-    for documented in documented_lists:
-      self.assertEqual(len(documented), len(set(documented)), "documented test modules must be unique")
-    job = workflow.split("      - name: Run the Python acceptance harness\n", 1)[1].split(
-        "      - name: Compile Python sources\n", 1)[0]
-    configured = re.findall(r"scripts\.test_[a-z0-9_]+", job)
-    self.assertEqual(len(configured), len(set(configured)))
-    for documented in documented_lists:
-      self.assertEqual(set(documented), set(configured))
+    self.assertIn("run: python scripts/lifecycle.py run ci", workflow)
+    self.assertIn('"scripts.test_lifecycle"', lifecycle)
+    self.assertIn("python-tests", lifecycle)
+    self.assertIn("python-compile", lifecycle)
 
 
 if __name__ == "__main__":

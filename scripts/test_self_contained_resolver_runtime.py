@@ -556,10 +556,11 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('COPY --from=identity-src /.pinned-commit', dockerfile)
     self.assertIn('COPY --from=registry-src /.pinned-commit', dockerfile)
     self.assertNotIn('source-archives', dockerfile)
-    workflow = (ROOT / '.github/workflows/acceptance.yml').read_text()
-    self.assertIn('--materialize-sources', workflow)
-    self.assertIn('--build-context identity-src=', workflow)
-    self.assertIn('--build-context registry-src=', workflow)
+    lifecycle = (ROOT / 'scripts/lifecycle.py').read_text()
+    self.assertIn('container/build_resolver_runtime.py', lifecycle)
+    self.assertIn('--materialize-sources', lifecycle)
+    self.assertIn('f"identity-src={identity}"', lifecycle)
+    self.assertIn('f"registry-src={registry}"', lifecycle)
 
   def test_materializer_clones_each_locked_commit_without_overwriting_existing_paths(self):
     import importlib.util
@@ -755,15 +756,16 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
 
   def test_build_materializes_git_pins_before_building_without_source_archives(self):
     dockerfile = (ROOT / 'container/Dockerfile').read_text()
-    workflow = (ROOT / '.github/workflows/acceptance.yml').read_text()
+    lifecycle = (ROOT / 'scripts/lifecycle.py').read_text()
     builder = (ROOT / 'container/build_resolver_runtime.py').read_text()
     self.assertNotIn('source-archives', dockerfile)
     self.assertNotIn('curl ', dockerfile)
     self.assertIn('--filter=blob:none', builder)
     self.assertIn('checkout', builder)
-    self.assertIn('--materialize-sources', workflow)
-    self.assertIn('--build-context identity-src=', workflow)
-    self.assertIn('--build-context registry-src=', workflow)
+    self.assertIn('container/build_resolver_runtime.py', lifecycle)
+    self.assertIn('--materialize-sources', lifecycle)
+    self.assertIn('f"identity-src={identity}"', lifecycle)
+    self.assertIn('f"registry-src={registry}"', lifecycle)
     self.assertFalse((ROOT / 'container/source-archives/identity.tar.gz').exists())
     self.assertFalse((ROOT / 'container/source-archives/registry.tar.gz').exists())
 
