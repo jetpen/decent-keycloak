@@ -6,7 +6,8 @@ from pathlib import Path
 import unittest
 
 README = Path(__file__).parents[1] / "README.md"
-SECURITY_REVIEW = Path(__file__).parents[1] / "docs/security-review.md"
+HISTORY = README.parent / "docs/acceptance/qualification-history.md"
+SECURITY_REVIEW = README.parent / "docs/security-review.md"
 
 # Historical executed gates only: mode, selected provider/wrapper, operation, outcome.
 # Ordinary signup has no injected fault operation or outcome.
@@ -27,8 +28,35 @@ ISSUE7_ARCHIVED_PROFILES = {
 }
 
 class AcceptanceLedgerTest(unittest.TestCase):
-  def test_issue7_store_recovery_is_merged_and_ceremonies_are_distinct(self):
+  def test_readme_is_a_user_guide_with_build_config_and_scope(self):
     readme = README.read_text()
+    self.assertIn("decent-wallet-login-v1", readme)
+    self.assertIn("decent-ecosystem", readme)
+    self.assertIn("not production-ready", readme)
+    self.assertIn("python3.11 scripts/lifecycle.py run offline", readme)
+    self.assertIn("Build an installable local image", readme)
+    self.assertIn("decent.wallet.registry.bootstrap", readme)
+    self.assertIn("## Configure a disposable realm", readme)
+    self.assertIn("CONTRIBUTING.md", readme)
+    self.assertNotIn("Current Issue #6 result", readme)
+    self.assertNotIn("PR #12 check failure", readme)
+
+  def test_contributing_documents_lifecycle_prerequisites_and_local_first_acceptance(self):
+    contributing = (README.parent / "CONTRIBUTING.md").read_text()
+    self.assertIn("CPython", contributing)
+    self.assertIn("3.11.13", contributing)
+    self.assertIn("Java build JDK", contributing)
+    self.assertIn("Apache Maven", contributing)
+    self.assertIn("Git", contributing)
+    self.assertIn("Podman", contributing)
+    self.assertIn("Docker Engine + Buildx", contributing)
+    self.assertIn("OpenSSL", contributing)
+    self.assertIn("python3.11 scripts/lifecycle.py run offline", contributing)
+    self.assertIn("before publishing the PR", contributing)
+    self.assertIn("HTTP 503/unavailable is not a clean Identity miss", contributing)
+
+  def test_issue7_store_recovery_is_merged_and_ceremonies_are_distinct(self):
+    readme = HISTORY.read_text()
     doc = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
     self.assertIn('docs/acceptance/issue-7-store-recovery.md', readme)
     self.assertIn('PR #42', doc)
@@ -260,7 +288,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
               self.assert_issue7_archived_record(mutated, require_original_subject=corrected)
 
   def test_issue7_ordinary_signup_failure_provenance_is_reconciled(self):
-    readme = README.read_text()
+    readme = HISTORY.read_text()
     recovery = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
     boundary = (README.parent / 'docs/acceptance/issue-7-safe-retry-boundary.md').read_text()
     first_attempt = (
@@ -333,7 +361,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn('349 tests passed', readme)
 
   def test_issue7_pr43_and_ci_evidence_are_separate_from_live_qualification(self):
-    readme = README.read_text()
+    readme = HISTORY.read_text()
     recovery = (README.parent / 'docs/acceptance/issue-7-store-recovery.md').read_text()
     boundary = (README.parent / 'docs/acceptance/issue-7-safe-retry-boundary.md').read_text()
     for text in (readme, recovery):
@@ -355,7 +383,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn('fresh authorization is consumed', readme)
 
   def test_issue_six_expiry_profile_is_documented_as_offline_only(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("Issue #6 expiry-profile implementation chronology (2026-10-21)", text)
     self.assertIn("WALLET_IT_PROFILE=expiry", text)
     self.assertIn("configured real `SingleUseObjectProvider`", text)
@@ -368,7 +396,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("documented Python suite ran 151 tests (134 other tests, 14 ledger, 3 workflow guard tests", text)
 
   def test_issue_six_profile_sequences_auth_then_expiry_with_sanitized_checkpoint(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     security_review = SECURITY_REVIEW.read_text()
     harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
     regression = (README.parent / "scripts/test_wallet_login_transport_e2e.py").read_text()
@@ -385,7 +413,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("phase_order", regression)
 
   def test_issue_six_receipt_commit_then_throw_evidence_is_scoped(self):
-    readme = README.read_text()
+    readme = HISTORY.read_text()
     security_review = SECURITY_REVIEW.read_text()
     self.assertIn("Issue #6 ordinary-login receipt commit-then-throw regression", readme)
     self.assertIn("The offline ordinary-LOGIN regression drives the real", readme)
@@ -407,7 +435,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("Effective DB/cache were `dev-file`/local, but selected production provider path remained unavailable", security_review)
 
   def test_excluded_multi_node_topology_is_not_reported_as_an_open_acceptance_gate(self):
-    readme = README.read_text()
+    readme = HISTORY.read_text()
     security_review = SECURITY_REVIEW.read_text()
     self.assertNotIn("two-node replay", readme)
     self.assertNotIn("multi-node shared-store replay", readme)
@@ -416,7 +444,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("Multi-node behavior is explicitly out of scope for current acceptance.", security_review)
 
   def test_acceptance_ledger_reports_current_verification_layers_and_remaining_gates(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("The checks failed against the synthetic merge revision", text)
     self.assertIn("The failure-specific probe also assumed the Hermes scratch directory exists", text)
     self.assertIn("147 tests (133 other tests, 11 ledger, 3 workflow guard tests", text)
@@ -486,7 +514,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn("uncommitted/unmerged", text)
 
   def test_previous_current_worktree_image_records_fail_closed_gate(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("Previous #4 run from the current worktree based on `d700281409a876b74ee025f6d27ff50b40b0fca5`", text)
     self.assertIn("image ID `92cc5d4c06fd4a65dd1e2fbbb5472f70fd901201536b88019706bff48c14ce13`", text)
     self.assertIn("digest `sha256:b4120b6aa22de7bf036250a9f66b701245e6f4fd8082cbeaf71f96d832cfd58b`", text)
@@ -504,7 +532,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("That historical no-cache image build downloaded hash-locked dependency artifacts and was not network-isolated", text)
 
   def test_exact_image_resolver_qualification_is_recorded(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("Prior provider-level loopback probe on offline-built runtime from staging fingerprint `a1b8f561ac91d1bde332675658195b06e000c8d84bc6290f8f26d54484edad6a`", text)
     self.assertIn("wheelhouse `container/resolver-wheelhouse.tar.gz` (67 files, 32,102,893 bytes", text)
     self.assertIn("SHA-256 `3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587`", text)
@@ -524,7 +552,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn("network-isolated image build remains unshown", text)
 
   def test_prior_provider_level_issue4_not_found_attempt_remains_unqualified(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("The legacy selector `issue4-not-found` is now named `provider-not-found-diagnostic`: it starts a Keycloak HTTP flow separate from Issue #4’s direct resolver gate and was not run for this resolver-only qualification.", text)
     self.assertIn("Prior provider-level `issue4-not-found` diagnostic probe: image ID `a74499a0980391206b961260fe04e9e02b931d8c4fe36b61195318820d7874fe`", text)
     self.assertIn("digest `sha256:76d8083b7f2af1587d737ad82add075cf718f8814af891e06acf3a053c95512e`", text)
@@ -536,7 +564,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("Does not qualify clean CLI or provider `not_found`", text)
 
   def test_separate_registry_matrix_run_is_not_conflated_with_issue_four(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("Separate #5 matrix attempt (not the #4 loopback run)", text)
     self.assertIn("harness SHA `3743c2b44e2f40f9f4ad3179d1d9a9767b0797661ce6dd9d6fc8729d1a13a7a6`", text)
     self.assertIn("provider_registry_inconsistent", text)
@@ -552,18 +580,18 @@ class AcceptanceLedgerTest(unittest.TestCase):
 
 
   def test_earlier_loopback_is_distinguished_from_precommit_run(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("Earlier #4 run: image ID", text)
     self.assertNotIn("Latest loopback from the current code state", text)
     self.assertIn("Prior #4 run (image predates d700)", text)
 
   def test_disposable_probe_uses_the_explicit_lifecycle_live_profile(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("python3.11 scripts/lifecycle.py run issue5-live --allow-live", text)
     self.assertIn("WALLET_IT_IMAGE", (README.parent / "scripts/lifecycle.py").read_text())
 
   def test_runtime_configuration_documents_bundled_executable_default(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertIn("decent.wallet.identity.executable", text)
     self.assertIn("defaults to `/opt/decent-resolver/bin/decent-identity`", text)
 
@@ -578,10 +606,10 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("return sanitized_resolver_diagnostic_lines(logs.stdout)", capture)
     self.assertIn("categories = safe_resolver_diagnostic_snapshot(container)", capture)
     self.assertIn("marker = '[WALLET-RESOLVER-DIAG]'", source)
-    self.assertNotIn("timestamp/logger-prefixed output", README.read_text())
+    self.assertNotIn("timestamp/logger-prefixed output", HISTORY.read_text())
 
   def test_stale_acceptance_wording_was_removed(self):
-    text = README.read_text()
+    text = HISTORY.read_text()
     self.assertNotIn("The latest run's three fresh resolver reads were unavailable", text)
     self.assertNotIn("This attribution fix is source-tested but has not yet been rebuilt into an immutable image and rerun", text)
 

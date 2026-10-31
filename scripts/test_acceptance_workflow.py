@@ -50,8 +50,8 @@ class AcceptanceWorkflowTest(unittest.TestCase):
 
   def test_local_checks_use_the_shared_lifecycle_instead_of_duplicate_image_builds(self):
     readme = (ROOT / "README.md").read_text()
-    local_checks = readme.split("## Local checks", 1)[1].split(
-        "## Issue #6 expiry-profile", 1)[0]
+    local_checks = readme.split("## Build and verify locally", 1)[1].split(
+        "## Build an installable local image", 1)[0]
 
     self.assertIn("python3.11 scripts/lifecycle.py run offline", local_checks)
     self.assertNotIn("podman build ", local_checks)
