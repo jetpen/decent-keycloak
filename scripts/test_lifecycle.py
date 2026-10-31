@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from scripts import lifecycle
-from scripts.lifecycle import image_smoke_command, normalize_image_id
+from scripts.lifecycle import _engine_command, image_smoke_command, normalize_image_id
 
 
 ROOT = Path(__file__).parents[1]
@@ -39,6 +39,15 @@ class LifecycleCliTest(unittest.TestCase):
          f"sha256:{raw_id}", "--version"],
         image_smoke_command("podman", image_id),
     )
+
+  def test_both_container_engines_receive_the_run_scoped_dependency_context(self):
+    sources = Path("/run/source-checkouts")
+    dependencies = Path("/run/binary-dependencies")
+    for engine in ("docker", "podman"):
+      command = _engine_command(engine, "candidate", sources, dependencies)
+      self.assertIn(f"binary-dependencies={dependencies}", command)
+      self.assertIn(f"identity-src={sources / 'identity'}", command)
+      self.assertIn(f"registry-src={sources / 'registry'}", command)
 
   def test_preflight_runs_before_evidence_directory_is_created(self):
     with tempfile.TemporaryDirectory() as temporary:
@@ -162,6 +171,7 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertIn("python-tests", names)
     self.assertIn("provider-image", names)
     self.assertIn("resolver-sources", names)
+    self.assertIn("resolver-dependencies", names)
     self.assertIn("evidence", names)
     self.assertIn("teardown", names)
     suite = next(step for step in plan["steps"] if step["name"] == "python-tests")

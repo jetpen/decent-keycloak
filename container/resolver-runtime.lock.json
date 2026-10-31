@@ -19,14 +19,13 @@
   },
   "wheelhouse": {
     "archive": "resolver-wheelhouse.tar.gz",
-    "archive_sha256": "3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587",
     "file_count": 67,
     "python_version": "3.11.13",
     "platform": "x86_64-linux-gnu"
   },
   "binary_dependency_provenance": {
     "manifest": "resolver-binary-dependencies.lock.json",
-    "sha256": "72c9afb4b0b90fbdce7069aacb639972bdac73f73b5931460ce24dec598815c4"
+    "sha256": "80c96e3e77d311ef62f1e698686c71423ad63d09b1b24bd45d2e1b8a05c6a60c"
   },
   "gmp": {
     "version": "6.2.0-13.el9",

@@ -24,7 +24,6 @@
   },
   "wheelhouse": {
     "archive": "resolver-wheelhouse.tar.gz",
-    "archive_sha256": "3859a6a17d27837713d1626a09a988d562455306eb79dc055564c3568e3e3587",
     "artifact_count": 67,
     "artifacts": [
       {

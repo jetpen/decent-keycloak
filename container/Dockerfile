@@ -12,10 +12,10 @@ COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./
 COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/
 COPY container/resolver-runtime.lock.json container/registry-lock-constraints.txt container/resolver-requirements.in container/resolver-requirements.lock.txt container/resolver-build-requirements.lock.txt ./
 COPY container/resolver-binary-dependencies.lock.json ./
-COPY container/resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
-COPY container/gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel-6.2.0-13.el9.x86_64.rpm
-COPY container/cpio-2.13-16.el9.x86_64.rpm ./cpio-2.13-16.el9.x86_64.rpm
-RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json
+COPY --from=binary-dependencies /resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
+COPY --from=binary-dependencies /gmp-devel-6.2.0-13.el9.x86_64.rpm ./gmp-devel-6.2.0-13.el9.x86_64.rpm
+COPY --from=binary-dependencies /cpio-2.13-16.el9.x86_64.rpm ./cpio-2.13-16.el9.x86_64.rpm
+RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json --dependencies /resolver-build
 RUN --network=none printf '%s  %s\n' "6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff" resolver-requirements.lock.txt | sha256sum --check \
  && printf '%s  %s\n' "70387e4aedbe5e9561243a8195d14d90dd6e68d74672c26678f2de938dec5539" registry-lock-constraints.txt | sha256sum --check \
  && printf '%s  %s\n' "6f209b51694b56c0d4bd9760004303349c6b23217e828b85c07a7e778844fe9c" resolver-build-requirements.lock.txt | sha256sum --check \
@@ -33,7 +33,7 @@ RUN --network=none mkdir -p /tmp/gmp-root /opt/decent-resolver/lib /usr/lib64 \
  && ln -s libgmp.so.10.4.0 /opt/decent-resolver/lib/libgmp.so.10 \
  && ln -s /opt/decent-resolver/lib/libgmp.so.10.4.0 /usr/lib64/libgmp.so
 
-RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json \
+RUN --network=none python3.11 verify_resolver_runtime_inputs.py --sources /resolver-build/sources --manifest resolver-runtime.lock.json --dependencies /resolver-build \
  && mkdir -p /resolver-build/wheelhouse /opt/decent-resolver/identity-src /opt/decent-resolver/registry-src \
  && tar -xzf resolver-wheelhouse.tar.gz -C /resolver-build/wheelhouse \
  && cp -a /resolver-build/sources/identity/src /opt/decent-resolver/identity-src/ \

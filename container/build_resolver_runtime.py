@@ -8,7 +8,10 @@ import json
 import re
 import shutil
 import subprocess
+import tarfile
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "container/resolver-runtime.lock.json"
@@ -44,7 +47,6 @@ def validate_repo_owned_lock() -> dict:
       is_pinned_git_url,
       verify_repo_overlays,
       verify_binary_dependency_provenance,
-      verify_wheelhouse_archive,
   )
 
   for name in SOURCE_NAMES:
@@ -60,8 +62,7 @@ def validate_repo_owned_lock() -> dict:
       raise RuntimeError(f"source lock must pin a Git commit, not an archive: {name}")
 
   verify_repo_overlays(LOCK_PATH.parent, lock)
-  verify_wheelhouse_archive(LOCK_PATH.parent, LOCK_PATH)
-  verify_binary_dependency_provenance(LOCK_PATH.parent, LOCK_PATH)
+  verify_binary_dependency_provenance(LOCK_PATH.parent, LOCK_PATH, verify_files=False)
   return lock
 
 
@@ -142,12 +143,96 @@ def materialize_sources(source_directory: Path) -> Path:
   return destination
 
 
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    source = urlsplit(req.full_url)
+    target = urlsplit(newurl)
+    if (target.scheme != "https" or target.hostname != source.hostname or target.port is not None
+        or target.username is not None or target.password is not None):
+      return None
+    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_verified(url: str, destination: Path, expected_sha256: str, *,
+    host: str, path_prefix: str) -> None:
+  from verify_resolver_runtime_inputs import _valid_source_url
+
+  if (not _valid_source_url(url, host=host, filename=destination.name, path_prefix=path_prefix)
+      or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None):
+    raise RuntimeError(f"locked binary dependency source is invalid: {destination.name}")
+  request = urllib.request.Request(url, headers={"User-Agent": "decent-keycloak-resolver-dependencies/1"})
+  opener = urllib.request.build_opener(_SameHostRedirect())
+  temporary = destination.with_name(destination.name + ".part")
+  digest = hashlib.sha256()
+  total = 0
+  try:
+    with opener.open(request, timeout=90) as response, temporary.open("xb") as output:
+      final_url = response.geturl()
+      if not _valid_source_url(final_url, host=host, filename=destination.name, path_prefix=path_prefix):
+        raise RuntimeError(f"binary dependency redirected to an untrusted source: {destination.name}")
+      length = response.headers.get("Content-Length")
+      if length and int(length) > 256 * 1024 * 1024:
+        raise RuntimeError(f"binary dependency exceeds the size limit: {destination.name}")
+      for block in iter(lambda: response.read(1024 * 1024), b""):
+        total += len(block)
+        if total > 256 * 1024 * 1024:
+          raise RuntimeError(f"binary dependency exceeds the size limit: {destination.name}")
+        digest.update(block)
+        output.write(block)
+    if digest.hexdigest() != expected_sha256:
+      raise RuntimeError(f"binary dependency checksum mismatch: {destination.name}")
+    temporary.replace(destination)
+  except BaseException:
+    temporary.unlink(missing_ok=True)
+    destination.unlink(missing_ok=True)
+    raise
+
+
+def materialize_binary_dependencies(dependency_directory: Path) -> Path:
+  """Fetch locked binary inputs into a new run-scoped directory and verify every byte."""
+  from verify_resolver_runtime_inputs import verify_binary_dependency_provenance
+
+  requested = Path(dependency_directory).expanduser()
+  if requested.is_symlink() or requested.exists():
+    raise RuntimeError("binary dependency directory must be a new temporary directory")
+  destination = requested.resolve()
+  if destination == ROOT.resolve() or ROOT.resolve() in destination.parents:
+    raise RuntimeError("binary dependency directory must be outside the repository")
+  lock = validate_repo_owned_lock()
+  inventory_path = LOCK_PATH.parent / lock["binary_dependency_provenance"]["manifest"]
+  inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+  destination.parent.mkdir(parents=True, exist_ok=True)
+  destination.mkdir(mode=0o700)
+  wheelhouse = destination / ".wheelhouse"
+  try:
+    wheelhouse.mkdir(mode=0o700)
+    for artifact in inventory["wheelhouse"]["artifacts"]:
+      _download_verified(artifact["url"], wheelhouse / artifact["filename"], artifact["sha256"],
+          host="files.pythonhosted.org", path_prefix="/packages/")
+    for rpm in inventory["rpms"]:
+      _download_verified(rpm["url"], destination / rpm["filename"], rpm["sha256"],
+          host="cdn-ubi.redhat.com", path_prefix="/content/public/ubi/dist/ubi9/9/x86_64/")
+    with tarfile.open(destination / inventory["wheelhouse"]["archive"], "w:gz") as bundle:
+      for artifact in sorted(inventory["wheelhouse"]["artifacts"], key=lambda item: item["filename"]):
+        bundle.add(wheelhouse / artifact["filename"], arcname=artifact["filename"], recursive=False)
+    shutil.rmtree(wheelhouse)
+    verify_binary_dependency_provenance(destination, LOCK_PATH)
+  except BaseException:
+    shutil.rmtree(destination, ignore_errors=True)
+    raise
+  return destination
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--materialize-sources", action="store_true",
       help="shallow-clone the locked Identity and Registry commits into a new temporary directory")
   parser.add_argument("--sources-directory", type=Path,
       help="new temporary directory for source checkouts (required with --materialize-sources)")
+  parser.add_argument("--materialize-binary-dependencies", action="store_true",
+      help="download locked wheel and RPM inputs into run-scoped temporary storage")
+  parser.add_argument("--binary-dependencies-directory", type=Path,
+      help="new temporary directory for downloaded binary dependencies")
   args = parser.parse_args()
   if args.materialize_sources:
     if args.sources_directory is None:
@@ -161,8 +246,19 @@ def main() -> None:
         "registry_commit": lock["sources"]["registry"]["commit"],
     }, sort_keys=True))
     return
+  if args.materialize_binary_dependencies:
+    if args.binary_dependencies_directory is None:
+      parser.error("--binary-dependencies-directory is required with --materialize-binary-dependencies")
+    dependency_directory = materialize_binary_dependencies(args.binary_dependencies_directory)
+    lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    print(json.dumps({"status": "resolver_binary_dependencies_materialized",
+        "dependency_directory": str(dependency_directory),
+        "inventory_sha256": lock["binary_dependency_provenance"]["sha256"]}, sort_keys=True))
+    return
   if args.sources_directory is not None:
     parser.error("--sources-directory requires --materialize-sources")
+  if args.binary_dependencies_directory is not None:
+    parser.error("--binary-dependencies-directory requires --materialize-binary-dependencies")
   lock = validate_repo_owned_lock()
   print(json.dumps({
       "status": "resolver_inputs_verified",

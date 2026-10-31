@@ -42,7 +42,8 @@ def verify_repo_overlays(directory: Path, manifest: dict) -> None:
       raise RuntimeError(f"resolver overlay checksum mismatch: {name}")
 
 
-def verify_source_checkouts(source_directory: Path, manifest_path: Path) -> None:
+def verify_source_checkouts(source_directory: Path, manifest_path: Path,
+    dependency_directory: Path | None = None) -> None:
   manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
   verify_repo_overlays(manifest_path.parent, manifest)
   sources = manifest.get("sources")
@@ -78,11 +79,9 @@ def verify_source_checkouts(source_directory: Path, manifest_path: Path) -> None
     if source_root.is_symlink() or not source_root.is_dir() or not package_root.is_dir():
       raise RuntimeError(f"pinned source checkout is missing package source: {name}")
 
-  if "wheelhouse" in manifest:
-    # The wheelhouse is a third-party dependency bundle, separate from source checkouts.
-    verify_wheelhouse_archive(manifest_path.parent, manifest_path)
   if "binary_dependency_provenance" in manifest:
-    verify_binary_dependency_provenance(manifest_path.parent, manifest_path)
+    verify_binary_dependency_provenance(dependency_directory or manifest_path.parent,
+        manifest_path, verify_files=dependency_directory is not None)
 
 
 def verify_wheelhouse_archive(archive_directory: Path, manifest_path: Path) -> None:
@@ -91,18 +90,15 @@ def verify_wheelhouse_archive(archive_directory: Path, manifest_path: Path) -> N
   if not isinstance(entry, dict):
     raise RuntimeError("resolver manifest must lock the wheelhouse archive")
   archive_name = entry.get("archive")
-  expected_hash = entry.get("archive_sha256")
   file_count = entry.get("file_count")
   if not isinstance(archive_name, str) or Path(archive_name).name != archive_name:
     raise RuntimeError("wheelhouse archive name is invalid")
-  if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
-    raise RuntimeError("wheelhouse archive checksum is invalid")
   if not isinstance(file_count, int) or isinstance(file_count, bool) or file_count < 1:
     raise RuntimeError("wheelhouse archive file count is invalid")
 
   archive = archive_directory / archive_name
-  if not archive.is_file() or sha256(archive) != expected_hash:
-    raise RuntimeError("wheelhouse archive checksum mismatch")
+  if archive.is_symlink() or not archive.is_file():
+    raise RuntimeError("wheelhouse archive is unavailable")
   try:
     with tarfile.open(archive, "r:gz") as bundle:
       members = bundle.getmembers()
@@ -195,7 +191,8 @@ def _locked_package_hashes(lock_file: Path) -> dict[tuple[str, str], set[str]]:
   return result
 
 
-def verify_binary_dependency_provenance(directory: Path, runtime_manifest_path: Path) -> None:
+def verify_binary_dependency_provenance(directory: Path, runtime_manifest_path: Path,
+    *, verify_files: bool = True) -> None:
   """Verify the locked upstream identity and digest of every bundled binary input."""
   runtime_manifest = json.loads(runtime_manifest_path.read_text(encoding="utf-8"))
   entry = runtime_manifest.get("binary_dependency_provenance")
@@ -207,7 +204,7 @@ def verify_binary_dependency_provenance(directory: Path, runtime_manifest_path: 
     raise RuntimeError("binary dependency inventory filename is invalid")
   if not isinstance(inventory_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", inventory_sha256) is None:
     raise RuntimeError("binary dependency inventory checksum is invalid")
-  inventory_path = directory / inventory_name
+  inventory_path = runtime_manifest_path.parent / inventory_name
   if not inventory_path.is_file() or sha256(inventory_path) != inventory_sha256:
     raise RuntimeError("binary dependency inventory checksum mismatch")
   inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -226,47 +223,44 @@ def verify_binary_dependency_provenance(directory: Path, runtime_manifest_path: 
   if not isinstance(wheelhouse, dict):
     raise RuntimeError("binary dependency inventory must describe the wheelhouse")
   archive_name = wheelhouse.get("archive")
-  archive_sha256 = wheelhouse.get("archive_sha256")
   artifact_count = wheelhouse.get("artifact_count")
   artifacts = wheelhouse.get("artifacts")
   main_wheelhouse = runtime_manifest.get("wheelhouse")
   if not isinstance(main_wheelhouse, dict) or archive_name != main_wheelhouse.get("archive"):
     raise RuntimeError("binary dependency inventory wheelhouse does not match runtime lock")
-  if archive_sha256 != main_wheelhouse.get("archive_sha256"):
-    raise RuntimeError("binary dependency inventory archive checksum does not match runtime lock")
   if not isinstance(archive_name, str) or Path(archive_name).name != archive_name:
     raise RuntimeError("binary dependency wheelhouse archive name is invalid")
-  if not isinstance(archive_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None:
-    raise RuntimeError("binary dependency wheelhouse checksum is invalid")
+  if main_wheelhouse.get("file_count") != artifact_count:
+    raise RuntimeError("binary dependency artifact count does not match runtime lock")
   if not isinstance(artifacts, list) or not isinstance(artifact_count, int) \
       or isinstance(artifact_count, bool) or artifact_count != len(artifacts):
     raise RuntimeError("binary dependency artifact count is invalid")
 
-  lock_files = (directory / runtime_manifest["runtime_requirements"]["lock"],
-      directory / "resolver-build-requirements.lock.txt")
+  lock_files = (runtime_manifest_path.parent / runtime_manifest["runtime_requirements"]["lock"],
+      runtime_manifest_path.parent / "resolver-build-requirements.lock.txt")
   package_hashes: dict[tuple[str, str], set[str]] = {}
   for lock_file in lock_files:
     for identity, hashes in _locked_package_hashes(lock_file).items():
       package_hashes.setdefault(identity, set()).update(hashes)
-  archive = directory / archive_name
-  if not archive.is_file() or sha256(archive) != archive_sha256:
-    raise RuntimeError("wheelhouse archive checksum mismatch")
   verified_artifacts = {}
-  try:
-    with tarfile.open(archive, "r:gz") as bundle:
-      for member in bundle.getmembers():
-        if not member.isfile():
-          continue
-        filename = PurePosixPath(member.name).name
-        if filename in verified_artifacts:
-          raise RuntimeError("wheelhouse contains duplicate artifact filenames")
-        stream = bundle.extractfile(member)
-        if stream is None:
-          raise RuntimeError("wheelhouse artifact could not be read")
-        digest = hashlib.sha256(stream.read()).hexdigest()
-        verified_artifacts[filename] = digest
-  except (OSError, tarfile.TarError) as error:
-    raise RuntimeError("wheelhouse archive is invalid") from error
+  archive = directory / archive_name
+  if verify_files:
+    verify_wheelhouse_archive(directory, runtime_manifest_path)
+    try:
+      with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle.getmembers():
+          if not member.isfile():
+            continue
+          filename = PurePosixPath(member.name).name
+          if filename in verified_artifacts:
+            raise RuntimeError("wheelhouse contains duplicate artifact filenames")
+          stream = bundle.extractfile(member)
+          if stream is None:
+            raise RuntimeError("wheelhouse artifact could not be read")
+          digest = hashlib.sha256(stream.read()).hexdigest()
+          verified_artifacts[filename] = digest
+    except (OSError, tarfile.TarError) as error:
+      raise RuntimeError("wheelhouse archive is invalid") from error
 
   expected_artifacts = {}
   for artifact in artifacts:
@@ -303,7 +297,7 @@ def verify_binary_dependency_provenance(directory: Path, runtime_manifest_path: 
     if filename in expected_artifacts:
       raise RuntimeError("binary dependency inventory contains duplicate filenames")
     expected_artifacts[filename] = digest
-  if len(expected_artifacts) != artifact_count or verified_artifacts != expected_artifacts:
+  if len(expected_artifacts) != artifact_count or (verify_files and verified_artifacts != expected_artifacts):
     raise RuntimeError("wheelhouse contents do not match the binary dependency inventory")
 
   rpms = inventory.get("rpms")
@@ -331,9 +325,10 @@ def verify_binary_dependency_provenance(directory: Path, runtime_manifest_path: 
     if not _valid_source_url(rpm.get("url"), host="cdn-ubi.redhat.com",
         filename=filename, path_prefix="/content/public/ubi/dist/ubi9/9/x86_64/"):
       raise RuntimeError(f"RPM source URL is invalid: {filename}")
-    artifact_path = directory / filename
-    if artifact_path.is_symlink() or not artifact_path.is_file() or sha256(artifact_path) != digest:
-      raise RuntimeError(f"RPM checksum mismatch: {filename}")
+    if verify_files:
+      artifact_path = directory / filename
+      if artifact_path.is_symlink() or not artifact_path.is_file() or sha256(artifact_path) != digest:
+        raise RuntimeError(f"RPM checksum mismatch: {filename}")
     if package == "gmp-devel":
       gmp_lock = runtime_manifest.get("gmp")
       if not isinstance(gmp_lock, dict) or (gmp_lock.get("version"),
@@ -349,11 +344,15 @@ def main() -> None:
   parser.add_argument("--manifest", type=Path,
       default=Path(__file__).resolve().with_name("resolver-runtime.lock.json"),
       help="resolver source and dependency lock manifest")
+  parser.add_argument("--dependencies", type=Path,
+      help="run-scoped directory containing downloaded wheelhouse and RPM inputs")
   args = parser.parse_args()
-  verify_source_checkouts(args.sources, args.manifest)
+  if args.dependencies is not None and args.dependencies.is_symlink():
+    raise RuntimeError("binary dependency directory must not be a symlink")
+  verify_source_checkouts(args.sources, args.manifest, args.dependencies)
   print("resolver_git_sources_verified")
-  if "wheelhouse" in json.loads(args.manifest.read_text(encoding="utf-8")):
-    print("resolver_wheelhouse_archive_verified")
+  if args.dependencies is not None:
+    print("resolver_binary_dependencies_verified")
 
 
 if __name__ == "__main__":
