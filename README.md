@@ -216,53 +216,27 @@ Latest #4 artifact provenance: the build-input verifier parses `container/resolv
 
 ## Local checks
 
-With Java 21 available:
+With the pinned Java 21 and Python 3.11 toolchain available, run the shared offline software lifecycle locally:
 
 ```bash
-mvn -q -o clean package
-git diff --check
+python3.11 scripts/lifecycle.py run offline
 ```
 
-For the standalone local Registry rotation/readback probe, use the invocation documented above; it is a local integration check, not proof of production or network-wide Registry reliability.
-
-After `mvn -q -o clean package`, materialize the exact Identity/Registry commits into a fresh temporary Git checkout, verify both commit markers, and pass the directories as named build contexts. The source clones are never committed and are removed when the shell exits:
+Inspect the ordered plan without executing it:
 
 ```bash
-source_parent="$(mktemp -d)"
-source_dir="$source_parent/sources"
-trap 'rm -rf -- "$source_parent"' EXIT
-python3.11 container/build_resolver_runtime.py \
-  --materialize-sources --sources-directory "$source_dir"
-python3.11 container/verify_resolver_runtime_inputs.py \
-  --sources "$source_dir" --manifest container/resolver-runtime.lock.json
-podman build --no-cache --pull=never --target resolver-builder --network=none \
-  --build-context identity-src="$source_dir/identity" \
-  --build-context registry-src="$source_dir/registry" \
-  -f container/Dockerfile \
-  -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-resolver-check .
-podman build --no-cache --pull=never --target runtime --network=none \
-  --build-context identity-src="$source_dir/identity" \
-  --build-context registry-src="$source_dir/registry" \
-  -f container/Dockerfile \
-  -t localhost/decent-keycloak-wallet-authenticator-spike:issue4-current-check .
+python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-The Git fetches run on the host before the image build and are constrained to the locked commit IDs. `--network=none` disables networking for Dockerfile `RUN` instructions; it does not block BuildKit from pulling base images when `--pull` is used. These local commands use `--pull=never`, so the pinned base images must already be present in the local image store.
+The offline profile runs Maven/Surefire, the canonical Python acceptance suite and compile check, verifies and materializes the pinned resolver sources in a temporary directory, verifies provider registration, builds and smoke-tests the runtime image with network-isolated build steps, records sanitized evidence under `target/lifecycle/evidence/`, and tears down only resources owned by that run. Local Podman builds use `--pull=never`; pinned base images must already exist locally. CI invokes the same lifecycle using the Docker engine.
 
-A successful Maven or image build is not live wallet-login qualification. Read Surefire XML totals from the current build and use the immutable image ID/digest in the live probe.
-
-### Disposable local integration probe
-
-`scripts/wallet_login_live_e2e.py` requires Podman, OpenSSL, and the pinned runtime image built from this repository. It does not mount sibling Identity or Registry source checkouts or developer Python environments.
-
-After `mvn -q -o clean package`, build both the resolver target and full provider/runtime target from the edited worktree with cache disabled. Use the local image tag for Podman in this environment, verify its immutable ID/digest, and confirm the harness provenance reports that digest. It can also accept an immutable ID if Podman resolves that ID locally. Run the harness with the immutable image ID—not a moving source tag:
+A successful offline lifecycle is not live wallet-login qualification. To run the full loopback matrix, request separate authorization first; the command requires `--allow-live`:
 
 ```bash
-IMAGE_ID="$(podman image inspect --format '{{.Id}}' localhost/decent-keycloak-wallet-authenticator-spike:issue4-current-check)"
-WALLET_IT_IMAGE="$IMAGE_ID" python3 scripts/wallet_login_live_e2e.py
+python3.11 scripts/lifecycle.py run issue5-live --allow-live
 ```
 
-The harness verifies the ID/digest through Podman before starting the disposable environment. This command is a loopback probe only; a passing result does not establish production Registry behavior or real TLS/browser-wallet interoperability. Multi-node behavior is explicitly out of scope for acceptance.
+This profile uses the immutable ID of the image it just built and retains sanitized harness evidence in its receipt. It does not qualify production Registry behavior or real TLS/browser-wallet interoperability.
 
 
 ```python
