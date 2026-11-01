@@ -4,11 +4,11 @@
 
 Issue #4 is closed; its resolver-runtime implementation and direct exact-image resolver gate are integrated. That resolver-only qualification does not establish provider-level missing-Identity behavior. Any README wording that #4 blocks #5 is stale.
 
-Issue #5 remains open pending PR review/merge and completion of the separate lifecycle/documentation closure checklist. The historical run below was partial; the latest exact-candidate live run is recorded next. All evidence is disposable single-node loopback only: it does not qualify Registry reliability, production TLS, browser/native-wallet interoperability, shared-store behavior, or production use. A 503 is not evidence of absence, stale-key rejection, or account-policy denial.
+PR #52 merged at `bcc3f6d2cbf4bb64576acfb87ca61ee822873023` from reviewed head `6b4032f2085bd78e38138e4874eeb46776b86658`; its canonical offline CI run `41321216744` passed. The live and offline receipts below pass, and the four separate remediation areas are integrated by PRs #48–#51. Issue #5 is ready for final closeout. All evidence remains disposable single-node loopback only: it does not qualify Registry reliability, production TLS, browser/native-wallet interoperability, shared-store behavior, or production use. A 503 is not evidence of absence, stale-key rejection, or account-policy denial.
 
 ## Latest integrated qualification (2026-11-01)
 
-The exact candidate passed the complete `issue5-live` lifecycle and all named Issue #5 gates. The sanitized receipt is `target/lifecycle/evidence/d455d1aaad9d440ba9da80bfc794ef64.json` (run ID `d455d1aaad9d440ba9da80bfc794ef64`, exit 0). The image was removed after the run; exact Podman image inventory returned to the recorded baseline with no inconclusive IDs. Offline lifecycle receipt `target/lifecycle/evidence/f0eda711d86146e8b3feca9e6dc73dfd.json` also passed on the same source/artifact fingerprint.
+The image-contributing source and live harness used by PR #52 passed the complete `issue5-live` lifecycle and all named Issue #5 gates. The sanitized live receipt is `target/lifecycle/evidence/d455d1aaad9d440ba9da80bfc794ef64.json` (run ID `d455d1aaad9d440ba9da80bfc794ef64`, exit 0). The image was removed after the run; exact Podman image inventory returned to the recorded baseline with no inconclusive IDs. Subsequent changes were documentation and test-assertion only and do not alter the recorded image-input fingerprint. The latest local Java 21 offline lifecycle passed all 13 steps; receipt `target/lifecycle/evidence/00769465d3c748e68cf7b1a31ddc7d1b.json` records cleanup pass, zero inconclusive IDs, exact return to the 3,502-image baseline, and all live gates `not_run`. The canonical offline lifecycle also passed in PR CI run `41321216744` on the merged PR head.
 
 | Provenance | Value |
 |---|---|
@@ -32,7 +32,7 @@ The exact candidate passed the complete `issue5-live` lifecycle and all named Is
 | Effective provider/runtime | Effective `dev-file` database and `local` cache; Infinispan transaction-consumption witness count 2. |
 | Lifecycle and teardown | Every step passed; cleanup passed, no inconclusive IDs, image inventory exactly restored to baseline. |
 
-The receipt stores only sanitized evidence; raw request IDs, markers, credentials, tokens, and Identity/key values are not retained. The live fingerprint intentionally covers image-contributing source and runtime JARs, not docs, lifecycle scripts, or project configuration. This run qualifies the existing matrix on this candidate only; it does not by itself satisfy the four separate closure-remediation sections or authorize closing Issue #5.
+The receipt stores only sanitized evidence; raw request IDs, markers, credentials, tokens, and Identity/key values are not retained. The live fingerprint intentionally covers image-contributing source and runtime JARs, not docs, lifecycle scripts, or project configuration. The live run alone is not the closure proof: PRs #48–#51 implement the CI lifecycle, contributor/user documentation, dependency provenance, and lifecycle/image-cleanup remediations; PR #52 completes the Issue #5 gates. The canonical offline lifecycle passed locally and in the pull-request workflow on a fresh checkout. Together with the live receipt above, the existing acceptance criteria and four remediation sections are verified; the issue remains open for final closeout.
 
 ## Historical attempted run and provenance
 
@@ -49,7 +49,7 @@ The source worktree's harness was run with the immutable image ID below, not a m
 | Runtime manifest SHA-256 | `a9380af7777df65be522f0dda83ebef4a9aadd57a991694d58ec7adb4db3e699` |
 | Runtime requirements lock SHA-256 | `6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff` |
 
-After the run, the source harness was changed to give each repeated unpublished-key fixture a distinct generated-key filename. That fix was not live-verified. The selected source worktree's current harness SHA-256 was `ac2b8e10f1bebce6d80c379ef26cabd2675acc307f7f4bc2dd618cffab2fed8e`; this is not the version that ran. The harness integrated here is newer still and has not been live-run.
+After that historical run, the source harness was changed to give each repeated unpublished-key fixture a distinct generated-key filename. The selected source worktree's then-current harness SHA-256 was `ac2b8e10f1bebce6d80c379ef26cabd2675acc307f7f4bc2dd618cffab2fed8e`; it was not the version that ran. The later integrated candidate was live-qualified as recorded above; this paragraph preserves the earlier provenance only.
 
 ## Observed outcomes from the historical attempt
 
@@ -120,4 +120,4 @@ WALLET_IT_IMAGE='ad9834f964d24aa9a0c8320ed095af4514760d9d2ce10eeaca52a20c6ff31fb
   python3 scripts/wallet_login_live_e2e.py
 ```
 
-Use an immutable image ID and preserve image/harness/source provenance for any future authorized run. The historical partial run above is superseded for the integrated candidate by the successful latest qualification. Keep Issue #5 open until the PR is reviewed/merged and the separate lifecycle/documentation closure checklist is complete; the live receipt alone does not authorize issue closure.
+Use an immutable image ID and preserve image/harness/source provenance for any future authorized run. The historical partial run above is superseded for the integrated candidate by the successful latest qualification. PR #52 is merged, all named acceptance gates pass, and the four lifecycle/documentation remediation areas are verified by the merged PRs and canonical lifecycle; Issue #5 is ready for final closeout. Preserve the scope limits above in any resolution comment.
