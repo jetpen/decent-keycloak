@@ -24,6 +24,14 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
         provenance.get('runtime_manifest_sha256'))
     self.assertEqual(hashlib.sha256((ROOT / 'container/resolver-requirements.lock.txt').read_bytes()).hexdigest(),
         provenance.get('runtime_lock_sha256'))
+    for key,path in {
+        'runtime_patcher_sha256': 'container/patch_resolver_runtime.py',
+        'pinned_lookup_outcomes_sha256': 'container/pinned_lookup_outcomes.py',
+        'rotation_registry_roundtrip_sha256': 'container/rotation_registry_roundtrip.py',
+        'issue5_adversarial_cases_sha256': 'scripts/issue5_adversarial_cases.py',
+    }.items():
+      self.assertEqual(hashlib.sha256((ROOT / path).read_bytes()).hexdigest(),
+          provenance.get(key))
 
   def test_runtime_patcher_finds_helper_when_copied_into_flat_build_context(self):
     import runpy
@@ -343,6 +351,25 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertTrue(all(sample['json_balanced'] for sample in exact))
     self.assertTrue(all(sample['exact_identity_and_successor_match'] for sample in exact))
 
+  def test_registry_matrix_projection_retains_rotation_gate_witnesses(self):
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    from wallet_login_live_e2e import sanitize_live_checkpoint
+
+    candidate = {'registry_matrix': {'rotation': {'attempts': [{
+        'attempt_number': 1, 'direct_resolution': 'resolved',
+        'exact_readback': True, 'provider_http': 202, 'status_http': 200,
+        'rotation_publish': 'passed', 'current_sequence': 2,
+        'stale_key_proof_http': 401, 'current_key_proof_http': 202,
+        'stale_transaction_remains_pending': True,
+        'current_transaction_accepted': True,
+        'independent_rotation_readback': True, 'outcome': 'current_accepted',
+    }]}}}
+
+    projected = sanitize_live_checkpoint(candidate)
+    attempt = projected['registry_matrix']['rotation']['attempts'][0]
+    self.assertEqual('passed', attempt['rotation_publish'])
+    self.assertTrue(attempt['independent_rotation_readback'])
+
   def test_checkpoint_projection_drops_nested_secrets_and_unknown_fields(self):
     sys.path.insert(0, str(ROOT / 'scripts'))
     from wallet_login_live_e2e import sanitize_live_checkpoint
@@ -497,17 +524,26 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn("progress('proof', {'signup_proof_http': proof_status})", signup_flow)
     self.assertNotIn("print('signup_proof_http=", signup_flow)
 
-  def test_account_mapping_checkpoint_reports_unavailable_before_policy_failure(self):
+  def test_account_mapping_checkpoint_is_written_for_each_concurrent_denial(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
     main = harness.split('def main():', 1)[1]
-    disabled = main.index("disabled_result = account_mapping_denial_flow")
-    checkpoint = main.index("result['disabled_account_case'] = disabled_result", disabled)
-    decision = main.index("require(account_policy_denial_is_attributed(disabled_result)", disabled)
-    self.assertLess(checkpoint, decision)
+    callback = main.split('def save_account_denial_case(', 1)[1].split('denial_run = run_concurrent_account_denial_flows(', 1)[0]
+    for assignment in (
+        "result['unmapped_account_case'] = unmapped_account_case_evidence(outcome)",
+        "result['disabled_account_case'] = outcome",
+        "result['ambiguous_account_case'] = outcome",
+    ):
+      self.assertIn(assignment, callback)
+      self.assertLess(callback.index(assignment), callback.index('checkpoint()'))
+    self.assertIn('], on_case_complete=save_account_denial_case)', main)
 
-    self.assertIn("result['disabled_account_case'] = disabled_result", harness)
-    self.assertIn("result['ambiguous_account_case'] = ambiguity_result", harness)
-    self.assertIn("rotation_result = stale_key_rotation_flow", harness)
+    summary = main.index("result['account_denial_concurrency'] = {")
+    summary_checkpoint = main.index('checkpoint()', summary)
+    overlap_gate = main.index("require(max_concurrent >= 2", summary)
+    attribution_gate = main.index("require(attributed, 'all concurrent account denials", summary)
+    self.assertLess(summary_checkpoint, overlap_gate)
+    self.assertLess(overlap_gate, attribution_gate)
+    self.assertIn("result['rotated_identity_case'] = {", main)
 
   def test_rotation_progress_checkpoint_is_bounded_and_stages_are_allowlisted(self):
     sys.path.insert(0, str(ROOT / 'scripts'))
@@ -1108,17 +1144,6 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn("'--volume', f'{datastore}:{datastore}:rw'", registry_start)
     self.assertNotIn("path: /tmp/registry-lmdb", registry_start)
 
-  def test_mapping_checkpoint_is_written_before_later_scenarios(self):
-    source = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
-    main = source.split('def main():', 1)[1]
-    mapping_check = main.index("rotation_progress('mapping', {'local_mapping_persisted': local_mapping_persisted})")
-    require_mapping = main.index("require(local_mapping_persisted, 'rotated account Identity mapping persisted exactly')")
-    ambiguity = main.index('ambiguity_result = account_mapping_denial_flow', require_mapping)
-    checkpoint_after = main.index('checkpoint()', require_mapping)
-    self.assertLess(mapping_check, require_mapping)
-    self.assertLess(require_mapping, checkpoint_after)
-    self.assertLess(checkpoint_after, ambiguity)
-
   def test_refreshes_realm_admin_token_before_late_rotation_readback(self):
     harness = (ROOT / 'scripts/wallet_login_live_e2e.py').read_text()
     main = harness.split('def main():', 1)[1]
@@ -1158,14 +1183,20 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     builder_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[0]
     peer_test = '/resolver-build/scripts/test_pinned_dht_peer_outcomes.py'
     registry_test = '/resolver-build/scripts/test_pinned_registry_lookup_outcomes.py'
+    adversarial_test = '/resolver-build/scripts/test_pinned_adversarial_identity_peer.py'
+    rotation_test = '/resolver-build/scripts/test_rotation_registry_roundtrip.py'
     self.assertIn('RUN --network=none if [ ! -e /etc/resolv.conf ]', builder_stage)
     self.assertIn('LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python ' + peer_test, builder_stage)
     self.assertIn('RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python ' + registry_test, builder_stage)
+    self.assertIn('RESOLVER_TEST_LIBP2P_SOURCE=/opt/decent-resolver/venv/lib64/python3.11/site-packages/libp2p', builder_stage)
+    self.assertIn(adversarial_test, builder_stage)
+    self.assertIn(rotation_test, builder_stage)
+    self.assertIn('scripts/rotation_registry_roundtrip.py scripts/issue5_adversarial_cases.py ./scripts/', builder_stage)
     self.assertIn("/opt/decent-resolver/bin/decent-identity --help", builder_stage)
     self.assertIn("/opt/decent-resolver/bin/decent-registry --help", builder_stage)
     self.assertIn('rm -f /etc/resolv.conf', builder_stage)
     self.assertLess(builder_stage.index('if [ ! -e /etc/resolv.conf ]'), builder_stage.index(peer_test))
-    self.assertLess(builder_stage.index(registry_test), builder_stage.index('rm -f /etc/resolv.conf'))
+    self.assertLess(builder_stage.index(rotation_test), builder_stage.index('rm -f /etc/resolv.conf'))
     keycloak_stage = dockerfile.split('FROM quay.io/keycloak/keycloak@', 1)[1].split(
         'FROM keycloak-with-resolver AS runtime', 1)[0]
     runtime_stage = dockerfile.split('FROM keycloak-with-resolver AS runtime', 1)[1].split(

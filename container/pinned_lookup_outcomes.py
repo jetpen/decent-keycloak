@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from typing import Any
 
 import trio
+
+MAX_DHT_MESSAGE_SIZE = 4 * 1024 * 1024
+MAX_IDENTITY_CANDIDATE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,12 @@ class LookupCounts:
     failed: int = 0
     timeouts: int = 0
     incomplete: int = 0
+    positive_records: int = 0
+    records: list[bytes] = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.records and self.positive_records == 0:
+            self.positive_records = len(self.records)
 
     def is_clean_absence(self) -> bool:
         return (
@@ -79,6 +88,38 @@ def report_lookup_summary(stage: str, counts: LookupCounts) -> None:
     )
 
 
+class DHTUnvalidatedRecords(DHTLookupUnavailable):
+    """Private candidates for higher-layer verification, never absence/evidence."""
+
+    def __init__(self, stage: str, counts: LookupCounts, records: tuple[bytes, ...]):
+        if not isinstance(counts, LookupCounts):
+            raise TypeError("counts must be LookupCounts")
+        records = tuple(records)
+        if not records or not all(isinstance(record, bytes) for record in records):
+            raise ValueError("positive Identity records must be retained as bytes")
+        super().__init__(stage, counts)
+        self.counts = counts
+        self.records = records
+
+
+def check_identity_candidate_selection(key: str, quorum: int) -> None:
+    """Stop generic DHT selection/cache repair from masking Identity candidates."""
+    counts = _CURRENT_LOOKUP_COUNTS.get()
+    if not key.startswith("/decent-registry/identity/") or counts is None:
+        return
+    if counts.failed or counts.timeouts or counts.incomplete:
+        raise DHTLookupUnavailable("get_value", counts)
+    if counts.attempts != counts.positive_records + counts.empty:
+        raise DHTLookupUnavailable("get_value", counts)
+    if not counts.records:
+        return
+    if len(set(counts.records)) > 1:
+        # The caller's quorum does not resolve a divergent Identity state.
+        if quorum:
+            raise DHTLookupUnavailable("get_value", counts)
+        raise DHTUnvalidatedRecords("get_value", counts, tuple(counts.records))
+
+
 class _SuppressUnqualifiedMiss(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -94,29 +135,46 @@ def install(kad_dht_class: type[Any], value_store_class: type[Any]) -> None:
 
     async def tracked_peer_read(self: Any, peer_id: Any, key: bytes, return_record: bool = False):
         counts = _CURRENT_LOOKUP_COUNTS.get()
-        if counts is not None:
-            counts.attempts += 1
+        if not key.startswith(b"/decent-registry/identity/"):
+            outcome = await original_peer_read(self, peer_id, key, return_record)
+            if isinstance(outcome, (PeerValueAbsent, PeerValueIncomplete, PeerValueUnavailable)):
+                return None
+            return outcome
+        if counts is None:
+            return await original_peer_read(self, peer_id, key, return_record)
+        counts.attempts += 1
         try:
             outcome = await original_peer_read(self, peer_id, key, return_record)
         except trio.Cancelled:
-            if counts is not None:
-                counts.timeouts += 1
+            counts.timeouts += 1
             raise
         except Exception:
-            if counts is not None:
-                counts.failed += 1
+            counts.failed += 1
             return PeerValueUnavailable()
 
-        if counts is not None:
-            if isinstance(outcome, PeerValueAbsent):
-                counts.empty += 1
-            elif isinstance(outcome, PeerValueIncomplete):
-                counts.incomplete += 1
-            elif isinstance(outcome, PeerValueUnavailable) or outcome is None:
+        if isinstance(outcome, PeerValueAbsent):
+            counts.empty += 1
+        elif isinstance(outcome, PeerValueIncomplete):
+            counts.incomplete += 1
+        elif isinstance(outcome, PeerValueUnavailable) or outcome is None:
+            counts.failed += 1
+        else:
+            candidate = getattr(outcome, "value", None)
+            if not isinstance(candidate, bytes):
                 counts.failed += 1
+                return PeerValueUnavailable()
+            counts.positive_records += 1
+            if candidate not in counts.records:
+                if (len(counts.records) >= 64
+                        or sum(map(len, counts.records)) + len(candidate) > MAX_IDENTITY_CANDIDATE_BYTES):
+                    counts.failed += 1
+                    return PeerValueUnavailable()
+                counts.records.append(candidate)
         return outcome
 
     async def outcome_aware_get_value(self: Any, key: str, quorum: int = 0) -> bytes | None:
+        if not isinstance(key, str) or not key.startswith("/decent-registry/identity/"):
+            return await original_get_value(self, key, quorum=quorum)
         counts = LookupCounts()
         token = _CURRENT_LOOKUP_COUNTS.set(counts)
         miss_filter = _SuppressUnqualifiedMiss()
@@ -124,6 +182,12 @@ def install(kad_dht_class: type[Any], value_store_class: type[Any]) -> None:
         try:
             try:
                 value = await original_get_value(self, key, quorum=quorum)
+            except DHTUnvalidatedRecords as exc:
+                report_lookup_summary("get_value", counts)
+                raise
+            except DHTLookupUnavailable:
+                report_lookup_summary("get_value", counts)
+                raise
             except Exception:
                 counts.failed += 1
                 report_lookup_summary("get_value", counts)
@@ -139,6 +203,10 @@ def install(kad_dht_class: type[Any], value_store_class: type[Any]) -> None:
         if counts.is_clean_absence():
             _LOGGER.warning("Value not found for key %s", key)
             return None
+        if (counts.records and counts.attempts == counts.positive_records
+                and not (counts.empty or counts.failed or counts.timeouts or counts.incomplete)
+                and (not quorum or counts.positive_records >= quorum)):
+            raise DHTUnvalidatedRecords("get_value", counts, tuple(counts.records))
         raise DHTLookupUnavailable("get_value", counts)
 
     value_store_class._get_from_peer = tracked_peer_read

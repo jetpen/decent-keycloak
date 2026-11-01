@@ -9,7 +9,7 @@ COPY --from=registry-src /.pinned-commit ./sources/registry/.pinned-commit
 COPY --from=registry-src /src ./sources/registry/src
 COPY container/verify_resolver_runtime_inputs.py ./verify_resolver_runtime_inputs.py
 COPY container/patch_resolver_runtime.py container/pinned_lookup_outcomes.py ./
-COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py ./scripts/
+COPY scripts/test_pinned_dht_peer_outcomes.py scripts/test_pinned_registry_lookup_outcomes.py scripts/test_pinned_adversarial_identity_peer.py scripts/test_rotation_registry_roundtrip.py scripts/rotation_registry_roundtrip.py scripts/issue5_adversarial_cases.py ./scripts/
 COPY container/resolver-runtime.lock.json container/registry-lock-constraints.txt container/resolver-requirements.in container/resolver-requirements.lock.txt container/resolver-build-requirements.lock.txt ./
 COPY container/resolver-binary-dependencies.lock.json ./
 COPY --from=binary-dependencies /resolver-wheelhouse.tar.gz ./resolver-wheelhouse.tar.gz
@@ -74,6 +74,8 @@ RUN --network=none if [ ! -e /etc/resolv.conf ]; then \
     fi \
  && LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_dht_peer_outcomes.py \
  && RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_registry_lookup_outcomes.py \
+ && RESOLVER_TEST_LIBP2P_SOURCE=/opt/decent-resolver/venv/lib64/python3.11/site-packages/libp2p RESOLVER_TEST_REGISTRY_SOURCE=/opt/decent-resolver/registry-src/src RESOLVER_TEST_IDENTITY_SOURCE=/opt/decent-resolver/identity-src/src PYTHONPATH=/resolver-build:/resolver-build/scripts:/opt/decent-resolver/identity-src/src:/opt/decent-resolver/registry-src/src:/opt/decent-resolver/venv/lib64/python3.11/site-packages LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_pinned_adversarial_identity_peer.py \
+ && PYTHONPATH=/resolver-build:/resolver-build/scripts:/opt/decent-resolver/identity-src/src:/opt/decent-resolver/registry-src/src:/opt/decent-resolver/venv/lib64/python3.11/site-packages LD_LIBRARY_PATH=/opt/decent-resolver/lib /opt/decent-resolver/venv/bin/python /resolver-build/scripts/test_rotation_registry_roundtrip.py \
  && /opt/decent-resolver/bin/decent-identity --help >/dev/null \
  && /opt/decent-resolver/bin/decent-registry --help >/dev/null \
  && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi

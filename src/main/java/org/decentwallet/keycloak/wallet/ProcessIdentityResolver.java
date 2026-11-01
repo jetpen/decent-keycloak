@@ -31,6 +31,9 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
           + "failed=(\\d{1,3}) timeouts=(\\d{1,3}) incomplete=(\\d{1,3})");
   private static final org.jboss.logging.Logger LOG =
       org.jboss.logging.Logger.getLogger(ProcessIdentityResolver.class);
+  // Each CLI child starts a TCP listener. Keycloak resource instances can resolve in parallel.
+  private static final java.util.Set<Integer> ACTIVE_CONFIGURED_CLIENT_PORTS =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
   private static final ObjectMapper RESULT_MAPPER = new ObjectMapper(
       JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
       .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -52,6 +55,23 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
 
   @Override
   public WalletIdentityKeyResolver.ResolvedIdentityKey resolveExact(String identityId) throws Exception {
+    boolean configuredPortLease = ACTIVE_CONFIGURED_CLIENT_PORTS.add(clientPort);
+    int processClientPort = configuredPortLease ? clientPort : 0;
+    boolean releaseConfiguredPort = true;
+    try {
+      return resolveExactAtPort(identityId, processClientPort);
+    } catch (IdentityResolutionException failure) {
+      if (failure.processMayStillRun()) releaseConfiguredPort = false;
+      throw failure;
+    } finally {
+      if (configuredPortLease && releaseConfiguredPort) {
+        ACTIVE_CONFIGURED_CLIENT_PORTS.remove(clientPort);
+      }
+    }
+  }
+
+  private WalletIdentityKeyResolver.ResolvedIdentityKey resolveExactAtPort(
+      String identityId, int processClientPort) throws Exception {
     if (identityId == null || identityId.isEmpty() || identityId.length() > 1024
         || identityId.indexOf('\0') >= 0) throw new IllegalArgumentException("Identity ID rejected");
     try {
@@ -68,7 +88,7 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     command.add("--host");
     command.add("127.0.0.1");
     command.add("--port");
-    command.add(Integer.toString(clientPort));
+    command.add(Integer.toString(processClientPort));
     for (String peer : bootstrap) { command.add("--bootstrap"); command.add(peer); }
 
     ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
@@ -163,11 +183,15 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
     boolean traceback = false;
     boolean dhtLookupUnavailable = false;
     int unknown = 0;
+    var summaryStages = new java.util.HashSet<String>();
     for (String line : lines) {
       if (line.isBlank()) continue;
       DhtLookupSummary summary = parseDhtLookupSummary(line);
       if (summary != null) {
-        if (!summary.isCleanAbsence()) dhtLookupUnavailable = true;
+        if (!summaryStages.add(summary.stage())) unknown = Math.min(unknown + 1, MAX_DIAGNOSTIC_LINES);
+        // A completed record-bearing lookup is not absence, but can accompany
+        // a successful, independently validated Identity JSON result.
+        if (!summary.hasCompletedReplies()) dhtLookupUnavailable = true;
       }
       else if (line.startsWith("DHT_LOOKUP_SUMMARY ")) unknown = Math.min(unknown + 1, MAX_DIAGNOSTIC_LINES);
       else if (line.startsWith("history unavailable:")) historyUnavailable = true;
@@ -323,6 +347,10 @@ public final class ProcessIdentityResolver implements WalletIdentityKeyResolver 
 
   private record DhtLookupSummary(
       String stage, int attempts, int empty, int failed, int timeouts, int incomplete) {
+    boolean hasCompletedReplies() {
+      return attempts > 0 && empty <= attempts && failed == 0 && timeouts == 0 && incomplete == 0;
+    }
+
     boolean isCleanAbsence() {
       return attempts > 0 && empty == attempts && failed == 0 && timeouts == 0 && incomplete == 0;
     }

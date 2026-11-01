@@ -165,6 +165,9 @@ public final class WalletLoginTransportHandler {
       return HttpResult.empty(503);
     }
     if (identity == null || !proof.identityId().equals(identity.identityId())) {
+      if (identity == null) {
+        LOG.debugf("Wallet Identity lookup completed (request=%s, outcome=not_found)", requestId);
+      }
       transactions.recordInvalidAttempt(handle);
       return HttpResult.empty(401);
     }

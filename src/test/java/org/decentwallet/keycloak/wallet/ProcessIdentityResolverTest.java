@@ -448,6 +448,156 @@ final class ProcessIdentityResolverTest {
   }
 
   @Test
+  void recoveredRotationSummaryAllowsExactCurrentOwnerResolution() throws Exception {
+    String identifier = "rotation-summary@example.invalid";
+    String key = "11".repeat(32);
+    String json = rotationResultJson(identifier, key);
+    String summary = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=0 failed=0 timeouts=0 incomplete=0";
+    for (String output : java.util.List.of(summary + "\n" + json, json + "\n" + summary)) {
+      var resolved = resolveScriptedOutput(identifier, output, 0);
+      assertEquals(identifier, resolved.identityId());
+      assertArrayEquals(java.util.HexFormat.of().parseHex(key), resolved.publicKey());
+    }
+  }
+
+  @Test
+  void positiveRotationOutputCannotHideUncertainOrDuplicateSummaries() throws Exception {
+    String identifier = "rotation-summary@example.invalid";
+    String json = rotationResultJson(identifier, "11".repeat(32));
+    String summary = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=0 failed=0 timeouts=0 incomplete=0";
+    for (String prefix : java.util.List.of(
+        summary.replace("attempts=1", "attempts=0"),
+        summary.replace("empty=0", "empty=999"),
+        summary.replace("failed=0", "failed=1"),
+        summary.replace("timeouts=0", "timeouts=1"),
+        summary.replace("incomplete=0", "incomplete=1"),
+        summary.replace("attempts=1", "attempts=1000"),
+        summary + "\n" + summary,
+        summary + "\nunknown private-marker=never-log")) {
+      assertThrows(ProcessIdentityResolver.IdentityResolutionException.class,
+          () -> resolveScriptedOutput(identifier, prefix + "\n" + json, 0));
+    }
+    assertThrows(ProcessIdentityResolver.IdentityResolutionException.class,
+        () -> resolveScriptedOutput(identifier, summary + "\n" + json, 1));
+    assertThrows(ProcessIdentityResolver.IdentityResolutionException.class,
+        () -> resolveScriptedOutput("other@example.invalid", summary + "\n" + json, 0));
+  }
+
+  private static String rotationResultJson(String identifier, String key) throws Exception {
+    String hex = java.util.HexFormat.of().formatHex(identifier.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    return new com.fasterxml.jackson.databind.ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(
+        java.util.Map.of("identifier", identifier, "owner_name_hex", hex,
+            "owner_public_key_hex", key, "seq", 2,
+            "authorization", java.util.Map.of("operation", 5, "threshold", 2,
+                "signer_set", java.util.List.of(
+                    java.util.Map.of("signer_id", "new", "public_key", key),
+                    java.util.Map.of("signer_id", "old", "public_key", "22".repeat(32)),
+                    java.util.Map.of("signer_id", "cosigner", "public_key", "33".repeat(32))))));
+  }
+
+  private static WalletIdentityKeyResolver.ResolvedIdentityKey resolveScriptedOutput(
+      String identity, String output, int exitCode) throws Exception {
+    Path executable = Files.createTempFile("identity-rotation-summary-", ".sh");
+    try {
+      String encodedOutput = java.util.Base64.getEncoder().encodeToString(
+          output.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      Files.writeString(executable, "#!/bin/sh\nprintf '%s' '" + encodedOutput
+          + "' | base64 -d\nexit " + exitCode + "\n");
+      executable.toFile().setExecutable(true);
+      return new ProcessIdentityResolver(new String[] {"peer"}, 8000, executable.toString()).resolveExact(identity);
+    } finally {
+      Files.deleteIfExists(executable);
+    }
+  }
+
+  @Test
+  void concurrentResolverInstancesAvoidConfiguredListenerPortCollision() throws Exception {
+    String firstIdentity = "mailto:first-account@example.org";
+    String secondIdentity = "mailto:second-account@example.org";
+    Path directory = Files.createTempDirectory("identity-concurrent-listener-");
+    Path executable = directory.resolve("identity-fixture");
+    int configuredPort;
+    try (var reservation = new java.net.ServerSocket(0)) {
+      configuredPort = reservation.getLocalPort();
+    }
+    String root = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(directory.toString());
+    String script = """
+        #!/usr/bin/python3
+        import json, os, pathlib, socket, sys, time
+        root = pathlib.Path(ROOT)
+        args = sys.argv[1:]
+        identity = next(arg.split("=", 1)[1] for arg in args if arg.startswith("--identifier="))
+        port = int(args[args.index("--port") + 1])
+        (root / ("requested-" + str(os.getpid()))).write_text(str(port))
+        (root / ("started-" + str(os.getpid()))).touch()
+        deadline = time.monotonic() + 5
+        while len(list(root.glob("started-*"))) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", port))
+            listener.listen()
+        except OSError:
+            print("Failed to start TCP listener", file=sys.stderr)
+            sys.exit(1)
+        (root / ("bound-" + str(os.getpid()))).write_text(str(listener.getsockname()[1]))
+        print(json.dumps({"identifier": identity, "owner_name_hex": identity.encode().hex(),
+            "owner_public_key_hex": "11" * 32, "seq": 0}))
+        time.sleep(0.3)
+        listener.close()
+        """.replace("ROOT", root);
+    Files.writeString(executable, script);
+    executable.toFile().setExecutable(true);
+    var firstResolver = new ProcessIdentityResolver(new String[] {"peer"}, configuredPort, executable.toString());
+    var secondResolver = new ProcessIdentityResolver(new String[] {"peer"}, configuredPort, executable.toString());
+    var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
+    try {
+      var first = executor.submit(() -> firstResolver.resolveExact(firstIdentity));
+      var second = executor.submit(() -> secondResolver.resolveExact(secondIdentity));
+      var results = new java.util.ArrayList<WalletIdentityKeyResolver.ResolvedIdentityKey>();
+      var lookupFailures = new java.util.ArrayList<String>();
+      for (var future : java.util.List.of(first, second)) {
+        try { results.add(future.get(8, java.util.concurrent.TimeUnit.SECONDS)); }
+        catch (java.util.concurrent.ExecutionException failedLookup) {
+          Throwable cause = failedLookup.getCause();
+          lookupFailures.add(cause == null ? "unknown" : cause.getClass().getSimpleName());
+        }
+      }
+      assertEquals(2, results.size(),
+          "both concurrent resolver subprocesses must complete; failures=" + lookupFailures);
+      assertEquals(java.util.Set.of(firstIdentity, secondIdentity), results.stream()
+          .map(WalletIdentityKeyResolver.ResolvedIdentityKey::identityId)
+          .collect(java.util.stream.Collectors.toSet()));
+      try (var files = Files.list(directory)) {
+        var requestedPorts = files.filter(path -> path.getFileName().toString().startsWith("requested-"))
+            .map(path -> {
+              try { return Files.readString(path); }
+              catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+            }).collect(java.util.stream.Collectors.toSet());
+        assertEquals(java.util.Set.of(Integer.toString(configuredPort), "0"), requestedPorts);
+      }
+      try (var files = Files.list(directory)) {
+        var boundPorts = files.filter(path -> path.getFileName().toString().startsWith("bound-"))
+            .map(path -> {
+              try { return Files.readString(path); }
+              catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+            }).toList();
+        assertEquals(2, boundPorts.size());
+        assertEquals(2, new java.util.HashSet<>(boundPorts).size());
+      }
+    } finally {
+      executor.shutdownNow();
+      executor.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS);
+      try (var paths = Files.walk(directory)) {
+        paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+          try { Files.deleteIfExists(path); }
+          catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+        });
+      }
+    }
+  }
+
+  @Test
   void forcedTerminationNeverUsesAnUnboundedWait() throws Exception {
     var process = org.mockito.Mockito.mock(Process.class);
     org.mockito.Mockito.when(process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)).thenReturn(false);

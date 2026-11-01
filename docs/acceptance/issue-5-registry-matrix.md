@@ -2,7 +2,7 @@
 
 ## Status
 
-Issue #4's resolver-runtime implementation and direct exact-image resolver gate are integrated. Issue #4 remains open pending review and explicit closure; its resolver-only qualification does not establish provider-level missing-Identity behavior. Any README wording that #4 blocks #5 is stale.
+Issue #4 is closed; its resolver-runtime implementation and direct exact-image resolver gate are integrated. That resolver-only qualification does not establish provider-level missing-Identity behavior. Any README wording that #4 blocks #5 is stale.
 
 Issue #5 remains open and unqualified overall. This is disposable single-node loopback evidence only. It does not qualify Registry reliability, production TLS, browser/native-wallet interoperability, shared-store behavior, or production use. In particular, HTTP 503 is not evidence of absence, stale-key rejection, or account-policy denial.
 
@@ -45,8 +45,29 @@ The harness records bounded attempts in `registry_matrix` and checkpoints after 
 1. **Current Identity:** before each independent proof, perform a separate resolver read and require the exact Identity and owner key; then use a fresh Keycloak login/proof and retain proof/status outcomes.
 2. **Missing Identity:** use a fresh unpublished Identity/key and a separate resolver lookup; classify direct results as `not_found` only after checking the exact requested Registry key. Use a fresh Keycloak transaction and valid signature, poll browser status separately, and distinguish provider `503` from a terminal miss.
 3. **Unavailable Registry:** point the disposable realm bootstrap at the same peer ID on a different, unreachable local TCP port; read configuration back; run direct lookup and a valid Keycloak proof; record provider/status results; restore and read back the original bootstrap in `finally`.
-4. **History-incomplete, malformed, and ambiguous Registry results:** keep explicit empty attempt lists until safe real fixtures reach the pinned Keycloak resolver path. Synthetic parser tests do not fill live gates.
+4. **Hostile Registry peers:** a test-only fixture supplies malformed bytes, a history-incomplete Identity, conflicting equal-sequence heads, and mixed legacy/rotated heads. The `issue5-adversarial` profile sends each fixture through a separate direct resolver lookup and Keycloak proof transaction; it requires exact-key requests at the CLI and provider peers, pending status, and no receipt/callback/code, then restores the original bootstrap and stops the fixture. These loopback fixtures do not change normal Registry publication or qualify network-wide behavior. The profile is implemented but has not been live-run on this integrated candidate.
 5. **Rotation:** publish an authorized successor and independently confirm sequence/key before proofs; require stale-key `401` with the transaction pending, then current-key `202`/accepted. The harness records two rounds on the same Identity (sequence 2, then sequence 3). Neither round ran in the historical #5 attempt.
+
+### Lifecycle receipt gate mapping
+
+The `issue5-live` receipt maps each criterion to an explicit gate. Offline receipts leave every live gate `not_run`; the matrix step cannot pass unless the harness evidence is complete and each ordinary gate is mapped. An incomplete or interrupted attempt remains `inconclusive` (or `fail` when observed evidence contradicts the criterion), never an implicit pass.
+
+| Criterion | Receipt gate | Evidence source |
+|---|---|---|
+| Current Identity and valid current-key proof | `current_identity`, `valid_current_key_proof` | Two distinct exact resolver readbacks and two Keycloak proof/status outcomes. |
+| Exact missing Identity | `exact_missing_identity` | Two independent unpublished-key reads and provider/status outcomes; only exact-key `not_found` qualifies. |
+| Registry unavailable | `registry_unavailable` | Read-back of temporary unreachable bootstrap, direct lookup, provider proof/status, and restored configuration readback. |
+| Malformed result | `malformed_result` | Bounded test-only hostile peer, exact-key request witness, provider pending status, no receipt/callback/code. |
+| History-incomplete result | `history_incomplete` | Same bounded hostile-peer evidence requirements. |
+| Ambiguous equal-sequence result | `ambiguous_registry_result` | Same bounded hostile-peer evidence requirements. |
+| Mixed legacy/rotated heads | `mixed_legacy_rotated_head` | Same bounded hostile-peer evidence requirements. |
+| Stale-key denial | `stale_key_denial` | Rotation proof returns 401 while the transaction remains pending. |
+| Owner-key rotation | `owner_key_rotation` | Two successor publication/readback rounds and successful current-key proofs. |
+| Independent rotation readback | `independent_rotation_readback` | Resolver readback witnesses for both sequence 2 and sequence 3 before proof. |
+
+### Image retention and publication
+
+The lifecycle removes the run-owned image by default after saving its receipt. `--retain-image` is explicit local retention only; its receipt records the immutable image ID and verified run-owned tag. Retention does not publish or complete any acceptance gate. Registry publication is a separate `promote` action that requires a fully successful `issue5-live` receipt, every criterion gate in its required state, the still-present retained image with the exact recorded ID, an explicit release-candidate destination, and `--allow-publish`. It uses the existing image without rebuilding and reads back the remote manifest/config digest before reporting success. No registry destination or image promotion is authorized by this documentation or by the live-run approval.
 
 Account-mapping denial evidence is separate; its `403`/policy observations are not used to classify Registry miss or unavailable outcomes.
 
@@ -58,7 +79,7 @@ Run the focused behavior suite without starting Keycloak, containers, or live pr
 python3.11 -m unittest scripts.test_registry_acceptance_matrix -v
 ```
 
-The suite covers eight offline behaviors: attempt ordering and checkpoint timing, distinct fixtures, retention of proof/status outcomes after a failed attempt, miss-versus-unavailable-versus-policy classification, unavailable-bootstrap construction, malformed-evidence rejection and checkpoint sanitization, plus the guide/status guard. Offline tests do not qualify live Registry states.
+The focused suite exercises matrix ordering/checkpointing, outcome classification, bootstrap setup, hostile-peer evidence projection, and cleanup witnesses. The pinned adversarial-peer and rotation tests must run inside the resolver-builder against the materialized, hash-verified Identity/Registry sources after the overlay is applied; the ordinary host suite intentionally does not import those source trees. Those offline resolver tests do not exercise the Keycloak provider proof path. Live Registry and provider gates remain `not_run` until the explicitly authorized live profile completes on this exact candidate.
 
 ## Historical reproduction command
 

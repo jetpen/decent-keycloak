@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import unittest
 from pathlib import Path
 
 PROBE = Path(__file__).with_name("wallet_login_live_e2e.py")
@@ -27,9 +28,9 @@ def test_live_disabled_account_fixture_has_distinct_identity_and_user_mapping():
   main = PROBE.read_text().split("def main():", 1)[1]
   assert "label='wallet-login-disabled'" in main
   assert "'username': 'wallet-disabled-fixture'" in main
-  assert "client, disabled_key, disabled_identifier, 'disabled-account'" in main
-  start = main.index("client, disabled_key, disabled_identifier, 'disabled-account'")
-  assert "wallet-unmapped-fixture" not in main[start:start + 500]
+  start = main.index("('disabled-account', lambda: account_mapping_denial_flow(")
+  assert "disabled_key, disabled_identifier, 'disabled-account'" in main[start:start + 220]
+  assert "wallet-unmapped-fixture" not in main[start:start + 220]
 
 
 def test_live_account_denial_flow_uses_initiating_cookie_jar_for_post_and_status():
@@ -42,7 +43,7 @@ def test_live_account_denial_flow_uses_initiating_cookie_jar_for_post_and_status
   assert "'X-Decent-CSRF': csrf.group(1)" in function
   assert "'Origin': WALLET_ORIGIN" in function
   assert "'Sec-Fetch-Site': 'cross-site'" in function
-  assert "browser.request('GET', status_url.group(1)" in function
+  assert "status_url.group(1), headers=poll_headers, follow_redirects=False)" in function
 
 
 def test_live_disabled_account_fixture_is_independent_from_unmapped_user():
@@ -50,8 +51,9 @@ def test_live_disabled_account_fixture_is_independent_from_unmapped_user():
   main = source[source.index("def main():"):]
   assert "label='wallet-login-disabled'" in main
   assert "'username': 'wallet-disabled-fixture'" in main
-  start = main.index("client, disabled_key, disabled_identifier, 'disabled-account'")
-  assert "wallet-unmapped-fixture" not in main[start:start + 500]
+  start = main.index("('disabled-account', lambda: account_mapping_denial_flow(")
+  assert "disabled_key, disabled_identifier, 'disabled-account'" in main[start:start + 220]
+  assert "wallet-unmapped-fixture" not in main[start:start + 220]
 
 
 def test_live_probe_counts_registry_unavailable_separately_from_policy_denial():
@@ -62,7 +64,8 @@ def test_live_probe_counts_registry_unavailable_separately_from_policy_denial():
   classifier_start = source.index("def account_mapping_denial_result(")
   classifier_end = source.index("\ndef unmapped_account_case_evidence", classifier_start)
   classifier = source[classifier_start:classifier_end]
-  assert "account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories)" in body
+  assert "account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories," in body
+  assert "response_safety=response_safety" in body
   assert "status == 503" in classifier
   assert "status == 403" in classifier
   assert "local_account_mapping_decision_observed" in classifier
@@ -76,7 +79,8 @@ def test_account_policy_attribution_validates_the_exact_direct_registry_result()
   assert "registry_lookup_outcome = exact_registry_lookup_outcome(" in function
   assert "direct_probe.stdout, direct_probe.returncode, identity_id)" in function
   assert "registry_lookup_succeeded = direct_probe.returncode == 0" not in function
-  assert "account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories)" in function
+  assert "account_mapping_denial_result(direct_http, registry_lookup_outcome, safe_categories," in function
+  assert "response_safety=response_safety" in function
 
 
 def test_unclassified_403_diagnostic_does_not_claim_registry_unavailable():
@@ -91,11 +95,24 @@ def test_unclassified_403_diagnostic_does_not_claim_registry_unavailable():
 def test_live_account_denials_require_request_specific_registry_and_log_evidence():
   source = PROBE.read_text()
   main = source[source.index("def main():") :]
-  assert "account_policy_denial_is_attributed(result['unmapped_account_case'])" in main
-  assert "account_policy_denial_is_attributed(disabled_result)" in main
-  assert "account_policy_denial_is_attributed(ambiguity_result)" in main
+  assert "run_concurrent_account_denial_flows([" in main
+  for case_name in ('unmapped-account', 'disabled-account', 'ambiguous-account'):
+    assert f"('{case_name}', lambda: account_mapping_denial_flow(" in main
+  assert "account_policy_denial_is_attributed(outcome)" in main
+  assert "max_concurrent >= 2" in main
   assert "expected_request_id = account_policy_request_id(locator)" in source
   assert "request_id != expected_request_id" in source
+
+
+def test_live_account_denial_checks_proof_and_status_response_disclosures():
+  source = PROBE.read_text()
+  start = source.index("def account_mapping_denial_flow(")
+  end = source.index("\ndef account_policy_request_id", start)
+  flow = source[start:end]
+  assert "follow_redirects=False" in flow
+  assert "account_policy_denial_response_safety(" in flow
+  assert "response_body, direct_headers, proof_redirects" in flow
+  assert "polled, status_raw, status_headers, status_redirects" in flow
 
 
 def test_account_policy_request_id_is_derived_from_opaque_handle():
@@ -110,3 +127,10 @@ def test_latest_e2e_summary_does_not_claim_unqualified_scenarios_passed():
   assert "E2E_SCENARIOS_COMPLETE: inspect per-case outcomes" in source
   assert "covered cases passed" not in source
   assert "PASS: disposable Keycloak" not in source
+
+
+def load_tests(loader, tests, pattern):
+  for name, test in sorted(globals().items()):
+    if name.startswith('test_') and callable(test):
+      tests.addTest(unittest.FunctionTestCase(test, description=name))
+  return tests
