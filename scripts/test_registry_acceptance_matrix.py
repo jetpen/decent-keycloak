@@ -501,7 +501,9 @@ class RegistryAcceptanceMatrixTest(unittest.TestCase):
     text = guide.read_text()
     self.assertIn('test-only fixture supplies malformed bytes', text)
     self.assertIn('inside the resolver-builder', text)
-    self.assertIn('Live Registry and provider gates remain `not_run`', text)
+    self.assertIn('Offline receipts still leave live Registry/provider gates `not_run`', text)
+    self.assertIn('latest explicitly authorized integrated live result is recorded above', text)
+    self.assertIn('The exact candidate passed the complete `issue5-live` lifecycle', text)
     readme = Path(__file__).parents[1] / 'README.md'
     readme_text = readme.read_text()
     self.assertEqual(0, readme_text.count('Twenty-three offline behavior tests'))
