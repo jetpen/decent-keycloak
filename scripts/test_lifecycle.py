@@ -182,11 +182,14 @@ class LifecycleCliTest(unittest.TestCase):
       cleanup.assert_called_once()
 
   def _run_profile_with_fake_engine(self, *, build_outcome="success", retain=False,
-      change_owner_before_removal=False, add_unowned_image=False, removal_noop=False):
+      change_owner_before_removal=False, add_unowned_image=False, removal_noop=False,
+      uninspectable_transient_image=False,
+      known_owned_transient_becomes_uninspectable=False):
     baseline_id = "sha256:" + "b" * 64
     runtime_id = "sha256:" + "a" * 64
     builder_id = "sha256:" + "c" * 64
     base_stage_id = "sha256:" + "d" * 64
+    transient_id = "sha256:" + "e" * 64
     images = {baseline_id: {"Parent": "", "owner": "upstream"}}
     tags = {"pre-existing:keep": baseline_id}
     run_id = None
@@ -196,6 +199,11 @@ class LifecycleCliTest(unittest.TestCase):
 
     def inspected_image(image_id):
       record = images.get(image_id)
+      if uninspectable_transient_image and image_id == transient_id:
+        payload = [{"Id": image_id, "Parent": record["Parent"], "Config": {"Labels": {}}}]
+        return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+      if known_owned_transient_becomes_uninspectable and image_id == transient_id and inventory_calls > 2:
+        return subprocess.CompletedProcess([], 1, "", "not found")
       if record is None:
         return subprocess.CompletedProcess([], 1, "", "not found")
       labels = {"io.decent.lifecycle.run-id": record["owner"]}
@@ -229,6 +237,10 @@ class LifecycleCliTest(unittest.TestCase):
         images[base_stage_id] = {"Parent": "", "owner": run_id}
         images[builder_id] = {"Parent": base_stage_id, "owner": run_id}
         images[runtime_id] = {"Parent": builder_id, "owner": run_id}
+        if uninspectable_transient_image or known_owned_transient_becomes_uninspectable:
+          # Podman may list an intermediate builder ID whose inspect metadata
+          # is unavailable; removing its owned parent/runtime deletes it too.
+          images[transient_id] = {"Parent": builder_id, "owner": run_id}
         if add_unowned_image:
           images["sha256:" + "f" * 64] = {"Parent": "", "owner": "unrelated-run"}
         tags[build_tag] = runtime_id
@@ -241,6 +253,8 @@ class LifecycleCliTest(unittest.TestCase):
         removals.append(image_id)
         if not removal_noop:
           images.pop(image_id, None)
+          if uninspectable_transient_image and image_id == builder_id:
+            images.pop(transient_id, None)
           for tag, tagged_id in list(tags.items()):
             if tagged_id == image_id:
               del tags[tag]
@@ -301,6 +315,43 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertTrue(receipt["cleanup"]["image_retained"])
     self.assertEqual(2, receipt["cleanup"]["removed_image_count"])
     self.assertNotIn(runtime, removals)
+
+  def test_uninspectable_transient_id_removed_transitively_does_not_fail_cleanup(self):
+    result, receipt, images, removals, baseline, runtime, builder, base_stage = \
+        self._run_profile_with_fake_engine(uninspectable_transient_image=True)
+    transient = "sha256:" + "e" * 64
+
+    self.assertEqual(0, result)
+    self.assertEqual({baseline}, set(images))
+    self.assertEqual([runtime, builder, base_stage], removals)
+    self.assertNotIn(transient, images)
+    self.assertEqual("pass", receipt["cleanup"]["status"])
+    self.assertEqual(4, receipt["cleanup"]["candidate_image_count"])
+    self.assertEqual(3, receipt["cleanup"]["removed_image_count"])
+    self.assertEqual(0, receipt["cleanup"]["inconclusive_image_count"])
+
+  def test_uninspectable_transient_id_that_survives_cleanup_fails_closed(self):
+    result, receipt, images, _removals, baseline, *_ = \
+        self._run_profile_with_fake_engine(
+            uninspectable_transient_image=True, removal_noop=True)
+    transient = "sha256:" + "e" * 64
+
+    self.assertNotEqual(0, result)
+    self.assertEqual({baseline, transient, "sha256:" + "a" * 64,
+        "sha256:" + "c" * 64, "sha256:" + "d" * 64}, set(images))
+    self.assertEqual("fail", receipt["cleanup"]["status"])
+    self.assertGreater(receipt["cleanup"]["inconclusive_image_count"], 0)
+
+  def test_previously_identified_owned_transient_that_becomes_uninspectable_fails_closed(self):
+    result, receipt, images, _removals, _baseline, *_ = \
+        self._run_profile_with_fake_engine(
+            known_owned_transient_becomes_uninspectable=True)
+    transient = "sha256:" + "e" * 64
+
+    self.assertNotEqual(0, result)
+    self.assertIn(transient, images)
+    self.assertEqual("fail", receipt["cleanup"]["status"])
+    self.assertGreater(receipt["cleanup"]["inconclusive_image_count"], 0)
 
   def test_changed_run_ownership_label_is_preserved_and_cleanup_fails_closed(self):
     result, receipt, images, removals, baseline, _, builder, *_ = \

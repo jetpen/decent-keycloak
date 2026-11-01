@@ -649,6 +649,7 @@ def _cleanup_owned_images(engine: str, baseline_ids: set[str], run_id: str,
   candidates = after_ids - baseline_ids
   known_owned_ids = known_owned_ids or set()
   owned_metadata: dict[str, dict] = {}
+  uninspectable_candidates: set[str] = set()
   unowned_count = 0
   inconclusive_count = 0
   for image_id in sorted(candidates):
@@ -656,8 +657,8 @@ def _cleanup_owned_images(engine: str, baseline_ids: set[str], run_id: str,
       metadata = _image_metadata(engine, image_id)
     except RuntimeError:
       metadata = None
-      inconclusive_count += 1
     if metadata is None:
+      uninspectable_candidates.add(image_id)
       if image_id not in known_owned_ids:
         inconclusive_count += 1
       continue
@@ -700,6 +701,15 @@ def _cleanup_owned_images(engine: str, baseline_ids: set[str], run_id: str,
     removed.append(image_id)
 
   remaining = _image_inventory(engine)
+  # Podman may list transient intermediate IDs that it cannot inspect; deleting
+  # an owned descendant can remove them transitively. Only remaining IDs need
+  # a successful ownership readback, while disappearance is confirmed by the
+  # complete immutable-ID inventory.
+  for image_id in sorted(uninspectable_candidates):
+    if image_id not in remaining:
+      inconclusive_count -= 1
+    else:
+      inconclusive_count += 1
   missing_after_cleanup = sorted(image_id for image_id in removed if image_id in remaining)
   still_owned = []
   for image_id in sorted(remaining - baseline_ids):
