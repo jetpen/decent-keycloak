@@ -2,7 +2,7 @@
 
 An experimental Keycloak provider for wallet-based sign-in using the provider-neutral [`decent-wallet-login-v1`](https://github.com/jetpen/decent-ecosystem) protocol. This repository implements the Keycloak adapter; it does not include a wallet application or relying-party website. Protocol design and vectors are maintained by [decent-ecosystem](https://github.com/jetpen/decent-ecosystem). The wallet proof-signer is a separate component.
 
-> **Status: experimental — not production-ready.** The supported build target is Keycloak 26.8.0 on Linux/amd64. A passing build, unit suite, image smoke test, or local loopback test does not establish production readiness. Real TLS/browser/native-wallet interoperability and full current-Registry acceptance remain incomplete. See [support policy](docs/support-policy.md), [security review and limitations](docs/security-review.md), and [acceptance records](docs/acceptance/).
+> **Status: experimental — not production-ready.** The supported build target is Keycloak 26.8.0 on Linux/amd64. A passing build, unit suite, image smoke test, or local loopback test does not establish production readiness. Production Registry reliability, real TLS/browser/native-wallet interoperability, and production readiness remain unqualified. See [support policy](docs/support-policy.md), [security review and limitations](docs/security-review.md), and [acceptance records](docs/acceptance/).
 
 ## What this provider does
 

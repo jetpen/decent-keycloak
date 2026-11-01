@@ -306,6 +306,34 @@ class RegistryAcceptanceMatrixTest(unittest.TestCase):
     broken = dict(evidence, provider_http=202)
     self.assertEqual('unqualified', probe.classify_adversarial_peer_attempt(broken))
 
+  def test_set_registry_bootstrap_reports_exact_get_put_get_readback(self):
+    original = {'attributes': {'decent.wallet.registry.bootstrap': 'old-peer'}}
+    overridden = {'attributes': {'decent.wallet.registry.bootstrap': 'new-peer'}}
+    admin = patch.object(probe, 'admin_call', side_effect=[
+        (200, {}, json.dumps(original).encode()),
+        (204, {}, b''),
+        (200, {}, json.dumps(overridden).encode()),
+    ])
+    with admin as admin_call:
+      self.assertIs(probe.set_registry_bootstrap(object(), 'token', 'new-peer'), True)
+    self.assertEqual(['GET', 'PUT', 'GET'], [call.args[2] for call in admin_call.call_args_list])
+
+  def test_set_registry_bootstrap_readback_mismatch_fails_closed(self):
+    original = {'attributes': {'decent.wallet.registry.bootstrap': 'old-peer'}}
+    wrong = {'attributes': {'decent.wallet.registry.bootstrap': 'unexpected-peer'}}
+    with patch.object(probe, 'admin_call', side_effect=[
+        (200, {}, json.dumps(original).encode()),
+        (204, {}, b''),
+        (200, {}, json.dumps(wrong).encode()),
+    ]):
+      with self.assertRaisesRegex(RuntimeError, 'persisted exactly'):
+        probe.set_registry_bootstrap(object(), 'token', 'new-peer')
+
+  def test_set_registry_bootstrap_admin_error_fails_closed(self):
+    with patch.object(probe, 'admin_call', return_value=(403, {}, b'')):
+      with self.assertRaises(Exception):
+        probe.set_registry_bootstrap(object(), 'token', 'new-peer')
+
   def test_fixture_peer_request_delta_requires_each_expected_peer(self):
     delta = probe.fixture_peer_request_increments
     self.assertTrue(delta([0, 2], [1, 3], 2))

@@ -15,6 +15,7 @@ import wallet_login_live_e2e as probe  # noqa: E402
 SAFE_ACCOUNT_DENIAL_RESPONSE = {
     'response_body_safe': True, 'headers_safe': True, 'location_safe': True,
     'redirects_safe': True, 'status_pending': True,
+    'no_authorization_code': True,
     'no_acceptance_or_callback': True,
 }
 
@@ -564,6 +565,14 @@ class SignupIntentProbeTest(unittest.TestCase):
     safe = probe.account_policy_denial_response_safety(
         b'{}', {}, [], 200, b'{"status":"pending"}', {}, [])
     self.assertTrue(safe['no_acceptance_or_callback'])
+    self.assertTrue(safe['no_authorization_code'])
+    attributed = probe.account_mapping_denial_result(
+        403, 'resolved', ['account-policy-rejected'], response_safety=safe)
+    self.assertTrue(attributed['no_authorization_code'])
+    unsafe_code = probe.account_policy_denial_response_safety(
+        b'{"status":"denied","authorization_code":"opaque"}', {}, [],
+        200, b'{"status":"pending"}', {}, [])
+    self.assertFalse(unsafe_code['no_authorization_code'])
     unsafe_evidence = (
         probe.account_policy_denial_response_safety(
             b'{"message":"code=private-code","message":"ordinary denial"}', {}, [],
@@ -665,12 +674,32 @@ class SignupIntentProbeTest(unittest.TestCase):
 
   def test_account_denial_concurrency_sanitizer_keeps_only_bounded_facts(self):
     request_id = '0123456789abcdef0123456789abcdef'
-    evidence = probe.sanitize_live_checkpoint({'account_denial_concurrency': {
-        'case_count': 3, 'max_concurrent_flows': 3, 'overlap_observed': True,
-        'all_policy_denied': True, 'request_id': request_id}})
-    self.assertEqual(evidence, {'account_denial_concurrency': {
-        'case_count': 3, 'max_concurrent_flows': 3, 'overlap_observed': True,
-        'all_policy_denied': True}})
+    evidence = probe.sanitize_live_checkpoint({
+        'account_denial_concurrency': {
+            'case_count': 3, 'max_concurrent_flows': 3, 'overlap_observed': True,
+            'all_policy_denied': True, 'all_request_correlated': True,
+            'request_id': request_id,
+        },
+        'account_denial_cases': {
+            name: {
+                'outcome': 'policy_denied', 'current_registry_proof_http': 403,
+                'local_account_mapping_decision_observed': True,
+                'request_correlated_denial': True, 'status_pending': True,
+                'no_acceptance_or_callback': True, 'no_authorization_code': True,
+                'response_body_safe': True, 'headers_safe': True,
+                'location_safe': True, 'redirects_safe': True,
+                'runtime_qualification_status': 'runtime_facts_verified',
+                'single_use_object_provider_path': 'infinispan',
+                'single_use_object_provider_evidence': 'request_correlated_consumed_transaction',
+                'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+            }
+            for name in ('unmapped-account', 'disabled-account', 'ambiguous-account')
+        },
+    })
+    self.assertIn('account_denial_concurrency', evidence)
+    self.assertIn('all_request_correlated', evidence['account_denial_concurrency'])
+    self.assertEqual({'unmapped-account', 'disabled-account', 'ambiguous-account'},
+        set(evidence['account_denial_cases']))
     self.assertNotIn(request_id, repr(evidence))
     case = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'],
         response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)

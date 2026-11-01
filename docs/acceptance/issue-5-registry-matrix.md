@@ -4,9 +4,35 @@
 
 Issue #4 is closed; its resolver-runtime implementation and direct exact-image resolver gate are integrated. That resolver-only qualification does not establish provider-level missing-Identity behavior. Any README wording that #4 blocks #5 is stale.
 
-Issue #5 remains open and unqualified overall. This is disposable single-node loopback evidence only. It does not qualify Registry reliability, production TLS, browser/native-wallet interoperability, shared-store behavior, or production use. In particular, HTTP 503 is not evidence of absence, stale-key rejection, or account-policy denial.
+Issue #5 remains open pending PR review/merge and completion of the separate lifecycle/documentation closure checklist. The historical run below was partial; the latest exact-candidate live run is recorded next. All evidence is disposable single-node loopback only: it does not qualify Registry reliability, production TLS, browser/native-wallet interoperability, shared-store behavior, or production use. A 503 is not evidence of absence, stale-key rejection, or account-policy denial.
 
-This consolidation ports the matrix harness and offline tests but does not rerun a live profile. The historical attempt below is partial evidence from an earlier source snapshot; the integrated harness has not been live-verified.
+## Latest integrated qualification (2026-11-01)
+
+The exact candidate passed the complete `issue5-live` lifecycle and all named Issue #5 gates. The sanitized receipt is `target/lifecycle/evidence/d455d1aaad9d440ba9da80bfc794ef64.json` (run ID `d455d1aaad9d440ba9da80bfc794ef64`, exit 0). The image was removed after the run; exact Podman image inventory returned to the recorded baseline with no inconclusive IDs. Offline lifecycle receipt `target/lifecycle/evidence/f0eda711d86146e8b3feca9e6dc73dfd.json` also passed on the same source/artifact fingerprint.
+
+| Provenance | Value |
+|---|---|
+| Image source set | 33 files; SHA-256 `7b86cca8112240dcc55ca0ebe187f72975ea58e8c30bce42a845f08828baab05` |
+| Runtime artifacts | 3 JARs; SHA-256 `81a22230404c0ca4920a41ed33f7cff51333c737c4bd447645974678d6ab7ba2` |
+| Immutable image ID | `sha256:a26c027f979bf4052b360cc88c808cbb95ae3b9d6075d5a9dee74ff65eed7896` |
+| Image digest | `sha256:6bf8f734b40f6534f0635c4577bbbcd30def718eaf0e1b60b531724219274bf2` |
+| Live harness SHA-256 | `fd29962b717059088299d1a2c7e9e436e81171f3641bc56def43205d8f54a126` |
+| Pinned Identity / Registry commits | `2caec24de52c2dbe241e72fe317281c051d03f89` / `628120989703d146da50af97b4602f1f4aa3a068` |
+| Runtime manifest / lock SHA-256 | `8c5841459aa1119875a3a29aad91f42704baa30d71f26fa0bdd20dc848bbb5db` / `6ff0d4c41ae5aa8834bbc9a88bfa30cb8386aae6ebb9b13467b55a6d996098ff` |
+| Hostile-fixture case constants SHA-256 | `5df1bfc8a5614d2dca9f3c40f39a3f95bdaeb1e3ba381ba8e70eb4e50c8aa8c6` |
+
+| Criterion | Observed result |
+|---|---|
+| Current Identity | 2/2 distinct exact resolver readbacks; provider 202 and accepted status in both attempts. |
+| Exact missing Identity | 2/2 exact-key `not_found`; provider 401 with pending status and no acceptance/code. |
+| Registry unavailable | 2/2 direct unavailable and provider 503; pending status and no acceptance/code; bootstrap override and restoration were read back. |
+| Hostile malformed, history-incomplete, ambiguous, and mixed-head fixtures | 2 attempts per fixture; exact-key fixture witnesses; direct unavailable/provider 503; pending and no receipt/callback/code. Each gate is `unavailable` as required for fail-closed hostile inputs. |
+| Stale/current-key rotation | Two independently read-back rounds (sequences 2 and 3); stale proofs 401 while pending, current proofs 202 and accepted. |
+| Concurrent account denial | Three overlapping request-correlated policy denials; pending/no acceptance/no code and response-safety checks passed. |
+| Effective provider/runtime | Effective `dev-file` database and `local` cache; Infinispan transaction-consumption witness count 2. |
+| Lifecycle and teardown | Every step passed; cleanup passed, no inconclusive IDs, image inventory exactly restored to baseline. |
+
+The receipt stores only sanitized evidence; raw request IDs, markers, credentials, tokens, and Identity/key values are not retained. The live fingerprint intentionally covers image-contributing source and runtime JARs, not docs, lifecycle scripts, or project configuration. This run qualifies the existing matrix on this candidate only; it does not by itself satisfy the four separate closure-remediation sections or authorize closing Issue #5.
 
 ## Historical attempted run and provenance
 
@@ -45,18 +71,22 @@ The harness records bounded attempts in `registry_matrix` and checkpoints after 
 1. **Current Identity:** before each independent proof, perform a separate resolver read and require the exact Identity and owner key; then use a fresh Keycloak login/proof and retain proof/status outcomes.
 2. **Missing Identity:** use a fresh unpublished Identity/key and a separate resolver lookup; classify direct results as `not_found` only after checking the exact requested Registry key. Use a fresh Keycloak transaction and valid signature, poll browser status separately, and distinguish provider `503` from a terminal miss.
 3. **Unavailable Registry:** point the disposable realm bootstrap at the same peer ID on a different, unreachable local TCP port; read configuration back; run direct lookup and a valid Keycloak proof; record provider/status results; restore and read back the original bootstrap in `finally`.
-4. **Hostile Registry peers:** a test-only fixture supplies malformed bytes, a history-incomplete Identity, conflicting equal-sequence heads, and mixed legacy/rotated heads. The `issue5-adversarial` profile sends each fixture through a separate direct resolver lookup and Keycloak proof transaction; it requires exact-key requests at the CLI and provider peers, pending status, and no receipt/callback/code, then restores the original bootstrap and stops the fixture. These loopback fixtures do not change normal Registry publication or qualify network-wide behavior. The profile is implemented but has not been live-run on this integrated candidate.
+4. **Hostile Registry peers:** a test-only fixture supplies malformed bytes, a history-incomplete Identity, conflicting equal-sequence heads, and mixed legacy/rotated heads. The `issue5-adversarial` profile sends each fixture through a separate direct resolver lookup and Keycloak proof transaction; it requires exact-key requests at the CLI and provider peers, pending status, and no receipt/callback/code, then restores the original bootstrap and stops the fixture. These loopback fixtures do not change normal Registry publication or qualify network-wide behavior. All four fixtures passed two fail-closed attempts each in the latest integrated qualification above.
 5. **Rotation:** publish an authorized successor and independently confirm sequence/key before proofs; require stale-key `401` with the transaction pending, then current-key `202`/accepted. The harness records two rounds on the same Identity (sequence 2, then sequence 3). Neither round ran in the historical #5 attempt.
 
 ### Lifecycle receipt gate mapping
 
-The `issue5-live` receipt maps each Registry matrix criterion below to an explicit gate. Account-denial concurrency is supplemental correlated evidence, not a Registry matrix gate. Offline receipts leave every live gate `not_run`; the matrix step cannot pass unless the harness evidence is complete and each ordinary gate is mapped. An incomplete or interrupted attempt remains `inconclusive` (or `fail` when observed evidence contradicts the criterion), never an implicit pass.
+The lifecycle receipt's `source.image_source_sha256` covers only the repository image-build source set: the production Java/resources tree and container build/support source files consumed by the Dockerfile. It intentionally excludes documentation, lifecycle/acceptance orchestration scripts, and project configuration. After compilation, `source.image_artifacts_sha256` covers the three runtime JARs copied into the image. The immutable image ID/digest identifies the built artifact.
+
+The `issue5-live` receipt maps each current Registry, account-denial, and runtime qualification criterion below to a named gate. Offline receipts leave every live qualification gate `not_run`; the matrix step cannot pass unless the harness evidence is complete and every required gate is mapped. An incomplete or interrupted attempt remains `inconclusive` (or `fail` when observed evidence contradicts the criterion), never an implicit pass.
 
 | Criterion | Receipt gate | Evidence source |
 |---|---|---|
 | Current Identity and valid current-key proof | `current_identity`, `valid_current_key_proof` | Two distinct exact resolver readbacks and two Keycloak proof/status outcomes. |
 | Exact missing Identity | `exact_missing_identity` | Two independent unpublished-key reads and provider/status outcomes; only exact-key `not_found` qualifies. |
-| Registry unavailable | `registry_unavailable` | Read-back of temporary unreachable bootstrap, direct lookup, provider proof/status, and restored configuration readback. |
+| Registry unavailable | `registry_unavailable` | Both temporary override and restored bootstrap GET/PUT/GET readbacks verified exactly, plus two direct lookups and provider proof/status outcomes. |
+| Concurrent account denial | `account_denial_concurrency` | Three fixed cases, overlap ≥2, all three independently request-correlated policy denials, pending/no-acceptance/no-code, and sanitized body/header/Location/redirect safety booleans. Request IDs are not retained. |
+| Effective provider/runtime | `runtime_provider` | At least one of the two successful current-Identity proof attempts supplies exactly one request-correlated consumed-transaction witness for selected `infinispan`; runtime evidence also reads back effective `dev-file` database and `local` cache. Offline receipts leave this gate `not_run`. |
 | Malformed result | `malformed_result` | Bounded test-only hostile peer, exact-key request witness, provider pending status, no receipt/callback/code. |
 | History-incomplete result | `history_incomplete` | Same bounded hostile-peer evidence requirements. |
 | Ambiguous equal-sequence result | `ambiguous_registry_result` | Same bounded hostile-peer evidence requirements. |
@@ -79,7 +109,7 @@ Run the focused behavior suite without starting Keycloak, containers, or live pr
 python3.11 -m unittest scripts.test_registry_acceptance_matrix -v
 ```
 
-The focused suite exercises matrix ordering/checkpointing, outcome classification, bootstrap setup, hostile-peer evidence projection, and cleanup witnesses. The pinned adversarial-peer and rotation tests must run inside the resolver-builder against the materialized, hash-verified Identity/Registry sources after the overlay is applied; the ordinary host suite intentionally does not import those source trees. Those offline resolver tests do not exercise the Keycloak provider proof path. Live Registry and provider gates remain `not_run` until the explicitly authorized live profile completes on this exact candidate.
+The focused suite exercises matrix ordering/checkpointing, outcome classification, bootstrap setup, hostile-peer evidence projection, and cleanup witnesses. The pinned adversarial-peer and rotation tests run inside the resolver-builder against the materialized, hash-verified Identity/Registry sources after the overlay is applied; the ordinary host suite intentionally does not import those source trees. Those offline resolver tests do not exercise the Keycloak provider proof path. Offline receipts still leave live Registry/provider gates `not_run`; the latest explicitly authorized integrated live result is recorded above.
 
 ## Historical reproduction command
 
@@ -90,4 +120,4 @@ WALLET_IT_IMAGE='ad9834f964d24aa9a0c8320ed095af4514760d9d2ce10eeaca52a20c6ff31fb
   python3 scripts/wallet_login_live_e2e.py
 ```
 
-Use an immutable image ID and preserve image/harness/source provenance for any future authorized run. Do not rerun the long full E2E merely to chase the prior six non-exact reads. Until every gate is actually observed, leave provider-level miss/unavailable, history, malformed/ambiguous, stale-key, and repeated-rotation acceptance open. Do not close Issue #5 based on the partial run or offline tests.
+Use an immutable image ID and preserve image/harness/source provenance for any future authorized run. The historical partial run above is superseded for the integrated candidate by the successful latest qualification. Keep Issue #5 open until the PR is reviewed/merged and the separate lifecycle/documentation closure checklist is complete; the live receipt alone does not authorize issue closure.
