@@ -34,7 +34,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("decent-ecosystem", readme)
     self.assertIn("not production-ready", readme)
     self.assertIn("python3.11 scripts/lifecycle.py run offline", readme)
-    self.assertIn("Build an installable local image", readme)
+    self.assertIn("Build and retain a local image", readme)
     self.assertIn("decent.wallet.registry.bootstrap", readme)
     self.assertIn("## Configure a disposable realm", readme)
     self.assertIn("CONTRIBUTING.md", readme)

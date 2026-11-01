@@ -103,10 +103,15 @@ First run Java 21 offline `mvn -o clean package`, then:
 
 ```bash
 python3.11 scripts/build_issue7_fault_provider.py
+IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue7-store-recovery-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue7-store-recovery-test-runtime --field image_artifacts_sha256)"
 podman build --no-cache --pull=never --network=none \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \
+  --build-arg IMAGE_ARTIFACTS_SHA256="$IMAGE_ARTIFACTS_SHA256" \
   --file container/Dockerfile --target issue7-store-recovery-test-runtime \
-  --tag decent-keycloak:issue7-store-recovery .
-IMAGE_ID=$(podman image inspect --format '{{.Id}}' decent-keycloak:issue7-store-recovery)
+  --tag localhost/decent-keycloak/wallet-provider-issue7-store-recovery-test:local .
+IMAGE_ID=$(podman image inspect --format '{{.Id}}' localhost/decent-keycloak/wallet-provider-issue7-store-recovery-test:local)
 WALLET_IT_PROFILE=issue7-consume-loss-recovery \
   WALLET_IT_STORE_RECOVERY_IMAGE="$IMAGE_ID" \
   python3.11 scripts/wallet_login_live_e2e.py

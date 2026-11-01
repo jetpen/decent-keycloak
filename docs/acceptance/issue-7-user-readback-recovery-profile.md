@@ -36,16 +36,21 @@ Prepare the artifact/image only when appropriate for the authorized test environ
 JAVA_HOME=/usr/lib/jvm/java-21-openjdk PATH=/usr/lib/jvm/java-21-openjdk/bin:$PATH \
   MAVEN_OPTS='-Xmx2g' mvn -o clean package
 python3 scripts/build_issue7_user_readback_provider.py
+IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue7-user-readback-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue7-user-readback-test-runtime --field image_artifacts_sha256)"
 podman build --no-cache --pull=never --network=none \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \
+  --build-arg IMAGE_ARTIFACTS_SHA256="$IMAGE_ARTIFACTS_SHA256" \
   --file container/Dockerfile --target issue7-user-readback-test-runtime \
-  --tag decent-keycloak-issue7-test:local .
+  --tag localhost/decent-keycloak/wallet-provider-issue7-user-readback-test:local .
 ```
 
 Then explicitly select the chosen mode and the separately built test image:
 
 ```bash
 WALLET_IT_PROFILE=issue7-user-readback-empty \
-WALLET_IT_USER_READBACK_IMAGE=decent-keycloak-issue7-test:local \
+WALLET_IT_USER_READBACK_IMAGE=localhost/decent-keycloak/wallet-provider-issue7-user-readback-test:local \
 python3 scripts/wallet_login_live_e2e.py
 ```
 

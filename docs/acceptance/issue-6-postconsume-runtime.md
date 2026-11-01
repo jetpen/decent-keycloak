@@ -57,10 +57,15 @@ The test-image target and the receipt-failure profile have already been run once
 ```bash
 mvn -q -o -DskipTests test-compile
 python3.11 scripts/build_issue6_postconsume_provider.py
+IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-postconsume-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-postconsume-test-runtime --field image_artifacts_sha256)"
 podman build --target issue6-postconsume-test-runtime \
-  -f container/Dockerfile -t localhost/decent-keycloak-issue6-postconsume:test .
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \
+  --build-arg IMAGE_ARTIFACTS_SHA256="$IMAGE_ARTIFACTS_SHA256" \
+  -f container/Dockerfile -t localhost/decent-keycloak/wallet-provider-issue6-postconsume-test:local .
 WALLET_IT_PROFILE=issue6-postconsume-receipt-failure \
-WALLET_IT_TEST_IMAGE=localhost/decent-keycloak-issue6-postconsume:test \
+WALLET_IT_TEST_IMAGE=localhost/decent-keycloak/wallet-provider-issue6-postconsume-test:local \
 python3.11 scripts/wallet_login_live_e2e.py
 ```
 
@@ -69,6 +74,25 @@ The profile refuses to run without `WALLET_IT_TEST_IMAGE`; it does not fall back
 ## Qualification gaps
 
 Current evidence includes the prior bounded attempts and candidate `7ee5cf...` reruns. On the current receipt-decorator image, the correlated commit-then-throw and fail-closed proof/retry/status outcomes passed, but fresh recovery exited with `RuntimeError` before recovery fields were checkpointed; the precise cause/outcome is unavailable. On the current callback-gate image, Keycloak reached 26.8.0/one node and advertised/configured the decorator ID, but the sanitized checkpoint remained at `preflight` with `RuntimeError`, so injection and recovery were not established. Effective DB/cache were `dev-file`/local, while selected provider path remained unavailable. Production-provider post-consume behavior, callback-gate injection/recovery, complete receipt recovery, strict replay/PKCE, changed-signature replay, and live expiry remain open. Do not treat the test decorator or its unit tests as production-provider qualification.
+
+## Rebuild the isolated callback-gate test image
+
+After a successful Java 21 offline Maven package, build the fault-injector JAR and compute the target-specific fingerprints before the image build:
+
+```bash
+mvn -q -o clean package
+python3.11 scripts/build_issue6_callback_gate_provider.py
+IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-callback-gate-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-callback-gate-test-runtime --field image_artifacts_sha256)"
+podman build --no-cache --pull=never --network=none \\
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \\
+  --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \\
+  --build-arg IMAGE_ARTIFACTS_SHA256="$IMAGE_ARTIFACTS_SHA256" \\
+  --file container/Dockerfile --target issue6-callback-gate-test-runtime \\
+  --tag localhost/decent-keycloak/wallet-provider-issue6-callback-gate-test:local .
+```
+
+The build is local and does not publish. Select the resulting image by immutable ID in the separate live-profile command only after the required runtime authorization.
 
 ## Callback-gate `putIfAbsent` commit-then-throw (offline implementation; live profile stopped at preflight)
 
