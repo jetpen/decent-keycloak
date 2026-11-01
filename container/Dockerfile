@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 FROM registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c AS resolver-builder
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 USER 0
 WORKDIR /resolver-build
 COPY container/rotation_registry_roundtrip.py ./rotation_registry_roundtrip.py
@@ -81,6 +83,8 @@ RUN --network=none if [ ! -e /etc/resolv.conf ]; then \
  && if [ "$created_resolv_conf" = 1 ]; then rm -f /etc/resolv.conf; fi
 
 FROM quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad AS keycloak-with-resolver
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 USER 0
 COPY --from=resolver-builder /opt/decent-resolver/ /opt/decent-resolver/
 COPY --from=resolver-builder /usr/lib64/python3.11/ /usr/lib64/python3.11/
@@ -93,6 +97,8 @@ COPY --from=resolver-builder /usr/include/gmp.h /usr/include/gmp.h
 USER 1000
 
 FROM keycloak-with-resolver AS runtime
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
@@ -100,6 +106,8 @@ RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --s
 
 # The fault injector exists only in this separately built test target.
 FROM runtime AS issue7-user-readback-test-runtime
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 USER 0
 COPY target/issue7-user-readback-provider.jar /opt/keycloak/providers/
 USER 1000
@@ -107,11 +115,15 @@ RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --h
 
 # Opt-in store fault wrapper; never included in the production runtime target.
 FROM runtime AS issue7-store-recovery-test-runtime
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 COPY target/issue7-fault-provider.jar /opt/keycloak/providers/
 RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --http-relative-path=/auth --spi-single-use-object--provider-default=issue7-fault-injection
 
 # The Issue #6 receipt fault decorator is available only in this isolated test image.
 FROM keycloak-with-resolver AS issue6-postconsume-test-runtime
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
@@ -120,6 +132,8 @@ RUN --network=none /opt/keycloak/bin/kc.sh build --db=dev-file --cache=local --s
 
 # The sibling callback-gate injector is isolated from both production and receipt-failure targets.
 FROM keycloak-with-resolver AS issue6-callback-gate-test-runtime
+ARG LIFECYCLE_RUN_ID=manual
+LABEL io.decent.lifecycle.run-id="$LIFECYCLE_RUN_ID"
 COPY target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar /opt/keycloak/providers/
 COPY target/providers/java-json-canonicalization-1.1.jar /opt/keycloak/providers/
 COPY target/providers/core-3.4.0.jar /opt/keycloak/providers/
