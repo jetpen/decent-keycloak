@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import subprocess
 import sys
@@ -58,8 +60,12 @@ class LifecycleCliTest(unittest.TestCase):
     dependencies = Path("/run/binary-dependencies")
     run_id = "e" * 32
     for engine in ("docker", "podman"):
-      command = _engine_command(engine, "candidate", sources, dependencies, run_id=run_id)
+      command = _engine_command(engine, "candidate", sources, dependencies, run_id=run_id,
+          source_revision="f" * 40, source_sha256="a" * 64, artifacts_sha256="b" * 64)
       self.assertIn(f"LIFECYCLE_RUN_ID={run_id}", command)
+      self.assertIn("SOURCE_REVISION=" + "f" * 40, command)
+      self.assertIn("IMAGE_SOURCE_SHA256=" + "a" * 64, command)
+      self.assertIn("IMAGE_ARTIFACTS_SHA256=" + "b" * 64, command)
       self.assertIn("--build-arg", command)
       self.assertEqual([engine, "image", "rm", "sha256:" + "a" * 64],
           lifecycle._image_remove_command(engine, "sha256:" + "a" * 64))
@@ -75,6 +81,13 @@ class LifecycleCliTest(unittest.TestCase):
     labels = [line for line in dockerfile.splitlines()
               if "io.decent.lifecycle.run-id" in line]
     self.assertEqual(len(stages), len(labels), "every Dockerfile stage must carry the run owner label")
+    for argument in ("ARG SOURCE_REVISION", "ARG IMAGE_SOURCE_SHA256", "ARG IMAGE_ARTIFACTS_SHA256"):
+      self.assertEqual(len(stages), dockerfile.count(argument),
+          f"every Dockerfile stage must require {argument}")
+    self.assertEqual(len(stages), dockerfile.count('case "$IMAGE_SOURCE_SHA256"'))
+    self.assertEqual(len(stages), dockerfile.count('case "$IMAGE_ARTIFACTS_SHA256"'))
+    self.assertNotIn("IMAGE_SOURCE_SHA256=unknown", dockerfile)
+    self.assertNotIn("IMAGE_ARTIFACTS_SHA256=unknown", dockerfile)
 
   def test_fingerprint_source_ignores_docs_lifecycle_and_project_configuration(self):
     with tempfile.TemporaryDirectory() as temporary:
@@ -102,26 +115,62 @@ class LifecycleCliTest(unittest.TestCase):
         self.assertNotEqual(baseline["image_source_sha256"],
             lifecycle.fingerprint_source()["image_source_sha256"])
 
-  def test_fingerprint_source_includes_built_runtime_jars_only_after_compilation(self):
+  def test_fingerprint_source_includes_target_specific_artifacts_and_cli_reports_hashes(self):
     with tempfile.TemporaryDirectory() as temporary:
       root = Path(temporary)
       for relative in lifecycle.IMAGE_SOURCE_FILES:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("source input\n")
-      for relative in lifecycle.IMAGE_BUILD_ARTIFACT_FILES:
+        path.write_text("source input" + chr(10))
+      artifact_files = sorted({relative for files in lifecycle.IMAGE_BUILD_ARTIFACTS_BY_TARGET.values()
+          for relative in files})
+      for relative in artifact_files:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("compiled jar\n")
+        path.write_text("compiled jar" + chr(10))
       with mock.patch.object(lifecycle, "ROOT", root):
         before_build = lifecycle.fingerprint_source()
-        built = lifecycle.fingerprint_source(include_build_artifacts=True)
-        self.assertEqual(3, built["image_artifact_file_count"])
+        runtime = lifecycle.fingerprint_source(include_build_artifacts=True)
+        issue6 = lifecycle.fingerprint_source(include_build_artifacts=True,
+            image_target="issue6-postconsume-test-runtime")
+        issue7 = lifecycle.fingerprint_source(include_build_artifacts=True,
+            image_target="issue7-store-recovery-test-runtime")
+        self.assertEqual(3, runtime["image_artifact_file_count"])
+        self.assertEqual(4, issue6["image_artifact_file_count"])
+        self.assertEqual(4, issue7["image_artifact_file_count"])
         self.assertNotIn("image_artifacts_sha256", before_build)
-        first_hash = built["image_artifacts_sha256"]
-        (root / lifecycle.IMAGE_BUILD_ARTIFACT_FILES[0]).write_text("different jar\n")
-        self.assertNotEqual(first_hash,
-            lifecycle.fingerprint_source(include_build_artifacts=True)["image_artifacts_sha256"])
+        test_artifact = root / lifecycle.IMAGE_BUILD_ARTIFACTS_BY_TARGET[
+            "issue6-postconsume-test-runtime"][-1]
+        test_artifact.write_text("different compiled injector jar" + chr(10))
+        changed_issue6 = lifecycle.fingerprint_source(include_build_artifacts=True,
+            image_target="issue6-postconsume-test-runtime")
+        unchanged_runtime = lifecycle.fingerprint_source(include_build_artifacts=True)
+        self.assertNotEqual(issue6["image_artifacts_sha256"],
+            changed_issue6["image_artifacts_sha256"])
+        self.assertEqual(runtime["image_artifacts_sha256"],
+            unchanged_runtime["image_artifacts_sha256"])
+        for target in lifecycle.IMAGE_BUILD_ARTIFACTS_BY_TARGET:
+          output = StringIO()
+          with redirect_stdout(output):
+            self.assertEqual(0, lifecycle.main(["image-fingerprints", "--target", target,
+                "--field", "image_artifacts_sha256"]))
+          self.assertRegex(output.getvalue().strip(), r"^[0-9a-f]{64}$")
+
+  def test_image_fingerprint_fails_closed_when_target_artifact_is_missing(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      for relative in lifecycle.IMAGE_SOURCE_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("source input" + chr(10))
+      for relative in lifecycle.IMAGE_BUILD_ARTIFACTS_BY_TARGET["runtime"]:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("runtime artifact" + chr(10))
+      with mock.patch.object(lifecycle, "ROOT", root):
+        with self.assertRaisesRegex(RuntimeError, "required container image artifact"):
+          lifecycle.fingerprint_source(include_build_artifacts=True,
+              image_target="issue6-postconsume-test-runtime")
 
   def test_preflight_runs_before_evidence_directory_is_created(self):
     with tempfile.TemporaryDirectory() as temporary:
@@ -194,6 +243,8 @@ class LifecycleCliTest(unittest.TestCase):
         return 0
 
       def fake_capture(command):
+        if command == ["git", "rev-parse", "--verify", "HEAD"]:
+          return subprocess.CompletedProcess([], 0, "c" * 40, "")
         if "{{json .}}" in command:
           payload = [{"Id": image_id, "Parent": "", "Config": {"Labels": {
               "io.decent.lifecycle.run-id": owner_run_id["value"]}}}]
@@ -208,7 +259,9 @@ class LifecycleCliTest(unittest.TestCase):
         return present
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
-          mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={
+              "image_source_sha256": "1" * 64, "image_artifacts_sha256": "2" * 64,
+              "image_artifact_file_count": 3}), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
           mock.patch.object(lifecycle, "run", side_effect=fake_run), \
@@ -269,6 +322,8 @@ class LifecycleCliTest(unittest.TestCase):
 
     def capture(command):
       nonlocal inventory_calls, changed
+      if command == ["git", "rev-parse", "--verify", "HEAD"]:
+        return subprocess.CompletedProcess([], 0, "c" * 40, "")
       if command[1:3] == ["image", "ls"]:
         inventory_calls += 1
         return subprocess.CompletedProcess([], 0, "\n".join(sorted(images)) + "\n", "")
@@ -326,9 +381,11 @@ class LifecycleCliTest(unittest.TestCase):
       changed_fingerprint = {**original_fingerprint, "image_artifacts_sha256": "c" * 64}
       fingerprint_results = [original_fingerprint, original_fingerprint,
           changed_fingerprint if change_image_inputs_after_build else original_fingerprint]
+      def fingerprint_source_for_run(**_kwargs):
+        return dict(fingerprint_results.pop(0))
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
-          mock.patch.object(lifecycle, "fingerprint_source", side_effect=fingerprint_results), \
+          mock.patch.object(lifecycle, "fingerprint_source", side_effect=fingerprint_source_for_run), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
           mock.patch.object(lifecycle, "run", side_effect=engine_run), \
@@ -501,6 +558,33 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertEqual(1, receipt["cleanup"]["unowned_new_image_count"])
     self.assertEqual("pass", receipt["cleanup"]["status"])
 
+  def test_git_revision_fingerprint_uses_committed_image_sources_not_dirty_worktree(self):
+    with tempfile.TemporaryDirectory(prefix="image-source-revision-") as temporary:
+      root = Path(temporary)
+      for relative in lifecycle.IMAGE_SOURCE_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"committed:{relative}".encode())
+      for relative in lifecycle.IMAGE_SOURCE_DIRECTORIES:
+        path = root / relative / "fingerprint-fixture.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"committed:{relative}".encode())
+      for command in (
+          ["git", "init", "--quiet"],
+          ["git", "config", "user.email", "fixture@example.invalid"],
+          ["git", "config", "user.name", "Fingerprint Fixture"],
+          ["git", "add", "--all"],
+          ["git", "commit", "--quiet", "-m", "image-source fixture"]):
+        subprocess.run(command, cwd=root, check=True, capture_output=True)
+      revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+      with mock.patch.object(lifecycle, "ROOT", root):
+        committed = lifecycle.fingerprint_image_source_at_revision(revision)
+        self.assertEqual(lifecycle.fingerprint_source(), committed)
+        changed_path = root / "container/Dockerfile"
+        changed_path.write_bytes(b"dirty source")
+        self.assertNotEqual(lifecycle.fingerprint_source(), committed)
+        self.assertEqual(committed, lifecycle.fingerprint_image_source_at_revision(revision))
+
   def test_promotion_requires_complete_live_receipt_and_explicit_image_retention(self):
     image_id = "sha256:" + "a" * 64
     gates = {
@@ -509,16 +593,39 @@ class LifecycleCliTest(unittest.TestCase):
     }
     receipt = {
         "profile": "issue5-live", "exit_code": 0, "run_id": "abc",
-        "source": {"image_source_sha256": "d" * 64, "image_source_file_count": 11,
-            "image_artifacts_sha256": "e" * 64, "image_artifact_file_count": 3},
+        "source": {"source_revision": "f" * 40, "image_source_sha256": "d" * 64,
+            "image_source_file_count": 11, "image_artifacts_sha256": "e" * 64,
+            "image_artifact_file_count": 3},
         "issue5_acceptance_gates": gates,
-        "image": {"status": "built", "engine": "podman", "run_owned_tag": "decent-keycloak-wallet-provider:lifecycle-abc",
+        "image": {"status": "built", "engine": "podman",
+            "run_owned_tag": f"{lifecycle.IMAGE_NAME}:lifecycle-abc",
             "immutable_id": image_id, "retention_requested": True, "retained": True},
         "cleanup": {"status": "pass", "image_retained": True, "retained_image_id": image_id},
     }
+    metadata = {"Id": image_id, "Config": {"Labels": {
+        "io.decent.image.repository": "https://github.com/jetpen/decent-keycloak",
+        "io.decent.image.component": "decent-keycloak", "io.decent.image.role": "wallet-provider",
+        "io.decent.lifecycle.run-id": "abc", "io.decent.image.source-revision": "f" * 40,
+        "io.decent.image.source-sha256": "d" * 64, "io.decent.image.artifacts-sha256": "e" * 64}}}
+    self.assertTrue(lifecycle.promotion_image_provenance_matches(metadata, receipt))
+    metadata["Config"]["Labels"]["io.decent.image.source-revision"] = "a" * 40
+    self.assertFalse(lifecycle.promotion_image_provenance_matches(metadata, receipt))
+    metadata["Config"]["Labels"]["io.decent.image.source-revision"] = "f" * 40
+    metadata["Id"] = "sha256:" + "b" * 64
+    self.assertFalse(lifecycle.promotion_image_provenance_matches(metadata, receipt))
 
-    self.assertEqual(("podman", "decent-keycloak-wallet-provider:lifecycle-abc", image_id),
-        lifecycle.promotion_source_from_receipt(receipt))
+    with mock.patch.object(lifecycle, "fingerprint_image_source_at_revision",
+        return_value={"image_source_sha256": "d" * 64, "image_source_file_count": 11}):
+      self.assertEqual(("podman", f"{lifecycle.IMAGE_NAME}:lifecycle-abc", image_id, "f" * 40),
+          lifecycle.promotion_source_from_receipt(receipt))
+    recorded_source = receipt["source"]
+    receipt["source"] = {**recorded_source,
+        "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"],
+            cwd=ROOT, text=True).strip(),
+        "image_source_sha256": "0" * 64}
+    with self.assertRaisesRegex(ValueError, "source fingerprint does not match source revision"):
+      lifecycle.promotion_source_from_receipt(receipt)
+    receipt["source"] = recorded_source
     receipt["cleanup"]["image_retained"] = False
     with self.assertRaisesRegex(ValueError, "cleanup retention does not match"):
       lifecycle.promotion_source_from_receipt(receipt)
@@ -527,13 +634,31 @@ class LifecycleCliTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "cleanup retention does not match"):
       lifecycle.promotion_source_from_receipt(receipt)
     receipt["cleanup"]["retained_image_id"] = image_id
-    receipt["image"]["run_owned_tag"] = "decent-keycloak-wallet-provider:lifecycle-other"
+    receipt["image"]["run_owned_tag"] = f"{lifecycle.IMAGE_NAME}:lifecycle-other"
     with self.assertRaisesRegex(ValueError, "tag does not match"):
       lifecycle.promotion_source_from_receipt(receipt)
-    receipt["image"]["run_owned_tag"] = "decent-keycloak-wallet-provider:lifecycle-abc"
+    receipt["image"]["run_owned_tag"] = f"{lifecycle.IMAGE_NAME}:lifecycle-abc"
     receipt["issue5_acceptance_gates"]["exact_missing_identity"] = "not_run"
     with self.assertRaisesRegex(ValueError, "acceptance gates"):
       lifecycle.promotion_source_from_receipt(receipt)
+
+  def test_promotion_only_accepts_source_commits_on_fresh_trusted_main(self):
+    trusted = subprocess.CompletedProcess([], 0, "", "")
+    unmerged = subprocess.CompletedProcess([], 1, "", "")
+    with mock.patch.object(lifecycle, "capture_command", side_effect=[trusted, trusted]) as capture:
+      self.assertTrue(lifecycle.is_trusted_promotion_revision("a" * 40))
+    self.assertEqual([
+        mock.call([
+            "git", "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"]),
+        mock.call(["git", "merge-base", "--is-ancestor", "a" * 40, "origin/main"]),
+    ], capture.call_args_list)
+    with mock.patch.object(lifecycle, "capture_command", side_effect=[trusted, unmerged]):
+      self.assertFalse(lifecycle.is_trusted_promotion_revision("b" * 40))
+    with mock.patch.object(lifecycle, "capture_command", return_value=unmerged) as capture:
+      self.assertFalse(lifecycle.is_trusted_promotion_revision("c" * 40))
+    capture.assert_called_once_with([
+        "git", "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"])
+    self.assertFalse(lifecycle.is_trusted_promotion_revision("not-a-commit"))
 
   def test_promotion_manifest_witness_binds_manifest_and_config_to_accepted_image_id(self):
     image_id = "sha256:" + "a" * 64
@@ -552,6 +677,11 @@ class LifecycleCliTest(unittest.TestCase):
   def test_release_candidate_destination_rejects_credentials_and_non_rc_tags(self):
     valid = "docker://registry.example.invalid/team/provider:v1.0.0-rc.1"
     self.assertEqual(valid, lifecycle.validate_release_candidate_destination(valid))
+    digest = "sha256:" + "a" * 64
+    self.assertEqual("registry.example.invalid/team/provider:v1.0.0-rc.1@" + digest,
+        lifecycle.immutable_registry_reference(valid, digest))
+    with self.assertRaisesRegex(ValueError, "digest"):
+      lifecycle.immutable_registry_reference(valid, "latest")
     for invalid in (
         "docker://user@registry.example.invalid/team/provider:v1.0.0-rc.1",
         "docker://registry.example.invalid/team/provider:latest",

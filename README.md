@@ -34,34 +34,55 @@ python3.11 scripts/lifecycle.py run issue5-live --allow-live
 
 Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry. Retaining a local image is a separate opt-in (`--retain-image`) and does not publish it. Registry promotion is a separate command that requires a successful, fully gated `issue5-live` receipt, the retained image's exact immutable ID, an explicit release-candidate destination, and `--allow-publish`; it pushes and reads back the registry manifest before reporting success. No destination or publication is configured by default.
 
-## Build an installable local image
+Repository-built image inventory:
 
-No release image is published by this repository. The offline lifecycle removes its temporary image by default after smoke testing; `--retain-image` is an explicit opt-in to keep that exact local image and is not a publication step. To keep a separately built local image for evaluation, first run the offline lifecycle above. The following Podman example assumes the lifecycle prerequisites are installed and pinned base images are already present locally; it leaves the resulting image in Podman and removes its temporary source and dependency downloads:
+| Dockerfile target / role | Purpose and consumers | Lifecycle |
+|---|---|---|
+| `runtime` / `wallet-provider` | Installable Keycloak 26.8.0 provider image; offline lifecycle smoke and opt-in local/live acceptance profiles consume the exact immutable ID. | Run-scoped tagged build, removed by default; explicit `--retain-image` for local consumers or trusted promotion. |
+| `issue7-user-readback-test-runtime` / `wallet-provider-issue7-user-readback-test` | Isolated Issue #7 fault-injection provider for its recovery profile and tests. | Temporary test artifact; never a release role. |
+| `issue7-store-recovery-test-runtime` / `wallet-provider-issue7-store-recovery-test` | Isolated Issue #7 datastore-fault provider. | Temporary test artifact; never a release role. |
+| `issue6-postconsume-test-runtime` / `wallet-provider-issue6-postconsume-test` | Isolated Issue #6 post-consume receipt-failure provider. | Temporary test artifact; never a release role. |
+| `issue6-callback-gate-test-runtime` / `wallet-provider-issue6-callback-gate-test` | Isolated Issue #6 callback-gate fault provider. | Temporary test artifact; never a release role. |
+| `resolver-builder`, `keycloak-with-resolver` / intermediate roles | Build intermediates only. | Run-owned intermediates are removed by bounded lifecycle teardown; never promotion targets. |
+
+`container/Dockerfile` pins upstream UBI and Keycloak bases by digest. They are not this repository's artifacts and are excluded from the local age cleaner; builder caches are also out of scope. The only tracked CI workflow is `.github/workflows/acceptance.yml`: it runs the canonical offline lifecycle for pull requests, and neither publishes images nor grants package-write permissions. The `decent-integration-test` repository currently documents Identity CLI integration tests rather than consuming this Keycloak image; no remote image consumer is verified.
+
+## Build and retain a local image
+
+The canonical lifecycle builds the component-and-role image `localhost/decent-keycloak/wallet-provider`, labels it with the source revision and source/artifact fingerprints, and writes the exact immutable image ID to its sanitized receipt. The lifecycle's run tag is unique; use the receipt's `image.immutable_id` for same-machine consumers rather than resolving a mutable tag later. Podman consumers in this and other checkouts share the same per-user local image store; no local registry or remote push is needed.
 
 ```bash
-set -eu
-mvn --batch-mode --no-transfer-progress clean package
-source_parent="$(mktemp -d)"
-trap 'rm -rf -- "$source_parent"' EXIT
-sources="$source_parent/sources"
-dependencies="$source_parent/binary-dependencies"
-python3.11 container/build_resolver_runtime.py \
-  --materialize-sources --sources-directory "$sources"
-python3.11 container/build_resolver_runtime.py \
-  --materialize-binary-dependencies --binary-dependencies-directory "$dependencies"
-python3.11 container/verify_resolver_runtime_inputs.py --sources "$sources" \
-  --dependencies "$dependencies"
-podman build --no-cache --pull=never --network=none \
-  --build-context "identity-src=$sources/identity" \
-  --build-context "registry-src=$sources/registry" \
-  --build-context "binary-dependencies=$dependencies" \
-  --file container/Dockerfile --target runtime \
-  --tag localhost/decent-keycloak-wallet-provider:local .
+python3.11 scripts/lifecycle.py run offline --retain-image
+# Read image.immutable_id and image.run_owned_tag from target/lifecycle/evidence/<run-id>.json
 podman run --rm --entrypoint /opt/keycloak/bin/kc.sh \
-  localhost/decent-keycloak-wallet-provider:local --version
+  "sha256:<immutable-image-id>" --version
 ```
 
-The image is an optimized Keycloak 26.8.0 runtime containing this provider and the pinned resolver runtime. Use it as the Keycloak image in a disposable evaluation environment. Do not deploy this development target to production. To pull pinned base images during the build, use an explicit authorized image-pull workflow; the lifecycle's Podman default is `--pull=never`.
+The default lifecycle removes its run-owned image after smoke testing. `--retain-image` is explicit and is not a publication action. The `offline` and `ci` profiles never publish. The PR workflow is pull-request-only, has `contents: read`, and contains no login, push, or package-publication step. Trusted release promotion is a separate manual `scripts/lifecycle.py promote` action and requires a successful gated receipt, a retained immutable source image, an explicit destination, `--allow-publish`, and a source commit already merged into `origin/main`; the command rejects unmerged PR revisions. Publishing does not itself qualify provider/Registry behavior. Consumers of a published image must pin the returned registry manifest digest (`registry/repository@sha256:…`), not its mutable tag.
+
+Repository-built images carry repository/component/role and source-revision labels. The canonical runtime lifecycle additionally labels its image-source and compiled-artifact fingerprints; its temporary tag includes the `lifecycle-<run-id>`. See [Issue #26 lifecycle evidence](docs/acceptance/issue-26-image-lifecycle.md) for the target inventory and verified provenance details.
+
+## Local image retention and cleanup
+
+Run the safe cleanup command periodically (for example, from a user-owned scheduled job). It removes only images with all exact `io.decent.image.*` repository/component/role labels that are older than three days, and only after read-back confirms the same image ID/labels and no container uses it. It never runs `image prune`, and never selects upstream bases, builder caches, unlabeled images, recent images, pinned images, or active-container images.
+
+```bash
+python3.11 scripts/image_lifecycle.py cleanup
+DECENT_IMAGE_RETENTION_DAYS=7 python3.11 scripts/image_lifecycle.py cleanup
+python3.11 scripts/image_lifecycle.py pin sha256:<immutable-image-id> integration-test
+python3.11 scripts/image_lifecycle.py extend sha256:<immutable-image-id> 14
+python3.11 scripts/image_lifecycle.py unpin sha256:<immutable-image-id> integration-test
+```
+
+The `pin-*` tag protects an image indefinitely until removed with `unpin`; `retain-until-<UTC timestamp>` tags created by `extend` protect it until that expiry. Extension days are bounded to 1–3650. Cleanup checks active containers both before selection and immediately before removal, and fails closed if inventory, ownership readback, or removal verification is inconclusive.
+
+## Remote promotion and retention policy
+
+Local builds and PR CI do not publish. Remote promotion is a separate, explicit maintainer action that requires a passing gated receipt, a retained immutable source image, a trusted source commit, an explicit destination, and `--allow-publish`. Published consumers must use the returned manifest digest, not a mutable release-candidate tag. The current verification limits and interim expiry/release procedure are recorded in [Issue #26 lifecycle evidence](docs/acceptance/issue-26-image-lifecycle.md).
+
+Before publishing to any registry, verify its package permissions and retention behavior. Do not configure GHCR or claim a package is available until that check succeeds. Keep a release-candidate manifest while a named downstream consumer still uses its digest; review unconsumed candidates every 30 days and retire unconsumed candidates within 90 days after confirming no consumer references them. Any extension requires a named owner, reason, and next review date. Delete only the exact candidate tag after the no-consumer check, then verify the tag is absent. These are interim review intervals, not verified registry-enforced expiry limits; see the linked evidence for the unresolved registry/consumer constraints.
+
+The image is an experimental Keycloak 26.8.0 runtime and is not production-ready. Building or publishing it is not wallet-login or Registry acceptance qualification. For local prerequisites and lifecycle details, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Configure a disposable realm
 

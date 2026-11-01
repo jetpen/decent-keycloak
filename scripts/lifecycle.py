@@ -34,6 +34,7 @@ PYTHON_TESTS = (
   "scripts.test_acceptance_workflow",
   "scripts.test_issue6_single_node_profile",
   "scripts.test_lifecycle",
+  "scripts.test_image_lifecycle",
 )
 PROFILES = {
   "offline": {
@@ -507,22 +508,62 @@ IMAGE_BUILD_ARTIFACT_FILES = (
   "target/providers/java-json-canonicalization-1.1.jar",
   "target/providers/core-3.4.0.jar",
 )
+IMAGE_BUILD_ARTIFACTS_BY_TARGET = {
+  "runtime": IMAGE_BUILD_ARTIFACT_FILES,
+  "issue7-user-readback-test-runtime": IMAGE_BUILD_ARTIFACT_FILES + (
+    "target/issue7-user-readback-provider.jar",),
+  "issue7-store-recovery-test-runtime": IMAGE_BUILD_ARTIFACT_FILES + (
+    "target/issue7-fault-provider.jar",),
+  "issue6-postconsume-test-runtime": IMAGE_BUILD_ARTIFACT_FILES + (
+    "target/issue6-postconsume-receipt-failure-provider.jar",),
+  "issue6-callback-gate-test-runtime": IMAGE_BUILD_ARTIFACT_FILES + (
+    "target/issue6-postconsume-callback-gate-failure-provider.jar",),
+}
+
+
+def _digest_named_contents(items: list[tuple[str, bytes]]) -> tuple[str, int]:
+  digest = hashlib.sha256()
+  for relative, payload in sorted(items):
+    relative_bytes = relative.encode("utf-8")
+    digest.update(len(relative_bytes).to_bytes(4, "big"))
+    digest.update(relative_bytes)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+  return digest.hexdigest(), len(items)
 
 
 def _digest_named_files(paths: list[Path]) -> tuple[str, int]:
-  digest = hashlib.sha256()
-  for path in sorted(paths):
-    relative = path.relative_to(ROOT).as_posix().encode("utf-8")
-    payload = path.read_bytes()
-    digest.update(len(relative).to_bytes(4, "big"))
-    digest.update(relative)
-    digest.update(len(payload).to_bytes(8, "big"))
-    digest.update(payload)
-  return digest.hexdigest(), len(paths)
+  return _digest_named_contents([
+      (path.relative_to(ROOT).as_posix(), path.read_bytes()) for path in paths])
 
 
-def fingerprint_source(*, include_build_artifacts: bool = False) -> dict:
-  """Fingerprint only repository inputs used to construct the container image."""
+def fingerprint_image_source_at_revision(source_revision: str) -> dict:
+  """Read image-source inputs from a Git commit, excluding worktree-only changes."""
+  if re.fullmatch(r"[0-9a-f]{40,64}", source_revision) is None:
+    raise ValueError("source revision is invalid")
+  command = ["git", "ls-tree", "-r", "--name-only", "-z", source_revision,
+      "--", *IMAGE_SOURCE_DIRECTORIES]
+  tree = subprocess.run(command, cwd=ROOT, capture_output=True, check=False)
+  if tree.returncode:
+    raise ValueError("source revision is unavailable")
+  source_paths: set[str] = set(IMAGE_SOURCE_FILES)
+  for raw_path in tree.stdout.split(b"\0"):
+    if raw_path:
+      source_paths.add(raw_path.decode("utf-8"))
+  contents = []
+  for relative in sorted(source_paths):
+    result = subprocess.run(["git", "show", f"{source_revision}:{relative}"],
+        cwd=ROOT, capture_output=True, check=False)
+    if result.returncode:
+      raise ValueError("source revision lacks an image source input")
+    contents.append((relative, result.stdout))
+  source_hash, source_count = _digest_named_contents(contents)
+  return {"image_source_sha256": source_hash, "image_source_file_count": source_count}
+
+
+def fingerprint_source(*, include_build_artifacts: bool = False,
+    image_target: str = "runtime") -> dict:
+  """Fingerprint repository inputs and target-specific artifacts used by an image."""
   source_paths = {ROOT / relative for relative in IMAGE_SOURCE_FILES}
   for relative in IMAGE_SOURCE_DIRECTORIES:
     directory = ROOT / relative
@@ -537,7 +578,10 @@ def fingerprint_source(*, include_build_artifacts: bool = False) -> dict:
     "image_source_file_count": source_count,
   }
   if include_build_artifacts:
-    artifact_paths = [ROOT / relative for relative in IMAGE_BUILD_ARTIFACT_FILES]
+    artifact_files = IMAGE_BUILD_ARTIFACTS_BY_TARGET.get(image_target)
+    if artifact_files is None:
+      raise ValueError("unknown container image target for artifact fingerprint")
+    artifact_paths = [ROOT / relative for relative in artifact_files]
     if any(not path.is_file() for path in artifact_paths):
       raise RuntimeError("unable to fingerprint a required container image artifact")
     artifact_hash, artifact_count = _digest_named_files(artifact_paths)
@@ -599,11 +643,18 @@ def _record_step(receipt: dict, path: Path, name: str, status: str, *, detail: s
   write_receipt(path, receipt)
 
 
+IMAGE_NAME = "localhost/decent-keycloak/wallet-provider"
+
+
 def _engine_command(engine: str, tag: str, sources: Path, dependencies: Path,
-    *, run_id: str) -> list[str]:
+    *, run_id: str, source_revision: str = "unknown", source_sha256: str = "unknown",
+    artifacts_sha256: str = "unknown") -> list[str]:
   identity = str(sources / "identity")
   registry = str(sources / "registry")
-  build_args = ["--build-arg", f"LIFECYCLE_RUN_ID={run_id}"]
+  build_args = ["--build-arg", f"LIFECYCLE_RUN_ID={run_id}",
+      "--build-arg", f"SOURCE_REVISION={source_revision}",
+      "--build-arg", f"IMAGE_SOURCE_SHA256={source_sha256}",
+      "--build-arg", f"IMAGE_ARTIFACTS_SHA256={artifacts_sha256}"]
   if engine == "docker":
     return ["docker", "buildx", "build", "--platform", "linux/amd64", "--pull",
             "--no-cache", "--load", "--network=none", *build_args, "--build-context",
@@ -923,7 +974,7 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
   }
   write_receipt(receipt_path, receipt)
   engine = container_engine()
-  tag = f"decent-keycloak-wallet-provider:lifecycle-{run_id}"
+  tag = f"{IMAGE_NAME}:lifecycle-{run_id}"
   built_image_id: str | None = None
   image_build_started = False
   baseline_image_ids: set[str] | None = None
@@ -997,7 +1048,13 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       _record_step(receipt, receipt_path, "provider-image", "fail",
                    detail="image_source_changed_during_lifecycle")
       return 2
-    receipt["source"] = build_fingerprint
+    revision_result = capture_command(["git", "rev-parse", "--verify", "HEAD"])
+    if revision_result.returncode or not re.fullmatch(r"[0-9a-f]{40,64}", revision_result.stdout.strip()):
+      _record_step(receipt, receipt_path, "provider-image", "fail", detail="source_revision_unavailable")
+      return 2
+    source_revision = revision_result.stdout.strip()
+    receipt["source"] = dict(build_fingerprint)
+    receipt["source"]["source_revision"] = source_revision
     write_receipt(receipt_path, receipt)
     baseline_image_ids = _image_inventory(engine)
     receipt["image"]["baseline_image_count"] = len(baseline_image_ids)
@@ -1009,7 +1066,10 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
     if before.returncode == 0:
       _record_step(receipt, receipt_path, "provider-image", "fail", detail="run_owned_tag_collision")
       return 2
-    build_command = _engine_command(engine, tag, sources, dependencies, run_id=run_id)
+    build_command = _engine_command(engine, tag, sources, dependencies, run_id=run_id,
+        source_revision=source_revision,
+        source_sha256=build_fingerprint["image_source_sha256"],
+        artifacts_sha256=build_fingerprint["image_artifacts_sha256"])
     if engine == "podman" and pull_base:
       build_command[build_command.index("--pull=never")] = "--pull=always"
     image_build_started = True
@@ -1022,7 +1082,7 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       _record_step(receipt, receipt_path, "provider-image", "fail", detail=f"exit_{result}")
       return result
     post_build_fingerprint = fingerprint_source(include_build_artifacts=True)
-    if post_build_fingerprint != receipt["source"]:
+    if post_build_fingerprint != build_fingerprint:
       _record_step(receipt, receipt_path, "provider-image", "fail",
                    detail="image_inputs_changed_during_build")
       return 2
@@ -1259,7 +1319,7 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       raise SystemExit(cleanup_code)
 
 
-def promotion_source_from_receipt(receipt: object) -> tuple[str, str, str]:
+def promotion_source_from_receipt(receipt: object) -> tuple[str, str, str, str]:
   """Require a complete successful Issue #5 live receipt and its retained immutable image."""
   if not isinstance(receipt, dict) or receipt.get("profile") != "issue5-live" or receipt.get("exit_code") != 0:
     raise ValueError("promotion requires a successful issue5-live receipt")
@@ -1285,10 +1345,10 @@ def promotion_source_from_receipt(receipt: object) -> tuple[str, str, str]:
     raise ValueError("promotion receipt has an unsupported image engine")
   image_id = normalize_image_id(image.get("immutable_id", ""))
   tag = image.get("run_owned_tag")
-  if (not isinstance(tag, str) or tag != f"decent-keycloak-wallet-provider:lifecycle-{receipt.get('run_id')}"):
+  if (not isinstance(tag, str) or tag != f"{IMAGE_NAME}:lifecycle-{receipt.get('run_id')}"):
     raise ValueError("promotion receipt run-owned tag does not match its lifecycle run ID")
   if image_id is None or not isinstance(tag, str) or not tag.startswith(
-      "decent-keycloak-wallet-provider:lifecycle-"):
+      IMAGE_NAME + ":lifecycle-"):
     raise ValueError("promotion receipt has invalid immutable image provenance")
   if (cleanup.get("image_retained") is not True
       or normalize_image_id(cleanup.get("retained_image_id", "")) != image_id):
@@ -1296,17 +1356,57 @@ def promotion_source_from_receipt(receipt: object) -> tuple[str, str, str]:
   source = receipt.get("source")
   if not isinstance(source, dict):
     raise ValueError("promotion receipt lacks source provenance")
+  source_revision = source.get("source_revision")
   source_hash = source.get("image_source_sha256")
   source_file_count = source.get("image_source_file_count")
   artifact_hash = source.get("image_artifacts_sha256")
   artifact_file_count = source.get("image_artifact_file_count")
-  if (not isinstance(source_hash, str) or re.fullmatch(r"[0-9a-f]{64}", source_hash) is None
+  if (not isinstance(source_revision, str) or re.fullmatch(r"[0-9a-f]{40,64}", source_revision) is None
+      or not isinstance(source_hash, str) or re.fullmatch(r"[0-9a-f]{64}", source_hash) is None
       or type(source_file_count) is not int or source_file_count < 1
       or not isinstance(artifact_hash, str)
       or re.fullmatch(r"[0-9a-f]{64}", artifact_hash) is None
       or type(artifact_file_count) is not int or artifact_file_count != len(IMAGE_BUILD_ARTIFACT_FILES)):
     raise ValueError("promotion receipt lacks complete image-input fingerprints")
-  return engine, tag, image_id
+  revision_fingerprint = fingerprint_image_source_at_revision(source_revision)
+  if (revision_fingerprint["image_source_sha256"] != source_hash
+      or revision_fingerprint["image_source_file_count"] != source_file_count):
+    raise ValueError("promotion image source fingerprint does not match source revision")
+  return engine, tag, image_id, source_revision
+
+
+def promotion_image_provenance_matches(metadata: dict | None, receipt: object) -> bool:
+  if not isinstance(metadata, dict) or not isinstance(receipt, dict):
+    return False
+  image = receipt.get("image")
+  source = receipt.get("source")
+  if not isinstance(image, dict) or not isinstance(source, dict):
+    return False
+  labels = _image_labels(metadata)
+  return (
+      _normalize_image_metadata_id(metadata) == normalize_image_id(image.get("immutable_id", ""))
+      and labels.get("io.decent.image.repository") == "https://github.com/jetpen/decent-keycloak"
+      and labels.get("io.decent.image.component") == "decent-keycloak"
+      and labels.get("io.decent.image.role") == "wallet-provider"
+      and labels.get("io.decent.lifecycle.run-id") == receipt.get("run_id")
+      and labels.get("io.decent.image.source-revision") == source.get("source_revision")
+      and labels.get("io.decent.image.source-sha256") == source.get("image_source_sha256")
+      and labels.get("io.decent.image.artifacts-sha256") == source.get("image_artifacts_sha256"))
+
+
+def _normalize_image_metadata_id(metadata: dict) -> str | None:
+  return normalize_image_id(str(metadata.get("Id", "")))
+
+
+def is_trusted_promotion_revision(source_revision: str) -> bool:
+  if re.fullmatch(r"[0-9a-f]{40,64}", source_revision) is None:
+    return False
+  fetch = capture_command([
+      "git", "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"])
+  if fetch.returncode != 0:
+    return False
+  result = capture_command(["git", "merge-base", "--is-ancestor", source_revision, "origin/main"])
+  return result.returncode == 0
 
 
 def manifest_identity(raw_manifest: bytes, expected_image_id: str) -> tuple[str, str]:
@@ -1335,6 +1435,13 @@ def validate_release_candidate_destination(destination: str) -> str:
   return destination
 
 
+def immutable_registry_reference(destination: str, manifest_digest: str) -> str:
+  destination = validate_release_candidate_destination(destination)
+  if not isinstance(manifest_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None:
+    raise ValueError("registry manifest digest is invalid")
+  return destination[len("docker://"):] + "@" + manifest_digest
+
+
 def capture_binary_command(command: list[str]) -> subprocess.CompletedProcess[bytes]:
   print("+ " + shlex.join(command), flush=True)
   return subprocess.run(command, cwd=ROOT, capture_output=True, check=False)
@@ -1351,9 +1458,12 @@ def run_promotion(receipt_path: str, destination: str, *, allow_publish: bool) -
       path = ROOT / path
     raw_receipt = path.read_bytes()
     receipt = json.loads(raw_receipt)
-    engine, source_tag, image_id = promotion_source_from_receipt(receipt)
+    engine, source_tag, image_id, source_revision = promotion_source_from_receipt(receipt)
   except (OSError, json.JSONDecodeError, ValueError) as error:
     print(f"promotion preflight failed: {type(error).__name__}: {error}", file=sys.stderr)
+    return 2
+  if not is_trusted_promotion_revision(source_revision):
+    print("promotion requires an image built from a commit already merged into origin/main", file=sys.stderr)
     return 2
   if not check_tool("container engine", [engine, "--version"], "version"):
     return 2
@@ -1367,7 +1477,7 @@ def run_promotion(receipt_path: str, destination: str, *, allow_publish: bool) -
     return 2
 
   promotion_id = uuid.uuid4().hex
-  temporary_tag = f"localhost/decent-issue5-promotion:{promotion_id}"
+  temporary_tag = f"{IMAGE_NAME}:promotion-{promotion_id}"
   promotion_path = ROOT / "target/lifecycle/promotions" / f"{promotion_id}.json"
   promotion = {
       "schema_version": 1,
@@ -1392,6 +1502,11 @@ def run_promotion(receipt_path: str, destination: str, *, allow_publish: bool) -
     source_check = capture_command(_image_inspect_command(engine, source_tag))
     if source_check.returncode or normalize_image_id(source_check.stdout) != image_id:
       promotion["failure_category"] = "retained_source_image_mismatch"
+      failure_code = 2
+      return failure_code
+    metadata = _image_metadata(engine, image_id)
+    if not promotion_image_provenance_matches(metadata, receipt):
+      promotion["failure_category"] = "retained_image_provenance_mismatch"
       failure_code = 2
       return failure_code
     tag_command = _image_tag_command(engine, source_tag, temporary_tag)
@@ -1461,6 +1576,9 @@ def run_promotion(receipt_path: str, destination: str, *, allow_publish: bool) -
       promotion["failure_category"] = "promotion_failed"
     write_receipt(promotion_path, promotion)
     print(f"promotion receipt: {promotion_path}")
+    if failure_code == 0:
+      print("promotion immutable reference: " + immutable_registry_reference(
+          destination, promotion["registry_manifest_digest"]))
   return failure_code
 
 
@@ -1475,6 +1593,11 @@ def main(argv: list[str] | None = None) -> int:
   subparsers.add_parser("verify-surefire", help="require nonempty passing Surefire reports")
   subparsers.add_parser("verify-provider", help="verify production provider SPI registration")
   subparsers.add_parser("diff-check", help="validate committed-base, staged, unstaged and untracked whitespace")
+  image_fingerprints_parser = subparsers.add_parser("image-fingerprints",
+      help="print source/artifact fingerprints for a Dockerfile image target")
+  image_fingerprints_parser.add_argument("--target", choices=sorted(IMAGE_BUILD_ARTIFACTS_BY_TARGET), required=True)
+  image_fingerprints_parser.add_argument("--field",
+      choices=("image_source_sha256", "image_artifacts_sha256"), required=True)
   run_parser = subparsers.add_parser("run", help="run a named lifecycle profile")
   run_parser.add_argument("profile", choices=sorted(PROFILES))
   run_parser.add_argument("--plan", action="store_true", help="print the plan without running it")
@@ -1484,7 +1607,7 @@ def main(argv: list[str] | None = None) -> int:
                           help="allow the Podman engine to pull pinned base images")
   run_parser.add_argument("--retain-image", action="store_true",
                           help="explicitly retain this run's immutable local image after receipt finalization")
-  promote_parser = subparsers.add_parser("promote", help="promote an accepted retained image to a release-candidate registry tag")
+  promote_parser = subparsers.add_parser("promote", help="promote an accepted image built from a commit merged into origin/main")
   promote_parser.add_argument("--receipt", required=True, help="successful issue5-live lifecycle receipt")
   promote_parser.add_argument("--destination", required=True, help="explicit docker:// registry/repository:rc-tag")
   promote_parser.add_argument("--allow-publish", action="store_true", required=True,
@@ -1507,6 +1630,14 @@ def main(argv: list[str] | None = None) -> int:
     return verify_provider()
   if args.action == "diff-check":
     return diff_check()
+  if args.action == "image-fingerprints":
+    try:
+      fingerprints = fingerprint_source(include_build_artifacts=True, image_target=args.target)
+    except (OSError, RuntimeError, ValueError) as error:
+      print(f"image fingerprint failed: {type(error).__name__}: {error}", file=sys.stderr)
+      return 2
+    print(fingerprints[args.field])
+    return 0
   if args.action == "promote":
     return run_promotion(args.receipt, args.destination, allow_publish=args.allow_publish)
   if args.profile == "issue5-live" and not args.allow_live:
