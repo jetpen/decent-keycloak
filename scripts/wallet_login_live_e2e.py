@@ -162,7 +162,7 @@ def read_provider_fault_log_window(container_id, cursor, *, strict=False):
   if not isinstance(container_id, str) or re.fullmatch(r'[0-9a-f]{64}', container_id) is None:
     raise ValueError('container ID is invalid')
   if not isinstance(cursor, str) or not re.fullmatch(
-      r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z', cursor):
+      r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3,6}Z', cursor):
     raise ValueError('invalid UTC log cursor')
   logs = _bounded_command_tail(
       ['podman', 'logs', '--since', cursor, '--tail', '160', container_id])
@@ -1008,7 +1008,8 @@ def sanitize_live_checkpoint(candidate):
       'keycloak_config_read_status',
       'keycloak_config_fields_present', 'runtime_qualification_status', 'provenance_probe_stage',
       'profile', 'node_count', 'database', 'cache',
-      'single_use_object_provider_evidence', 'credential_file_retained',
+      'single_use_object_provider_evidence', 'transaction_consume_witness_count',
+      'credential_file_retained',
   }
   runtime_identity_keys = {'single_use_object_provider_path',
       'single_use_object_provider_evidence', 'runtime_qualification_status'}
@@ -1070,7 +1071,7 @@ def sanitize_live_checkpoint(candidate):
       'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
       'issue5_profile',
       'issue7_single_node_signup_recovery', 'issue7_store_recovery',
-      'account_denial_concurrency',
+      'account_denial_concurrency', 'account_denial_cases',
   }
   runtime_candidate = candidate.get('resolver_runtime')
   if isinstance(runtime_candidate, dict):
@@ -1080,6 +1081,28 @@ def sanitize_live_checkpoint(candidate):
           and case_value.get('single_use_object_provider_evidence') == 'request_correlated_consumed_transaction'):
         runtime_candidate.update({field: case_value[field] for field in runtime_identity_keys
             if field in case_value})
+    matrix = candidate.get('registry_matrix')
+    current = matrix.get('current_identity') if isinstance(matrix, dict) else None
+    attempts = current.get('attempts') if isinstance(current, dict) else None
+    witnesses = [attempt for attempt in attempts if isinstance(attempt, dict)
+        and attempt.get('transaction_consume_marker_count') == 1
+        and isinstance(attempt.get('transaction_consume_marker'), str)
+        and attempt.get('provider_http') == 202
+        and attempt.get('transaction_consume_witness') == 'observed'
+        and attempt.get('transaction_consume_provider_id')
+            in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS] if isinstance(attempts, list) else []
+    witness_provider_ids = {attempt['transaction_consume_provider_id']
+        for attempt in witnesses}
+    runtime_candidate.pop('transaction_consume_witness_count', None)
+    if witnesses and len(witness_provider_ids) == 1:
+      provider_id = next(iter(witness_provider_ids))
+      runtime_candidate['single_use_object_provider_path'] = provider_id
+      runtime_candidate['single_use_object_provider_evidence'] = (
+          'request_correlated_consumed_transaction')
+      runtime_candidate['transaction_consume_witness_count'] = len(witnesses)
+      runtime_candidate['runtime_qualification_status'] = (
+          'runtime_facts_verified' if runtime_qualification_is_verified(runtime_candidate)
+          else 'open_runtime_facts_unavailable')
   signup_stages = issue7_store_recovery.CONFIRMED_PHASES | {'complete', 'unclassified'}
   rotation_stages = {'publish', 'readback', 'stale_proof', 'stale_pending', 'stale_attempt',
       'stale_proof_pending', 'current_proof', 'current_attempt', 'current_accepted', 'callback', 'complete', 'mapping'}
@@ -1277,6 +1300,8 @@ def sanitize_live_checkpoint(candidate):
       return value == 'local'
     if field == 'provenance_probe_stage':
       return value in {'keycloak_starting', 'admin_token', 'runtime_read', 'cleanup', 'complete'}
+    if field == 'transaction_consume_witness_count':
+      return type(value) is int and 1 <= value <= 2
     if field == 'single_use_object_provider_evidence':
       return value in {'not_observed', 'request_correlated_consumed_transaction'}
     if field == 'credential_file_retained':
@@ -1332,6 +1357,26 @@ def sanitize_live_checkpoint(candidate):
   for key, value in candidate.items():
     if key not in allowed or not isinstance(value, dict):
       continue
+    if key == 'account_denial_cases':
+      expected_cases = {'unmapped-account', 'disabled-account', 'ambiguous-account'}
+      if set(value) != expected_cases:
+        continue
+      safe_cases = {}
+      case_fields = {'current_registry_proof_http', 'outcome',
+          'local_account_mapping_decision_observed', 'request_correlated_denial',
+          'status_pending', 'no_acceptance_or_callback', 'no_authorization_code',
+          'response_body_safe', 'headers_safe', 'location_safe', 'redirects_safe'}
+      for case_name, case in value.items():
+        if not isinstance(case, dict):
+          break
+        safe_case = {field: item for field, item in case.items()
+            if field in case_fields and safe_scalar(field, item)}
+        if not safe_case:
+          break
+        safe_cases[case_name] = safe_case
+      if set(safe_cases) == expected_cases:
+        projected[key] = safe_cases
+      continue
     if key == 'account_denial_concurrency':
       case_count = value.get('case_count')
       max_concurrent = value.get('max_concurrent_flows')
@@ -1340,12 +1385,14 @@ def sanitize_live_checkpoint(candidate):
       if (type(case_count) is int and case_count == 3
           and type(max_concurrent) is int and 1 <= max_concurrent <= case_count
           and type(overlap_observed) is bool and overlap_observed == (max_concurrent >= 2)
-          and type(all_policy_denied) is bool):
+          and type(all_policy_denied) is bool
+          and type(value.get('all_request_correlated')) is bool):
         projected[key] = {
             'case_count': case_count,
             'max_concurrent_flows': max_concurrent,
             'overlap_observed': overlap_observed,
             'all_policy_denied': all_policy_denied,
+            'all_request_correlated': value['all_request_correlated'],
         }
       continue
     if key == 'issue5_profile':
@@ -1361,7 +1408,8 @@ def sanitize_live_checkpoint(candidate):
       case_names = {'current_identity', 'missing_identity', 'unavailable_registry', 'rotation'}
       case_names.update(ISSUE5_ADVERSARIAL_CASE_NAMES)
       matrix_outcomes = {'current_accepted', 'provider_registry_inconsistent',
-          'registry_unavailable', 'provider_unavailable', 'provider_denied_unclassified', 'provider_not_found',
+          'registry_unavailable', 'provider_unavailable', 'provider_denied_unclassified',
+          'provider_not_found',
           'adversarial_peer_unavailable', 'unexpected_acceptance', 'unexpected_status',
           'unqualified'}
       safe_matrix = {}
@@ -1391,7 +1439,7 @@ def sanitize_live_checkpoint(candidate):
               'no_authorization_code', 'fixture_cli_key_observed',
               'fixture_provider_key_observed', 'fixture_all_provider_peers_observed',
               'stale_transaction_remains_pending', 'current_transaction_accepted',
-      'independent_rotation_readback',
+              'independent_rotation_readback',
               'provider_identity_log_read', 'provider_identity_not_found_observed'}:
             flag = attempt.get(field)
             if type(flag) is bool:
@@ -1403,6 +1451,17 @@ def sanitize_live_checkpoint(candidate):
           marker_count = attempt.get('provider_identity_not_found_marker_count')
           if type(marker_count) is int and 0 <= marker_count <= 10:
             safe_attempt['provider_identity_not_found_marker_count'] = marker_count
+          if (attempt.get('transaction_consume_witness') == 'observed'
+              and attempt.get('transaction_consume_marker_count') == 1
+              and isinstance(attempt.get('transaction_consume_marker'), str)
+              and attempt.get('provider_http') == 202
+              and attempt.get('outcome') == 'current_accepted'
+              and attempt.get('exact_readback') is True
+              and attempt.get('transaction_consume_provider_id')
+                  in PRODUCTION_SINGLE_USE_OBJECT_PROVIDER_IDS):
+            safe_attempt['transaction_consume_witness'] = 'observed'
+            safe_attempt['transaction_consume_provider_id'] = (
+                attempt['transaction_consume_provider_id'])
           outcome = attempt.get('outcome')
           if isinstance(outcome, str) and outcome in matrix_outcomes:
             safe_attempt['outcome'] = outcome
@@ -1422,9 +1481,18 @@ def sanitize_live_checkpoint(candidate):
             safe_attempt['current_sequence'] = sequence
           if safe_attempt:
             safe_attempts.append(safe_attempt)
-        safe_matrix[case_name] = {'attempts': safe_attempts}
+        safe_case = {'attempts': safe_attempts}
+        # Bootstrap readbacks are case-level facts in the harness, not attempt
+        # facts: require exact booleans and preserve only this fixed schema.
+        if case_name == 'unavailable_registry':
+          for field in ('bootstrap_override_readback', 'bootstrap_restore_readback'):
+            flag = case_value.get(field)
+            if type(flag) is bool:
+              safe_case[field] = flag
+        safe_matrix[case_name] = safe_case
       if safe_matrix:
         projected[key] = safe_matrix
+      continue
     if key == 'issue7_store_recovery':
       safe = issue7_store_recovery.sanitize(value)
       if safe:
@@ -3892,6 +3960,13 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   replay_log_text = subprocess_output_text(replay_logs) if replay_logs.returncode == 0 else ''
   flow_log_text = subprocess_output_text(flow_logs) if flow_logs.returncode == 0 else ''
   request_id = hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]
+  successful_provider_witness = classify_success_provider_witness(
+      flow_log_text if flow_logs.returncode == 0 else None, request_id)
+  transaction_consume_marker_lines = [line for line in flow_log_text.splitlines()
+      if 'Wallet proof transaction consumed' in line] if flow_logs.returncode == 0 else []
+  transaction_consume_marker_count = sum(
+      'Wallet proof transaction consumed' in line
+      for line in flow_log_text.splitlines()) if flow_logs.returncode == 0 else 0
   replay_guard = callback_replay_guard_log_outcome(
       replay_log_text if replay_logs.returncode == 0 else '', request_id)
   lifecycle = callback_authenticator_lifecycle_log_outcome(
@@ -4077,6 +4152,12 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
       'status_after_callback_http': status_after_callback,
       'status_after_callback_safe': status_after_callback_safe,
       'pkce_token_http': token_status,
+      'transaction_consume_witness': ('observed' if
+          successful_provider_witness['status'] == 'observed' else 'unavailable'),
+      'transaction_consume_provider_id': successful_provider_witness['provider_id'],
+      'transaction_consume_marker_count': len(transaction_consume_marker_lines),
+      'transaction_consume_marker': (transaction_consume_marker_lines[0]
+          if len(transaction_consume_marker_lines) == 1 else None),
   }
   if prior_locator is not None:
     auth_result['fresh_locator_distinct'] = locator != prior_locator
@@ -4560,15 +4641,14 @@ def account_policy_denial_response_safety(proof_body, proof_headers, proof_redir
   redirects_safe = (isinstance(proof_redirects, (list, tuple)) and not proof_redirects
       and isinstance(status_redirects, (list, tuple)) and not status_redirects)
   status_pending = browser_status_is_pending(status_http, status_body)
-  return {
-      'response_body_safe': response_body_safe,
-      'headers_safe': headers_safe,
-      'location_safe': location_safe,
-      'redirects_safe': redirects_safe,
-      'status_pending': status_pending,
+  no_authorization_code = (response_body_safe and headers_safe and location_safe
+      and redirects_safe and status_pending)
+  return {'response_body_safe': response_body_safe,
+      'headers_safe': headers_safe, 'location_safe': location_safe,
+      'redirects_safe': redirects_safe, 'status_pending': status_pending,
+      'no_authorization_code': no_authorization_code,
       'no_acceptance_or_callback': (response_body_safe and headers_safe and location_safe
-          and redirects_safe and status_pending),
-  }
+          and redirects_safe and status_pending)}
 
 
 def account_mapping_denial_result(status, registry_lookup_outcome, safe_categories,
@@ -4577,7 +4657,8 @@ def account_mapping_denial_result(status, registry_lookup_outcome, safe_categori
   response_fields = {
       field: evidence.get(field) is True
       for field in ('response_body_safe', 'headers_safe', 'location_safe',
-          'redirects_safe', 'status_pending', 'no_acceptance_or_callback')
+          'redirects_safe', 'status_pending', 'no_authorization_code',
+          'no_acceptance_or_callback')
   }
   local_response_safe = all(response_fields.values())
   if status == 403:
@@ -4594,6 +4675,7 @@ def account_mapping_denial_result(status, registry_lookup_outcome, safe_categori
     if (registry_lookup_outcome == 'resolved' and local_decision_observed
         and local_response_safe):
       result.update({'local_account_mapping_decision_observed': True,
+          'request_correlated_denial': True,
           'registry_unavailable': False, 'outcome': 'policy_denied'})
       return result
     result['outcome'] = 'provider_denied_unclassified'
@@ -4646,6 +4728,7 @@ def account_policy_denial_is_attributed(result):
   return (result.get('current_registry_proof_http') == 403
       and result.get('outcome') == 'policy_denied'
       and result.get('local_account_mapping_decision_observed') is True
+      and result.get('request_correlated_denial') is True
       and result.get('response_body_safe') is True
       and result.get('headers_safe') is True
       and result.get('location_safe') is True
@@ -6335,6 +6418,7 @@ def set_registry_bootstrap(client, token, bootstrap):
   verified = json.loads(verified_raw)
   require(verified.get('attributes', {}).get('decent.wallet.registry.bootstrap') == bootstrap,
       'Registry bootstrap fixture configuration persisted exactly')
+  return True
 
 
 def fixture_peer_request_increments(before, after, peer_count, *, require_all=False):
@@ -6615,6 +6699,10 @@ def invoke_current_identity_attempt(identifier, key, container, image, attempt_n
       'outcome': classify_registry_matrix_attempt(direct_resolution,
           login_result['proof_post_http'], status_pending=False, exact_readback=True),
       'wallet_login': login_result,
+      **({field: login_result[field] for field in (
+          'transaction_consume_witness', 'transaction_consume_provider_id',
+          'transaction_consume_marker_count', 'transaction_consume_marker')
+          if field in login_result}),
   })
   return evidence
 
@@ -7812,14 +7900,18 @@ def main():
               missing_attempt.get('provider_http'))
         checkpoint()
 
-        result['registry_matrix']['unavailable_registry'] = {'attempts': []}
+        result['registry_matrix']['unavailable_registry'] = {
+            'attempts': [], 'bootstrap_override_readback': False,
+            'bootstrap_restore_readback': False}
         unavailable_port = free_port()
         unavailable_bootstrap_value = unavailable_bootstrap(bootstrap, unavailable_port)
         require(unavailable_bootstrap_value is not None,
             'construct unreachable Registry bootstrap fixture')
-        mark_issue5_matrix_stage('unavailable_bootstrap_configuring')
-        set_registry_bootstrap(client, token, unavailable_bootstrap_value)
         try:
+          mark_issue5_matrix_stage('unavailable_bootstrap_configuring')
+          override_readback = set_registry_bootstrap(client, token, unavailable_bootstrap_value)
+          result['registry_matrix']['unavailable_registry']['bootstrap_override_readback'] = override_readback
+          checkpoint()
           for attempt_number in range(1, 3):
             mark_issue5_matrix_stage(f'unavailable_registry_attempt_{attempt_number}')
             unavailable_result = registry_proof_probe(temp, resolver_port,
@@ -7842,7 +7934,11 @@ def main():
                 unavailable_result['direct_provider_http'])
         finally:
           mark_issue5_matrix_stage('unavailable_bootstrap_restoring')
-          set_registry_bootstrap(client, token, bootstrap)
+          try:
+            restored = set_registry_bootstrap(client, token, bootstrap)
+            result['registry_matrix']['unavailable_registry']['bootstrap_restore_readback'] = restored
+          finally:
+            checkpoint()
         result['registry_matrix']['history_incomplete'] = {'attempts': []}
         result['registry_matrix']['malformed_result'] = {'attempts': []}
         result['registry_matrix']['ambiguous_registry_result'] = {'attempts': []}
@@ -8004,11 +8100,17 @@ def main():
         attributed = all(account_policy_denial_is_attributed(outcome)
             for outcome in denial_cases.values())
         max_concurrent = denial_run['max_concurrent_flows']
+        result['account_denial_cases'] = {
+            name: outcome for name, outcome in denial_cases.items()
+        }
         result['account_denial_concurrency'] = {
             'case_count': len(denial_cases),
             'max_concurrent_flows': max_concurrent,
             'overlap_observed': max_concurrent >= 2,
             'all_policy_denied': attributed,
+            'all_request_correlated': all(
+                outcome.get('request_correlated_denial') is True
+                for outcome in denial_cases.values()),
         }
         checkpoint()
         require(max_concurrent >= 2, 'account denial flows overlapped', max_concurrent)

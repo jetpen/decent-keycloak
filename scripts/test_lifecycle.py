@@ -9,7 +9,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).parent))
+
 from scripts import lifecycle
+from scripts import wallet_login_live_e2e as probe
 from scripts.lifecycle import _engine_command, image_smoke_command, normalize_image_id
 
 
@@ -45,10 +48,80 @@ class LifecycleCliTest(unittest.TestCase):
     sources = Path("/run/source-checkouts")
     dependencies = Path("/run/binary-dependencies")
     for engine in ("docker", "podman"):
-      command = _engine_command(engine, "candidate", sources, dependencies)
+      command = _engine_command(engine, "candidate", sources, dependencies, run_id="e" * 32)
       self.assertIn(f"binary-dependencies={dependencies}", command)
       self.assertIn(f"identity-src={sources / 'identity'}", command)
       self.assertIn(f"registry-src={sources / 'registry'}", command)
+
+  def test_both_build_engines_label_every_build_stage_with_the_run_owner(self):
+    sources = Path("/run/source-checkouts")
+    dependencies = Path("/run/binary-dependencies")
+    run_id = "e" * 32
+    for engine in ("docker", "podman"):
+      command = _engine_command(engine, "candidate", sources, dependencies, run_id=run_id)
+      self.assertIn(f"LIFECYCLE_RUN_ID={run_id}", command)
+      self.assertIn("--build-arg", command)
+      self.assertEqual([engine, "image", "rm", "sha256:" + "a" * 64],
+          lifecycle._image_remove_command(engine, "sha256:" + "a" * 64))
+      self.assertEqual([engine, "image", "rm", "tag"],
+          lifecycle._image_remove_tag_command(engine, "tag"))
+      self.assertEqual([engine, "image", "tag", "source", "target"],
+          lifecycle._image_tag_command(engine, "source", "target"))
+      self.assertEqual([engine, "image", "ls", "--all", "--no-trunc", "--quiet"],
+          lifecycle._image_inventory_command(engine))
+
+    dockerfile = (ROOT / "container/Dockerfile").read_text()
+    stages = [line for line in dockerfile.splitlines() if line.startswith("FROM ")]
+    labels = [line for line in dockerfile.splitlines()
+              if "io.decent.lifecycle.run-id" in line]
+    self.assertEqual(len(stages), len(labels), "every Dockerfile stage must carry the run owner label")
+
+  def test_fingerprint_source_ignores_docs_lifecycle_and_project_configuration(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      source = root / "src/main/java/example/Provider.java"
+      for relative in lifecycle.IMAGE_SOURCE_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("image input\n")
+      source.parent.mkdir(parents=True, exist_ok=True)
+      source.write_text("source code\n")
+      excluded = (root / "README.md", root / "scripts/lifecycle.py", root / "pom.xml",
+          root / "container/resolver-runtime.lock.json")
+      for path in excluded:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("excluded input\n")
+      with mock.patch.object(lifecycle, "ROOT", root):
+        baseline = lifecycle.fingerprint_source()
+        self.assertEqual({"image_source_sha256", "image_source_file_count"}, set(baseline))
+        self.assertEqual(12, baseline["image_source_file_count"])
+        for path in excluded:
+          path.write_text("changed but excluded\n")
+        self.assertEqual(baseline, lifecycle.fingerprint_source())
+        source.write_text("changed image input\n")
+        self.assertNotEqual(baseline["image_source_sha256"],
+            lifecycle.fingerprint_source()["image_source_sha256"])
+
+  def test_fingerprint_source_includes_built_runtime_jars_only_after_compilation(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      for relative in lifecycle.IMAGE_SOURCE_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("source input\n")
+      for relative in lifecycle.IMAGE_BUILD_ARTIFACT_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("compiled jar\n")
+      with mock.patch.object(lifecycle, "ROOT", root):
+        before_build = lifecycle.fingerprint_source()
+        built = lifecycle.fingerprint_source(include_build_artifacts=True)
+        self.assertEqual(3, built["image_artifact_file_count"])
+        self.assertNotIn("image_artifacts_sha256", before_build)
+        first_hash = built["image_artifacts_sha256"]
+        (root / lifecycle.IMAGE_BUILD_ARTIFACT_FILES[0]).write_text("different jar\n")
+        self.assertNotEqual(first_hash,
+            lifecycle.fingerprint_source(include_build_artifacts=True)["image_artifacts_sha256"])
 
   def test_preflight_runs_before_evidence_directory_is_created(self):
     with tempfile.TemporaryDirectory() as temporary:
@@ -106,42 +179,327 @@ class LifecycleCliTest(unittest.TestCase):
       self.assertEqual("not_run", receipt["steps"]["provider-service-registration"]["status"])
       self.assertEqual("pass", receipt["cleanup"]["status"])
 
-  def test_cleanup_discovers_and_removes_run_tag_after_interrupted_build(self):
-    image_id = "sha256:" + "a" * 64
-    inspected = subprocess.CompletedProcess([], 0, image_id + "\n", "")
-    with mock.patch.object(lifecycle, "capture_command", return_value=inspected), \
-        mock.patch.object(lifecycle, "_image_remove", return_value=0) as remove:
-      result = lifecycle._cleanup_run_image("podman", "run-unique-tag", None)
-
-    self.assertEqual(0, result)
-    remove.assert_called_once_with("podman", "run-unique-tag", image_id)
-
   def test_run_profile_retains_image_only_with_opt_in_and_matching_owned_id(self):
     image_id = "sha256:" + "a" * 64
+    baseline_id = "sha256:" + "b" * 64
     absent = subprocess.CompletedProcess([], 1, "", "")
     present = subprocess.CompletedProcess([], 0, image_id + "\n", "")
+    owner_run_id = {"value": ""}
     with tempfile.TemporaryDirectory() as temporary:
       root = Path(temporary)
+      def fake_run(command, **_kwargs):
+        if "build" in command:
+          build_tag = command[command.index("--tag") + 1]
+          owner_run_id["value"] = build_tag.rsplit("lifecycle-", 1)[1]
+        return 0
+
+      def fake_capture(command):
+        if "{{json .}}" in command:
+          payload = [{"Id": image_id, "Parent": "", "Config": {"Labels": {
+              "io.decent.lifecycle.run-id": owner_run_id["value"]}}}]
+          return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        if command[1:3] == ["image", "ls"]:
+          ids = [baseline_id]
+          if owner_run_id["value"]:
+            ids.append(image_id)
+          return subprocess.CompletedProcess([], 0, "\n".join(ids) + "\n", "")
+        if "{{.Id}}" in command:
+          return absent if not owner_run_id["value"] else present
+        return present
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
-          mock.patch.object(lifecycle, "run", return_value=0), \
+          mock.patch.object(lifecycle, "run", side_effect=fake_run), \
           mock.patch.object(lifecycle, "verify_provider", return_value=0), \
           mock.patch.object(lifecycle, "_run_capture",
               return_value=(0, "Keycloak 26.8.0\\nJVM: 21.0.12.1")), \
           mock.patch.object(lifecycle, "diff_check", return_value=0), \
-          mock.patch.object(lifecycle, "capture_command", side_effect=[absent, present, present]), \
-          mock.patch.object(lifecycle, "_cleanup_run_image") as cleanup:
+          mock.patch.object(lifecycle, "capture_command", side_effect=fake_capture), \
+          mock.patch.object(lifecycle, "_cleanup_owned_images", return_value={
+              "status": "pass", "image_retained": True, "removed_image_count": 0,
+              "removed_image_ids": [], "unowned_new_image_count": 0,
+              "inconclusive_image_count": 0}) as cleanup:
         result = lifecycle.run_profile("offline", retain_image=True)
 
       receipt = json.loads(next((root / "target/lifecycle/evidence").glob("*.json")).read_text())
       self.assertEqual(0, result)
       self.assertTrue(receipt["image"]["retained"])
+      self.assertEqual(1, receipt["image"]["baseline_image_count"])
+      self.assertEqual([baseline_id], receipt["image"]["baseline_image_ids"])
+      self.assertEqual(64, len(receipt["image"]["baseline_image_ids_sha256"]))
+      self.assertEqual(hashlib.sha256(b"\n".join(
+          image_id.encode() for image_id in receipt["image"]["baseline_image_ids"])).hexdigest(),
+          receipt["image"]["baseline_image_ids_sha256"])
+
       self.assertTrue(receipt["cleanup"]["image_retained"])
       self.assertEqual("pass", receipt["cleanup"]["status"])
-      cleanup.assert_not_called()
+      cleanup.assert_called_once()
+
+  def _run_profile_with_fake_engine(self, *, build_outcome="success", retain=False,
+      change_owner_before_removal=False, add_unowned_image=False, removal_noop=False,
+      uninspectable_transient_image=False,
+      known_owned_transient_becomes_uninspectable=False,
+      change_image_inputs_after_build=False):
+    baseline_id = "sha256:" + "b" * 64
+    runtime_id = "sha256:" + "a" * 64
+    builder_id = "sha256:" + "c" * 64
+    base_stage_id = "sha256:" + "d" * 64
+    transient_id = "sha256:" + "e" * 64
+    images = {baseline_id: {"Parent": "", "owner": "upstream"}}
+    tags = {"pre-existing:keep": baseline_id}
+    run_id = None
+    inventory_calls = 0
+    changed = False
+    removals = []
+
+    def inspected_image(image_id):
+      record = images.get(image_id)
+      if uninspectable_transient_image and image_id == transient_id:
+        payload = [{"Id": image_id, "Parent": record["Parent"], "Config": {"Labels": {}}}]
+        return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+      if known_owned_transient_becomes_uninspectable and image_id == transient_id and inventory_calls > 2:
+        return subprocess.CompletedProcess([], 1, "", "not found")
+      if record is None:
+        return subprocess.CompletedProcess([], 1, "", "not found")
+      labels = {"io.decent.lifecycle.run-id": record["owner"]}
+      payload = [{"Id": image_id, "Parent": record["Parent"], "Config": {"Labels": labels}}]
+      return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+
+    def capture(command):
+      nonlocal inventory_calls, changed
+      if command[1:3] == ["image", "ls"]:
+        inventory_calls += 1
+        return subprocess.CompletedProcess([], 0, "\n".join(sorted(images)) + "\n", "")
+      if command[1:3] == ["image", "inspect"]:
+        image = command[-1]
+        image_id = tags.get(image, image if image in images else None)
+        if "{{json .}}" in command:
+          if (change_owner_before_removal and image_id == builder_id
+              and not changed and inventory_calls > 2):
+            changed = True
+            images[builder_id]["owner"] = "another-run"
+          return inspected_image(image_id) if image_id else subprocess.CompletedProcess([], 1, "", "not found")
+        if "{{.Id}}" in command:
+          return subprocess.CompletedProcess([], 0 if image_id else 1,
+              (image_id + "\n") if image_id else "", "")
+      return subprocess.CompletedProcess([], 1, "", "unexpected engine command")
+
+    def engine_run(command, **_kwargs):
+      nonlocal run_id
+      if "build" in command:
+        build_tag = command[command.index("--tag") + 1]
+        run_id = build_tag.rsplit("lifecycle-", 1)[1]
+        images[base_stage_id] = {"Parent": "", "owner": run_id}
+        images[builder_id] = {"Parent": base_stage_id, "owner": run_id}
+        images[runtime_id] = {"Parent": builder_id, "owner": run_id}
+        if uninspectable_transient_image or known_owned_transient_becomes_uninspectable:
+          # Podman may list an intermediate builder ID whose inspect metadata
+          # is unavailable; removing its owned parent/runtime deletes it too.
+          images[transient_id] = {"Parent": builder_id, "owner": run_id}
+        if add_unowned_image:
+          images["sha256:" + "f" * 64] = {"Parent": "", "owner": "unrelated-run"}
+        tags[build_tag] = runtime_id
+        if build_outcome == "interrupt":
+          raise KeyboardInterrupt
+        return 7 if build_outcome == "failure" else 0
+      if command[1:3] == ["image", "rm"]:
+        target = command[-1]
+        image_id = tags.pop(target, target)
+        removals.append(image_id)
+        if not removal_noop:
+          images.pop(image_id, None)
+          if uninspectable_transient_image and image_id == builder_id:
+            images.pop(transient_id, None)
+          for tag, tagged_id in list(tags.items()):
+            if tagged_id == image_id:
+              del tags[tag]
+        return 0
+      return 0
+
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      original_fingerprint = {
+          "image_source_sha256": "a" * 64, "image_source_file_count": 1,
+          "image_artifacts_sha256": "b" * 64, "image_artifact_file_count": 3}
+      changed_fingerprint = {**original_fingerprint, "image_artifacts_sha256": "c" * 64}
+      fingerprint_results = [original_fingerprint, original_fingerprint,
+          changed_fingerprint if change_image_inputs_after_build else original_fingerprint]
+      with mock.patch.object(lifecycle, "ROOT", root), \
+          mock.patch.object(lifecycle, "preflight", return_value=0), \
+          mock.patch.object(lifecycle, "fingerprint_source", side_effect=fingerprint_results), \
+          mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
+          mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
+          mock.patch.object(lifecycle, "run", side_effect=engine_run), \
+          mock.patch.object(lifecycle, "verify_provider", return_value=0), \
+          mock.patch.object(lifecycle, "_run_capture",
+              return_value=(0, "Keycloak 26.8.0\nJVM: 21.0.12.1")), \
+          mock.patch.object(lifecycle, "diff_check", return_value=0), \
+          mock.patch.object(lifecycle, "capture_command", side_effect=capture):
+        try:
+          result = lifecycle.run_profile("offline", retain_image=retain)
+        except SystemExit as error:
+          result = 0 if error.code is None else int(error.code)
+      receipt = json.loads(next((root / "target/lifecycle/evidence").glob("*.json")).read_text())
+    return result, receipt, images, removals, baseline_id, runtime_id, builder_id, base_stage_id
+
+  def test_successful_run_removes_all_new_owned_images_but_preserves_preexisting_image(self):
+    result, receipt, images, removals, baseline, runtime, builder, base_stage = \
+        self._run_profile_with_fake_engine()
+
+    self.assertEqual(0, result)
+    self.assertEqual({baseline}, set(images))
+    self.assertNotIn(runtime, images)
+    self.assertEqual([runtime, builder, base_stage], removals)
+    self.assertEqual("pass", receipt["cleanup"]["status"])
+    self.assertEqual(3, receipt["cleanup"]["removed_image_count"])
+    self.assertEqual(1, receipt["cleanup"]["baseline_image_count"])
+    self.assertEqual([baseline], receipt["cleanup"]["baseline_image_ids"])
+
+  def test_changed_image_input_during_container_build_fails_and_cleans_owned_images(self):
+    result, receipt, images, removals, baseline, *_ = \
+        self._run_profile_with_fake_engine(change_image_inputs_after_build=True)
+
+    self.assertEqual(2, result)
+    self.assertEqual("fail", receipt["steps"]["provider-image"]["status"])
+    self.assertEqual("image_inputs_changed_during_build",
+        receipt["steps"]["provider-image"]["detail"])
+    self.assertEqual({baseline}, set(images))
+    self.assertEqual("pass", receipt["cleanup"]["status"])
+    self.assertEqual(3, len(removals))
+
+  def test_cleanup_accepts_engine_pruned_owned_parents_after_exact_inventory_readback(self):
+    run_id = "d" * 32
+    base_id = "sha256:" + "a" * 64
+    parent_id = "sha256:" + "b" * 64
+    child_id = "sha256:" + "c" * 64
+    remaining = {base_id, parent_id, child_id}
+    removals = []
+    metadata = {
+        base_id: {"Id": base_id, "Parent": "", "Config": {
+            "Labels": {"io.decent.lifecycle.run-id": run_id}}},
+        parent_id: {"Id": parent_id, "Parent": base_id, "Config": {
+            "Labels": {"io.decent.lifecycle.run-id": run_id}}},
+        child_id: {"Id": child_id, "Parent": parent_id, "Config": {
+            "Labels": {"io.decent.lifecycle.run-id": run_id}}},
+    }
+
+    def remove(_engine, image_id):
+      removals.append(image_id)
+      if image_id == child_id:
+        remaining.clear()
+      return 0
+
+    with mock.patch.object(lifecycle, "_image_inventory", side_effect=lambda _engine: set(remaining)), \
+        mock.patch.object(lifecycle, "_image_metadata",
+            side_effect=lambda _engine, image_id: metadata.get(image_id)), \
+        mock.patch.object(lifecycle, "_remove_image_by_id", side_effect=remove):
+      result = lifecycle._cleanup_owned_images("podman", set(), run_id)
+
+    self.assertEqual([child_id], removals)
+    self.assertEqual("pass", result["status"])
+    self.assertEqual(0, result["inconclusive_image_count"])
+    self.assertEqual(set(), remaining)
+
+  def test_failed_and_interrupted_builds_remove_all_partial_run_owned_images(self):
+    for outcome, expected_code in (("failure", 7), ("interrupt", 130)):
+      with self.subTest(outcome=outcome):
+        result, receipt, images, removals, baseline, *_ = self._run_profile_with_fake_engine(
+            build_outcome=outcome)
+        self.assertEqual(expected_code, result)
+        self.assertEqual({baseline}, set(images))
+        self.assertEqual(3, len(removals))
+        self.assertEqual("pass", receipt["cleanup"]["status"])
+        self.assertEqual(3, receipt["cleanup"]["removed_image_count"])
+
+  def test_retain_image_keeps_only_the_exact_final_runtime_image(self):
+    result, receipt, images, removals, baseline, runtime, *_ = \
+        self._run_profile_with_fake_engine(retain=True)
+
+    self.assertEqual(0, result)
+    self.assertEqual({baseline, runtime}, set(images))
+    self.assertEqual("pass", receipt["cleanup"]["status"])
+    self.assertTrue(receipt["cleanup"]["image_retained"])
+    self.assertEqual(2, receipt["cleanup"]["removed_image_count"])
+    self.assertNotIn(runtime, removals)
+
+  def test_uninspectable_transient_id_removed_transitively_does_not_fail_cleanup(self):
+    result, receipt, images, removals, baseline, runtime, builder, base_stage = \
+        self._run_profile_with_fake_engine(uninspectable_transient_image=True)
+    transient = "sha256:" + "e" * 64
+
+    self.assertEqual(0, result)
+    self.assertEqual({baseline}, set(images))
+    self.assertEqual([runtime, builder, base_stage], removals)
+    self.assertNotIn(transient, images)
+    self.assertEqual("pass", receipt["cleanup"]["status"])
+    self.assertEqual(4, receipt["cleanup"]["candidate_image_count"])
+    self.assertEqual(3, receipt["cleanup"]["removed_image_count"])
+    self.assertEqual(0, receipt["cleanup"]["inconclusive_image_count"])
+
+  def test_uninspectable_transient_id_that_survives_cleanup_fails_closed(self):
+    result, receipt, images, _removals, baseline, *_ = \
+        self._run_profile_with_fake_engine(
+            uninspectable_transient_image=True, removal_noop=True)
+    transient = "sha256:" + "e" * 64
+
+    self.assertNotEqual(0, result)
+    self.assertEqual({baseline, transient, "sha256:" + "a" * 64,
+        "sha256:" + "c" * 64, "sha256:" + "d" * 64}, set(images))
+    self.assertEqual("fail", receipt["cleanup"]["status"])
+    self.assertGreater(receipt["cleanup"]["inconclusive_image_count"], 0)
+
+  def test_previously_identified_owned_transient_that_becomes_uninspectable_fails_closed(self):
+    result, receipt, images, _removals, _baseline, *_ = \
+        self._run_profile_with_fake_engine(
+            known_owned_transient_becomes_uninspectable=True)
+    transient = "sha256:" + "e" * 64
+
+    self.assertNotEqual(0, result)
+    self.assertIn(transient, images)
+    self.assertEqual("fail", receipt["cleanup"]["status"])
+    self.assertGreater(receipt["cleanup"]["inconclusive_image_count"], 0)
+
+  def test_changed_run_ownership_label_is_preserved_and_cleanup_fails_closed(self):
+    result, receipt, images, removals, baseline, _, builder, *_ = \
+        self._run_profile_with_fake_engine(change_owner_before_removal=True)
+
+    self.assertNotEqual(0, result)
+    self.assertIn(builder, images)
+    self.assertEqual("another-run", images[builder]["owner"])
+    self.assertNotIn(builder, removals)
+    self.assertEqual("fail", receipt["cleanup"]["status"])
+
+  def test_cleanup_inventory_or_readback_failure_fails_the_lifecycle(self):
+    result, receipt, *_ = self._run_profile_with_fake_engine()
+    self.assertEqual(0, result)
+
+    with mock.patch.object(lifecycle, "capture_command",
+        return_value=subprocess.CompletedProcess([], 1, "", "engine unavailable")):
+      with self.assertRaisesRegex(RuntimeError, "image_inventory_unavailable"):
+        lifecycle._cleanup_owned_images("podman", set(), "f" * 32)
+
+  def test_successful_remove_command_without_exact_id_readback_fails_lifecycle(self):
+    result, receipt, images, removals, baseline, *_ = self._run_profile_with_fake_engine(
+        removal_noop=True)
+
+    self.assertNotEqual(0, result)
+    self.assertTrue(removals)
+    self.assertGreater(receipt["cleanup"]["inconclusive_image_count"], 0)
+    self.assertEqual("fail", receipt["cleanup"]["status"])
+    self.assertIn(baseline, images)
+
+  def test_unowned_new_image_is_preserved_without_failing_owned_cleanup(self):
+    result, receipt, images, removals, baseline, *_ = self._run_profile_with_fake_engine(
+        add_unowned_image=True)
+    upstream_new = "sha256:" + "f" * 64
+
+    self.assertEqual(0, result)
+    self.assertEqual({baseline, upstream_new}, set(images))
+    self.assertNotIn(upstream_new, removals)
+    self.assertEqual(1, receipt["cleanup"]["unowned_new_image_count"])
+    self.assertEqual("pass", receipt["cleanup"]["status"])
 
   def test_promotion_requires_complete_live_receipt_and_explicit_image_retention(self):
     image_id = "sha256:" + "a" * 64
@@ -150,19 +508,29 @@ class LifecycleCliTest(unittest.TestCase):
         for name in lifecycle.ISSUE5_GATES
     }
     receipt = {
-        "profile": "issue5-live", "exit_code": 0,
-        "source": {"revision": "c" * 40, "harness_sha256": "d" * 64,
-            "resolver_manifest_sha256": "e" * 64,
-            "resolver_dependency_provenance_sha256": "f" * 64,
-            "resolver_requirements_sha256": "1" * 64},
+        "profile": "issue5-live", "exit_code": 0, "run_id": "abc",
+        "source": {"image_source_sha256": "d" * 64, "image_source_file_count": 11,
+            "image_artifacts_sha256": "e" * 64, "image_artifact_file_count": 3},
         "issue5_acceptance_gates": gates,
         "image": {"status": "built", "engine": "podman", "run_owned_tag": "decent-keycloak-wallet-provider:lifecycle-abc",
             "immutable_id": image_id, "retention_requested": True, "retained": True},
-        "cleanup": {"status": "pass"},
+        "cleanup": {"status": "pass", "image_retained": True, "retained_image_id": image_id},
     }
 
     self.assertEqual(("podman", "decent-keycloak-wallet-provider:lifecycle-abc", image_id),
         lifecycle.promotion_source_from_receipt(receipt))
+    receipt["cleanup"]["image_retained"] = False
+    with self.assertRaisesRegex(ValueError, "cleanup retention does not match"):
+      lifecycle.promotion_source_from_receipt(receipt)
+    receipt["cleanup"]["image_retained"] = True
+    receipt["cleanup"]["retained_image_id"] = "sha256:" + "b" * 64
+    with self.assertRaisesRegex(ValueError, "cleanup retention does not match"):
+      lifecycle.promotion_source_from_receipt(receipt)
+    receipt["cleanup"]["retained_image_id"] = image_id
+    receipt["image"]["run_owned_tag"] = "decent-keycloak-wallet-provider:lifecycle-other"
+    with self.assertRaisesRegex(ValueError, "tag does not match"):
+      lifecycle.promotion_source_from_receipt(receipt)
+    receipt["image"]["run_owned_tag"] = "decent-keycloak-wallet-provider:lifecycle-abc"
     receipt["issue5_acceptance_gates"]["exact_missing_identity"] = "not_run"
     with self.assertRaisesRegex(ValueError, "acceptance gates"):
       lifecycle.promotion_source_from_receipt(receipt)
@@ -285,6 +653,18 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertIn("--allow-live", steps["issue5-adversarial"]["requires"])
 
 
+  def test_issue5_success_requires_exact_complete_gate_set(self):
+    expected = {
+        name: ("unavailable" if name in lifecycle.ISSUE5_ADVERSARIAL_CASES else "pass")
+        for name in lifecycle.ISSUE5_GATES
+    }
+    self.assertTrue(lifecycle.issue5_acceptance_gate_set_complete(expected))
+    self.assertFalse(lifecycle.issue5_acceptance_gate_set_complete({
+        key: value for key, value in expected.items() if key != "runtime_provider"}))
+    inconclusive = dict(expected)
+    inconclusive["account_denial_concurrency"] = "inconclusive"
+    self.assertFalse(lifecycle.issue5_acceptance_gate_set_complete(inconclusive))
+
   def test_adversarial_gates_only_record_unavailable_for_two_complete_failed_closed_attempts(self):
     cases = {
         "malformed_result": "hostile-peer-malformed",
@@ -323,6 +703,147 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertEqual("inconclusive", statuses["history_incomplete"])
     self.assertEqual("unavailable", statuses["ambiguous_registry_result"])
 
+    self.assertEqual('pass', lifecycle.issue5_account_denial_gate_status({
+        'account_denial_concurrency': {
+            'case_count': 3, 'max_concurrent_flows': 3,
+            'overlap_observed': True, 'all_policy_denied': True,
+            'all_request_correlated': True,
+        },
+        'account_denial_cases': {
+            name: {
+                'outcome': 'policy_denied', 'current_registry_proof_http': 403,
+                'local_account_mapping_decision_observed': True,
+                'request_correlated_denial': True, 'status_pending': True,
+                'no_acceptance_or_callback': True, 'no_authorization_code': True,
+                'response_body_safe': True, 'headers_safe': True,
+                'location_safe': True, 'redirects_safe': True,
+            }
+            for name in ('unmapped-account', 'disabled-account', 'ambiguous-account')
+        }}))
+    self.assertEqual('inconclusive', lifecycle.issue5_account_denial_gate_status({
+        'account_denial_concurrency': {
+            'case_count': 3, 'max_concurrent_flows': 3,
+            'overlap_observed': True, 'all_policy_denied': True,
+        }}))
+    self.assertEqual('fail', lifecycle.issue5_account_denial_gate_status({
+        'account_denial_concurrency': {
+            'case_count': 3, 'max_concurrent_flows': 2,
+            'overlap_observed': True, 'all_policy_denied': True,
+            'all_request_correlated': False,
+        }}))
+    self.assertEqual('inconclusive', lifecycle.issue5_account_denial_gate_status({
+        'account_denial_concurrency': {
+            'case_count': 3, 'max_concurrent_flows': 3,
+            'overlap_observed': True, 'all_policy_denied': True,
+            'all_request_correlated': True,
+        },
+        'account_denial_cases': {
+            'unmapped-account': {
+                'outcome': 'policy_denied', 'current_registry_proof_http': 403,
+                'local_account_mapping_decision_observed': True,
+                'request_correlated_denial': True, 'status_pending': True,
+                'no_acceptance_or_callback': True, 'no_authorization_code': True,
+                'response_body_safe': True, 'headers_safe': True,
+                'location_safe': True, 'redirects_safe': True,
+            },
+        }}))
+
+  def test_runtime_provider_witness_is_projected_from_successful_current_identity_attempt(self):
+    request_id = "0123456789abcdef0123456789abcdef"
+    marker = (f"(executor-thread-1) Wallet proof transaction consumed "
+        f"(request={request_id}, provider=infinispan)")
+    evidence = {
+        "resolver_runtime": {
+            "runtime_qualification_status": "runtime_facts_verified",
+            "database_mode_effective": "dev-file", "cache_mode_effective": "local",
+            "single_use_object_provider_ids": ["infinispan"],
+            "single_use_object_provider_evidence": "not_observed",
+            "single_use_object_provider_path": "unavailable",
+        },
+        "registry_matrix": {"current_identity": {"attempts": [
+            {
+                "provider_http": 202, "outcome": "current_accepted", "exact_readback": True,
+                "transaction_consume_witness": "observed",
+                "transaction_consume_provider_id": "infinispan",
+                "transaction_consume_marker_count": 1,
+                "transaction_consume_marker": marker,
+            },
+            {
+                "provider_http": 202, "outcome": "current_accepted", "exact_readback": True,
+                "transaction_consume_witness": "observed",
+                "transaction_consume_provider_id": "infinispan",
+                "transaction_consume_marker_count": 1,
+                "transaction_consume_marker": (
+                    "(executor-thread-2) Wallet proof transaction consumed "
+                    "(request=abcdefabcdefabcdefabcdefabcdefab, provider=infinispan)"),
+            },
+        ]}},
+    }
+    projected = probe.sanitize_live_checkpoint(evidence)
+    runtime = projected["resolver_runtime"]
+    self.assertEqual("infinispan", runtime["single_use_object_provider_path"])
+    self.assertEqual("request_correlated_consumed_transaction",
+        runtime["single_use_object_provider_evidence"])
+    self.assertEqual(2, runtime["transaction_consume_witness_count"])
+    self.assertEqual("pass", lifecycle.issue5_runtime_provider_gate_status(projected))
+    self.assertNotIn(request_id, json.dumps(projected))
+    self.assertNotIn("transaction_consume_marker", json.dumps(projected))
+    incomplete = json.loads(json.dumps(evidence))
+    incomplete["registry_matrix"]["current_identity"]["attempts"] = []
+    incomplete_projection = probe.sanitize_live_checkpoint(incomplete)
+    self.assertNotIn("transaction_consume_witness_count",
+        incomplete_projection["resolver_runtime"])
+    self.assertEqual("inconclusive", lifecycle.issue5_runtime_provider_gate_status(
+        incomplete_projection))
+
+  def test_runtime_provider_gate_requires_effective_selected_provider_facts(self):
+    self.assertEqual('inconclusive', lifecycle.issue5_runtime_provider_gate_status({}))
+    self.assertEqual('pass', lifecycle.issue5_runtime_provider_gate_status({
+        'resolver_runtime': {
+            'runtime_qualification_status': 'runtime_facts_verified',
+            'single_use_object_provider_path': 'infinispan',
+            'single_use_object_provider_evidence': 'request_correlated_consumed_transaction',
+            'transaction_consume_witness_count': 1,
+            'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+        }}))
+    self.assertEqual('pass', lifecycle.issue5_runtime_provider_gate_status({
+        'resolver_runtime': {
+            'runtime_qualification_status': 'runtime_facts_verified',
+            'single_use_object_provider_path': 'infinispan',
+            'single_use_object_provider_evidence': 'request_correlated_consumed_transaction',
+            'transaction_consume_witness_count': 2,
+            'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+        }}))
+    self.assertEqual('inconclusive', lifecycle.issue5_runtime_provider_gate_status({
+        'resolver_runtime': {'runtime_qualification_status': 'open_runtime_facts_unavailable',
+            'single_use_object_provider_path': 'unavailable',
+            'database_mode_effective': 'unavailable', 'cache_mode_effective': 'unavailable'}}))
+    self.assertEqual('inconclusive', lifecycle.issue5_runtime_provider_gate_status({
+        'resolver_runtime': {
+            'runtime_qualification_status': 'runtime_facts_verified',
+            'single_use_object_provider_path': 'infinispan',
+            'single_use_object_provider_evidence': 'request_correlated_consumed_transaction',
+            'transaction_consume_witness_count': 3,
+            'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+        }}))
+
+  def test_unavailable_bootstrap_readbacks_survive_sanitizer_and_reach_gate(self):
+    attempts = [{
+        "attempt_number": number,
+        "direct_resolution": "unavailable", "provider_http": 503,
+        "status_http": 200, "status_pending": True,
+        "no_acceptance_or_callback": True, "no_authorization_code": True,
+        "outcome": "registry_unavailable",
+    } for number in (1, 2)]
+    evidence = probe.sanitize_live_checkpoint({"registry_matrix": {
+        "unavailable_registry": {
+            "attempts": attempts,
+            "bootstrap_override_readback": True,
+            "bootstrap_restore_readback": True,
+        },
+    }})
+    self.assertEqual("pass", lifecycle.issue5_live_matrix_gate_statuses(evidence)["registry_unavailable"])
+
   def test_live_matrix_gates_require_complete_two_attempt_receipts(self):
     current = lambda: {
         "direct_resolution": "resolved", "exact_readback": True,
@@ -342,6 +863,7 @@ class LifecycleCliTest(unittest.TestCase):
         "direct_resolution": "unavailable", "provider_http": 503,
         "status_http": 200, "status_pending": True,
         "no_acceptance_or_callback": True, "no_authorization_code": True,
+        "bootstrap_override_readback": True, "bootstrap_restore_readback": True,
         "outcome": "registry_unavailable",
     }
     rotation = lambda sequence: {
@@ -359,7 +881,8 @@ class LifecycleCliTest(unittest.TestCase):
         "registry_matrix": {
             "current_identity": {"attempts": [current(), current()]},
             "missing_identity": {"attempts": [missing(), missing()]},
-            "unavailable_registry": {"attempts": [unavailable(), unavailable()]},
+            "unavailable_registry": {"attempts": [unavailable(), unavailable()],
+            "bootstrap_override_readback": True, "bootstrap_restore_readback": True},
             "rotation": {"attempts": [rotation(2), rotation(3)]},
         },
         "rotated_identity_case": {"local_mapping_persisted": True},
@@ -374,7 +897,22 @@ class LifecycleCliTest(unittest.TestCase):
         "stale_key_denial": "pass",
         "owner_key_rotation": "pass",
         "independent_rotation_readback": "pass",
+        "account_denial_concurrency": "inconclusive",
+        "runtime_provider": "inconclusive",
     }, statuses)
+
+    self.assertEqual('inconclusive', lifecycle.issue5_live_matrix_gate_statuses({
+        'registry_matrix': {'unavailable_registry': {'attempts': [
+            {key: value for key, value in unavailable().items() if key != 'bootstrap_restore_readback'},
+            unavailable(),
+        ]}}
+    })['registry_unavailable'])
+    self.assertEqual('fail', lifecycle.issue5_live_matrix_gate_statuses({
+        'registry_matrix': {'unavailable_registry': {
+            'attempts': [unavailable(), unavailable()],
+            'bootstrap_override_readback': True, 'bootstrap_restore_readback': False,
+        }}
+    })['registry_unavailable'])
 
     evidence["registry_matrix"]["missing_identity"]["attempts"][1]["direct_resolution"] = "unavailable"
     self.assertEqual("fail", lifecycle.issue5_live_matrix_gate_statuses(evidence)["exact_missing_identity"])

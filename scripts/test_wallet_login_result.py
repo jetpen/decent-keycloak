@@ -141,6 +141,52 @@ class IdentityLookupClassificationTest(unittest.TestCase):
             'unpublished Identity produced no accepted receipt, callback, or code'):
           self._run_missing_identity_probe(redirect_during)
 
+  def test_current_identity_attempt_preserves_sanitized_success_provider_witness(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    def resolver_lookup(_attempt):
+      return SimpleNamespace(stdout='{"identity_id":"id-1","owner_public_key":"'
+          + 'ab' * 32 + '"}', returncode=0)
+
+    def public_key(*_args, **_kwargs):
+      return SimpleNamespace(returncode=0, stdout=b'\x00' * 32 + bytes.fromhex('ab' * 32))
+
+    request_id = '0123456789abcdef0123456789abcdef'
+    marker = (f'(executor-thread-1) Wallet proof transaction consumed '
+        f'(request={request_id}, provider=infinispan)')
+    login = {'proof_post_http': 202, 'initial_status_http': 200,
+        'transaction_consume_witness': 'observed',
+        'transaction_consume_provider_id': 'infinispan',
+        'transaction_consume_marker_count': 1,
+        'transaction_consume_marker': marker}
+    with patch.object(live.subprocess, 'run', side_effect=public_key), \
+        patch.object(live, 'packaged_resolver_readback', return_value=True), \
+        patch.object(live, 'classify_identity_lookup', return_value=('resolved', [])), \
+        patch.object(live, 'Client', return_value=object()):
+      attempt = live.invoke_current_identity_attempt('id-1', Path('/fixture.key'),
+          'kc', 'image', 1, resolver_lookup, lambda *_args: login)
+
+    self.assertEqual(202, attempt['provider_http'])
+    self.assertEqual('observed', attempt['transaction_consume_witness'])
+    self.assertEqual('infinispan', attempt['transaction_consume_provider_id'])
+    self.assertEqual(1, attempt['transaction_consume_marker_count'])
+    self.assertEqual(marker, attempt['transaction_consume_marker'])
+    projected = live.sanitize_live_checkpoint({
+        'resolver_runtime': {
+            'runtime_qualification_status': 'runtime_facts_verified',
+            'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+            'single_use_object_provider_ids': ['infinispan'],
+            'single_use_object_provider_evidence': 'not_observed',
+            'single_use_object_provider_path': 'unavailable',
+        },
+        'registry_matrix': {'current_identity': {'attempts': [attempt]}},
+    })
+    self.assertEqual('infinispan', projected['resolver_runtime']['single_use_object_provider_path'])
+    self.assertEqual(1, projected['resolver_runtime']['transaction_consume_witness_count'])
+    self.assertNotIn(request_id, repr(projected))
+    self.assertNotIn(marker, repr(projected))
+
   def test_current_identity_attempt_retains_failed_auth_outcomes(self):
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -1518,6 +1564,15 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertEqual('runtime_facts_verified', runtime['runtime_qualification_status'])
     self.assertNotIn('private-request', json.dumps(safe))
     self.assertNotIn('private-log', json.dumps(safe))
+
+  def test_provider_log_window_accepts_the_harness_millisecond_cursor(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    cursor = '2026-11-01T07:01:32.123Z'
+    with patch.object(live, '_bounded_command_tail', return_value=SimpleNamespace(
+        returncode=0, stdout='bounded logs')) as command:
+      self.assertEqual('bounded logs', live.read_provider_fault_log_window('a' * 64, cursor))
+    self.assertIn(cursor, command.call_args.args[0])
 
   def test_fresh_provider_log_window_classifies_only_the_exact_consumed_transaction(self):
     request_id = 'a' * 32
