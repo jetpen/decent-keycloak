@@ -368,12 +368,23 @@ final class WalletLoginTransportHandlerTest {
 
   @Test
   void exactRegistryMissMapsTo401AndKeepsPendingWithoutReceiptOrCallback() throws Exception {
-    var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
     var issued = store.issue(BINDING);
     KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     String identity = "mailto:identity-absent@example.org";
     byte[] proof = signedProof(issued.challenge(), identity, keyPair);
     var resolverExecutable = Files.createTempFile("identity-not-found-stub-", ".sh");
+    var logger = java.util.logging.Logger.getLogger(WalletLoginTransportHandler.class.getName());
+    var captured = new java.util.ArrayList<java.util.logging.LogRecord>();
+    var capture = new java.util.logging.Handler() {
+      @Override public void publish(java.util.logging.LogRecord record) { captured.add(record); }
+      @Override public void flush() {}
+      @Override public void close() {}
+    };
+    var previousLevel = logger.getLevel();
+    logger.setLevel(java.util.logging.Level.ALL);
+    logger.addHandler(capture);
     try {
       String expectedKey = ProcessIdentityResolver.exactRegistryObjectKeyHex(identity);
       String output = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0\n"
@@ -384,18 +395,275 @@ final class WalletLoginTransportHandlerTest {
       resolverExecutable.toFile().setExecutable(true);
       var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, resolverExecutable.toString());
       WalletLoginIdentityResolver identityResolver = resolver::resolveExact;
+      var accountCalls = new AtomicInteger();
       var handler = new WalletLoginTransportHandler(store, identityResolver, WALLET_ORIGIN, IDP_ORIGIN,
-          exact -> true);
+          exact -> { accountCalls.incrementAndGet(); return true; });
 
       var response = handler.submitProof(issued.handle(), null, null, null, null,
           "application/json", null, proof, IDP_ORIGIN);
 
       assertEquals(401, response.status());
+      assertEquals(0, accountCalls.get());
+      assertEquals(1, provider.entries.keySet().stream().filter(key -> key.startsWith(
+          "decent-wallet-login-v1:invalid-attempt:")).count());
+      assertTrue(response.body().isEmpty());
       assertTrue(store.load(issued.handle()).isPresent());
       assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
       assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+      var status = handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+          issued.csrfToken(), IDP_ORIGIN, BINDING);
+      assertEquals(200, status.status());
+      assertEquals(Map.of("status", "pending"), status.body());
+      var missingMarkers = captured.stream().filter(record -> record.getMessage().startsWith(
+          "Wallet Identity lookup completed (")).toList();
+      assertEquals(java.util.List.of("Wallet Identity lookup completed (request="
+          + WalletLoginTransportHandler.requestCorrelationId(issued.handle()) + ", outcome=not_found)"),
+          missingMarkers.stream().map(java.util.logging.LogRecord::getMessage).toList());
+      assertEquals(java.util.logging.Level.FINE, missingMarkers.getFirst().getLevel());
+      assertEquals(1, captured.size());
+      for (var record : captured) {
+        String message = record.getMessage();
+        assertFalse(message.contains(identity) || message.contains(expectedKey)
+            || message.contains(issued.handle()) || message.contains(issued.challenge())
+            || message.contains(issued.csrfToken()) || message.contains(new String(proof, StandardCharsets.UTF_8))
+            || message.contains(java.util.HexFormat.of().formatHex(rawKey(keyPair)))
+            || message.contains("DHT_LOOKUP_SUMMARY") || message.contains("Value not found for key"));
+        assertNull(record.getThrown());
+      }
+    } finally {
+      logger.removeHandler(capture);
+      logger.setLevel(previousLevel);
+      Files.deleteIfExists(resolverExecutable);
+    }
+  }
+
+  // Characterization controls: uncertain subprocess results must never be attributed as absence.
+  @Test
+  void uncertainRegistryMissesStay503WithoutMissingIdentityMarker() throws Exception {
+    String identity = "mailto:uncertain-absence@example.org";
+    String getSummary = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=1 failed=0 timeouts=0 incomplete=0\n";
+    String remoteSummary = "DHT_LOOKUP_SUMMARY stage=remote_identity attempts=1 empty=1 failed=0 timeouts=0 incomplete=0\n";
+    String miss = "Value not found for key /decent-registry/identity/"
+        + ProcessIdentityResolver.exactRegistryObjectKeyHex(identity) + "\nnot found\n";
+    String clean = getSummary + remoteSummary + miss;
+    record UncertainMiss(String label, String output, int exit) {}
+    var cases = java.util.List.of(
+        new UncertainMiss("wrong-key", getSummary + remoteSummary + "Value not found for key /decent-registry/identity/"
+            + ProcessIdentityResolver.exactRegistryObjectKeyHex("mailto:other@example.org") + "\nnot found\n", 1),
+        new UncertainMiss("unknown", "private resolver diagnostic\n" + clean, 1),
+        new UncertainMiss("mixed", clean.replace("attempts=1 empty=1 failed=0", "attempts=2 empty=1 failed=1"), 1),
+        new UncertainMiss("incomplete", clean.replace("incomplete=0", "incomplete=1"), 1),
+        new UncertainMiss("missing-summary", getSummary + miss, 1),
+        new UncertainMiss("duplicate-summary", getSummary + clean, 1),
+        new UncertainMiss("duplicate-miss", getSummary + remoteSummary + miss.replace("not found\n", "") + miss, 1),
+        new UncertainMiss("nonzero", clean, 2),
+        new UncertainMiss("transport", "Failed to open TCP stream: all attempts to connect to /ip4/127.0.0.1/tcp/9000 failed\n"
+            + clean, 1));
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var executable = Files.createTempFile("identity-uncertain-handler-", ".sh");
+    try {
+      for (var scenario : cases) {
+        writeResolverFixture(executable, scenario.output(), scenario.exit());
+        var provider = new MemoryStore();
+        var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+        var issued = store.issue(BINDING);
+        var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, executable.toString());
+        var accountCalls = new AtomicInteger();
+        var handler = new WalletLoginTransportHandler(store, resolver::resolveExact, WALLET_ORIGIN, IDP_ORIGIN,
+            exact -> { accountCalls.incrementAndGet(); return true; });
+        try (var logs = new HandlerLogCapture()) {
+          var result = handler.submitProof(issued.handle(), null, null, null, null, "application/json", null,
+              signedProof(issued.challenge(), identity, keyPair), IDP_ORIGIN);
+          assertEquals(503, result.status(), scenario.label());
+          assertTrue(result.body().isEmpty(), scenario.label());
+          assertRejectedProofRemainsPending(store, handler, issued);
+          assertEquals(0, accountCalls.get(), scenario.label());
+          assertEquals(0, provider.entries.keySet().stream().filter(key -> key.startsWith(
+              "decent-wallet-login-v1:invalid-attempt:")).count(), scenario.label());
+          assertTrue(logs.messages.stream().noneMatch(message -> message.startsWith(
+              "Wallet Identity lookup completed (")), scenario.label());
+          assertEquals(java.util.List.of("Wallet Identity resolver unavailable (request="
+              + WalletLoginTransportHandler.requestCorrelationId(issued.handle())
+              + ", IdentityResolutionException)"), logs.messages, scenario.label());
+        }
+      }
+    } finally {
+      Files.deleteIfExists(executable);
+    }
+  }
+
+  // The subprocess resolves the key for signature checks; wrong challenges stop before any lookup.
+  // A mismatched resolved Identity is injected at the handler seam: ProcessIdentityResolver itself rejects it as 503.
+  @Test
+  void resolvedProofRejectionsStay401WithoutMissingIdentityMarker() throws Exception {
+    String identity = "mailto:resolved-rejection@example.org";
+    KeyPair keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    KeyPair otherKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String json = new ObjectMapper().writeValueAsString(Map.of("identifier", identity,
+        "owner_name_hex", java.util.HexFormat.of().formatHex(identity.getBytes(StandardCharsets.UTF_8)),
+        "owner_public_key_hex", java.util.HexFormat.of().formatHex(rawKey(keyPair)), "seq", 0));
+    var executable = Files.createTempFile("identity-resolved-rejection-handler-", ".sh");
+    try {
+      writeResolverFixture(executable, json, 0);
+      for (String scenario : java.util.List.of("invalid-signature", "wrong-challenge", "wrong-identity")) {
+        var provider = new MemoryStore();
+        var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+        var issued = store.issue(BINDING);
+        var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, executable.toString());
+        var lookupCalls = new AtomicInteger();
+        WalletLoginIdentityResolver identities = exact -> {
+          lookupCalls.incrementAndGet();
+          return scenario.equals("wrong-identity")
+              ? new WalletIdentityKeyResolver.ResolvedIdentityKey("mailto:other@example.org", rawKey(keyPair))
+              : resolver.resolveExact(exact);
+        };
+        var accountCalls = new AtomicInteger();
+        var handler = new WalletLoginTransportHandler(store, identities, WALLET_ORIGIN, IDP_ORIGIN,
+            exact -> { accountCalls.incrementAndGet(); return true; });
+        String challenge = scenario.equals("wrong-challenge") ? store.issue(new WalletLoginTransactionStore.Binding(
+            BINDING.realmId(), BINDING.clientId(), "other-root", "other-tab", BINDING.redirectUri(), IDP_ORIGIN))
+            .challenge() : issued.challenge();
+        byte[] proof = signedProof(challenge, identity, scenario.equals("invalid-signature") ? otherKey : keyPair);
+        try (var logs = new HandlerLogCapture()) {
+          var result = handler.submitProof(issued.handle(), null, null, null, null,
+              "application/json", null, proof, IDP_ORIGIN);
+          assertEquals(401, result.status(), scenario);
+          assertTrue(result.body().isEmpty(), scenario);
+          assertRejectedProofRemainsPending(store, handler, issued);
+          assertEquals(scenario.equals("wrong-challenge") ? 0 : 1, lookupCalls.get(), scenario);
+          assertEquals(0, accountCalls.get(), scenario);
+          assertEquals(1, provider.entries.keySet().stream().filter(key -> key.startsWith(
+              "decent-wallet-login-v1:invalid-attempt:")).count(), scenario);
+          assertTrue(logs.messages.isEmpty(), scenario);
+        }
+      }
+    } finally {
+      Files.deleteIfExists(executable);
+    }
+  }
+
+  @Test
+  void accountDenialCandidateCapFailureIsUnavailableRatherThanPolicyDenial() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:disabled-cap-unavailable@example.org";
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var users = mock(org.keycloak.models.UserProvider.class);
+    when(users.searchForUserByUserAttributeStream(realm,
+        WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identity))
+        .thenReturn(java.util.stream.IntStream.range(0, 65)
+            .mapToObj(index -> mock(org.keycloak.models.UserModel.class)));
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return false; }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(users, realm, exactIdentityId);
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        return WalletLoginAccountMapping.ensureEnabledUser(users, realm, exactIdentityId, true);
+      }
+    };
+    var resolverExecutable = Files.createTempFile("identity-exact-result-", ".sh");
+    try {
+      String hex = java.util.HexFormat.of().formatHex(identity.getBytes(StandardCharsets.UTF_8));
+      String result = new ObjectMapper().writeValueAsString(Map.of("identifier", identity,
+          "owner_name_hex", hex, "owner_public_key_hex", java.util.HexFormat.of().formatHex(rawKey(keyPair)),
+          "seq", 0));
+      writeResolverFixture(resolverExecutable, result, 0);
+      var handler = new WalletLoginTransportHandler(store,
+          new ProcessIdentityResolver(new String[] {"peer"}, 8000, resolverExecutable.toString())::resolveExact,
+          WALLET_ORIGIN, IDP_ORIGIN, accounts, true);
+
+      try (var logs = new HandlerLogCapture()) {
+        var response = handler.submitProof(issued.handle(), null, null, null, null,
+            "application/json", null, signedProof(issued.challenge(), identity, keyPair), IDP_ORIGIN);
+
+        assertEquals(503, response.status());
+        assertTrue(response.body().isEmpty());
+        assertRejectedProofRemainsPending(store, handler, issued);
+        assertTrue(logs.messages.stream().anyMatch(message -> message.matches(
+            "Wallet account mapping lookup unavailable \\(request=[0-9a-f]{32}, IllegalStateException\\)")));
+        assertTrue(logs.messages.stream().noneMatch(message -> message.startsWith(
+            "Wallet account policy rejected proof")));
+      }
+      org.mockito.Mockito.verify(users, org.mockito.Mockito.never()).addUser(
+          org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+          org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyBoolean(),
+          org.mockito.ArgumentMatchers.anyBoolean());
     } finally {
       Files.deleteIfExists(resolverExecutable);
+    }
+  }
+
+  private static void writeResolverFixture(java.nio.file.Path executable, String output, int exit) throws Exception {
+    String encoded = Base64.getEncoder().encodeToString(output.getBytes(StandardCharsets.UTF_8));
+    Files.writeString(executable, "#!/bin/sh\nprintf '%s' '" + encoded + "' | base64 -d\nexit " + exit + "\n");
+    assertTrue(executable.toFile().setExecutable(true));
+  }
+
+  private static void assertRejectedProofRemainsPending(WalletLoginTransactionStore store,
+      WalletLoginTransportHandler handler, WalletLoginTransactionStore.IssuedTransaction issued) {
+    assertTrue(store.load(issued.handle()).isPresent());
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    var status = handler.getStatus(issued.handle(), null, "same-origin", "cors", "empty",
+        issued.csrfToken(), IDP_ORIGIN, BINDING);
+    assertEquals(200, status.status());
+    assertEquals(Map.of("status", "pending"), status.body());
+  }
+
+  private static final class HandlerLogCapture implements AutoCloseable {
+    private final java.util.List<String> messages = new java.util.ArrayList<>();
+    private final java.util.logging.Logger logger = java.util.logging.Logger.getLogger(
+        WalletLoginTransportHandler.class.getName());
+    private final java.util.logging.Level previousLevel = logger.getLevel();
+    private final java.util.logging.Handler capture = new java.util.logging.Handler() {
+      @Override public void publish(java.util.logging.LogRecord record) { messages.add(record.getMessage()); }
+      @Override public void flush() {}
+      @Override public void close() {}
+    };
+    HandlerLogCapture() {
+      logger.setLevel(java.util.logging.Level.ALL);
+      logger.addHandler(capture);
+    }
+    @Override public void close() {
+      logger.removeHandler(capture);
+      logger.setLevel(previousLevel);
+    }
+  }
+
+  @Test
+  void recoveredRotationSummaryRejectsStaleKeyAndAcceptsCurrentKey() throws Exception {
+    String identity = "rotation-handler@example.invalid";
+    KeyPair oldOwner = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    KeyPair currentOwner = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String summary = "DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=0 failed=0 timeouts=0 incomplete=0\n";
+    String json = new ObjectMapper().writeValueAsString(Map.of(
+        "identifier", identity, "owner_name_hex", java.util.HexFormat.of().formatHex(identity.getBytes(StandardCharsets.UTF_8)),
+        "owner_public_key_hex", java.util.HexFormat.of().formatHex(rawKey(currentOwner)), "seq", 2,
+        "authorization", Map.of("operation", 5, "threshold", 2)));
+    var executable = Files.createTempFile("identity-rotated-handler-", ".sh");
+    try {
+      String encoded = Base64.getEncoder().encodeToString((summary + json).getBytes(StandardCharsets.UTF_8));
+      Files.writeString(executable, "#!/bin/sh\nprintf '%s' '" + encoded + "' | base64 -d\n");
+      executable.toFile().setExecutable(true);
+      for (boolean stale : new boolean[] {true, false}) {
+        var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
+        var issued = store.issue(BINDING);
+        var resolver = new ProcessIdentityResolver(new String[] {"peer"}, 8000, executable.toString());
+        var handler = new WalletLoginTransportHandler(store, resolver::resolveExact, WALLET_ORIGIN, IDP_ORIGIN,
+            exact -> identity.equals(exact));
+        byte[] proof = signedProof(issued.challenge(), identity, stale ? oldOwner : currentOwner);
+        var response = handler.submitProof(issued.handle(), null, null, null, null,
+            "application/json", null, proof, IDP_ORIGIN);
+        assertEquals(stale ? 401 : 202, response.status());
+        assertEquals(stale, store.load(issued.handle()).isPresent());
+        assertEquals(!stale, store.getAccepted(issued.handle(), BINDING).isPresent());
+        assertEquals(!stale, store.callbackGateAvailable(issued.handle(), BINDING));
+      }
+    } finally {
+      Files.deleteIfExists(executable);
     }
   }
 

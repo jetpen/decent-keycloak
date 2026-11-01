@@ -12,6 +12,12 @@ os.environ.setdefault("WALLET_IT_NATIVE_LIBS", "/unused-test-library-path")
 sys.path.insert(0, str(Path(__file__).parent))
 import wallet_login_live_e2e as probe  # noqa: E402
 
+SAFE_ACCOUNT_DENIAL_RESPONSE = {
+    'response_body_safe': True, 'headers_safe': True, 'location_safe': True,
+    'redirects_safe': True, 'status_pending': True,
+    'no_acceptance_or_callback': True,
+}
+
 
 class SignupIntentProbeTest(unittest.TestCase):
   def test_credential_file_unlink_retries_transient_errors(self):
@@ -423,22 +429,31 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertEqual('unavailable', probe.exact_registry_lookup_outcome(handshake_output, 1, identifier))
 
   def test_unmapped_account_403_requires_a_successful_registry_lookup_for_policy_attribution(self):
-    denied = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'])
-    missing_policy_trace = probe.account_mapping_denial_result(403, 'resolved', [])
+    denied = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    missing_policy_trace = probe.account_mapping_denial_result(403, 'resolved', [],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     resolver_failed = probe.account_mapping_denial_result(
-        403, 'resolved', ['account-policy-rejected', 'identity-resolver-unavailable'])
+        403, 'resolved', ['account-policy-rejected', 'identity-resolver-unavailable'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     mapping_failed = probe.account_mapping_denial_result(
-        403, 'resolved', ['account-policy-rejected', 'account-mapping-unavailable'])
-    unclassified = probe.account_mapping_denial_result(403, 'unavailable', ['account-policy-rejected'])
-    unavailable = probe.account_mapping_denial_result(503, 'unavailable', ['peer_handshake'])
+        403, 'resolved', ['account-policy-rejected', 'account-mapping-unavailable'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    unclassified = probe.account_mapping_denial_result(403, 'unavailable', ['account-policy-rejected'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    unavailable = probe.account_mapping_denial_result(503, 'unavailable', ['peer_handshake'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     policy_log_on_unavailable = probe.account_mapping_denial_result(
-        503, 'resolved', ['account-policy-rejected'])
+        503, 'resolved', ['account-policy-rejected'], response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     mapping_unavailable = probe.account_mapping_denial_result(
-        503, 'resolved', ['account-mapping-unavailable'])
-    confirmed_missing = probe.account_mapping_denial_result(503, 'not_found', [])
-    lookup_unavailable = probe.account_mapping_denial_result(503, 'unavailable', [])
+        503, 'resolved', ['account-mapping-unavailable'], response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    confirmed_missing = probe.account_mapping_denial_result(503, 'not_found', [],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    lookup_unavailable = probe.account_mapping_denial_result(503, 'unavailable', [],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     inconsistent_account_mapping = probe.account_mapping_denial_result(
-        403, 'not_found', ['account-policy-rejected'])
+        403, 'not_found', ['account-policy-rejected'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     self.assertEqual(confirmed_missing['outcome'], 'provider_registry_inconsistent')
     self.assertEqual(lookup_unavailable['outcome'], 'registry_unavailable')
     self.assertEqual(inconsistent_account_mapping['outcome'], 'provider_denied_unclassified')
@@ -470,8 +485,10 @@ class SignupIntentProbeTest(unittest.TestCase):
     self.assertEqual(expected, actual)
 
   def test_account_policy_denial_requires_fresh_attribution_and_pending_state(self):
-    attributed = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'])
-    unclassified = probe.account_mapping_denial_result(403, 'resolved', [])
+    attributed = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    unclassified = probe.account_mapping_denial_result(403, 'resolved', [],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
     accepted = probe.account_mapping_denial_result(202, 'resolved', [])
     self.assertTrue(probe.account_policy_denial_is_attributed(attributed))
     self.assertFalse(probe.account_policy_denial_is_attributed(unclassified))
@@ -512,6 +529,165 @@ class SignupIntentProbeTest(unittest.TestCase):
     ]
     self.assertEqual(probe.new_account_mapping_log_categories(prior, current, expected_request_id),
         ['account-policy-rejected'])
+
+  def test_account_policy_marker_parser_rejects_duplicate_malformed_and_conflicting_lines(self):
+    request_id = '0123456789abcdef0123456789abcdef'
+    policy = (f'DEBUG Wallet account policy rejected proof (request={request_id}, '
+        'signup=false, registered=false, occupied=false)')
+    resolver = (f'WARN Wallet Identity resolver unavailable (request={request_id}, '
+        'IdentityResolutionException)')
+    malformed = 'DEBUG Wallet account policy rejected proof (request=bad, signup=false, registered=false, occupied=false)'
+    prior = ['prior log line']
+
+    for line in (policy + ' ' + policy, policy + ' ' + malformed, policy + ' ' + resolver):
+      with self.subTest(line=line):
+        self.assertEqual([], probe.new_account_mapping_log_categories(
+            prior, prior + [line], request_id))
+
+  def test_account_policy_attribution_rejects_duplicate_request_witnesses(self):
+    duplicate = probe.account_mapping_denial_result(403, 'resolved', [
+        'account-policy-rejected', 'account-policy-rejected'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    self.assertEqual(duplicate['outcome'], 'provider_denied_unclassified')
+    self.assertFalse(probe.account_policy_denial_is_attributed(duplicate))
+
+  def test_account_policy_denial_requires_safe_proof_and_status_responses(self):
+    denial = probe.account_mapping_denial_result(
+        403, 'resolved', ['account-policy-rejected'],
+        response_safety={'response_body_safe': True, 'headers_safe': True,
+            'location_safe': True, 'redirects_safe': True, 'status_pending': True,
+            'no_acceptance_or_callback': False})
+    self.assertEqual(denial['outcome'], 'provider_denied_unclassified')
+    self.assertFalse(probe.account_policy_denial_is_attributed(denial))
+
+  def test_account_policy_denial_response_safety_rejects_leaked_material_and_redirects(self):
+    safe = probe.account_policy_denial_response_safety(
+        b'{}', {}, [], 200, b'{"status":"pending"}', {}, [])
+    self.assertTrue(safe['no_acceptance_or_callback'])
+    unsafe_evidence = (
+        probe.account_policy_denial_response_safety(
+            b'{"message":"code=private-code","message":"ordinary denial"}', {}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'Location': 'https://rp.example/callback?code=private-code'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{"message":"x_receipt_id=private-receipt"}', {}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'Location': 'https://rp.example/failure?x_callback_url=opaque'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'Location': 'https://rp.example/failure/x_receipt_id/opaque'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'X-Callback-URL': 'https://rp.example/callback'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'XCallbackUrl': 'opaque'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'XReceiptId': 'opaque'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {'XAuthorizationCode': 'opaque'}, [],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {}, [{'status': 302}],
+            200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            None, {}, [], 200, b'{"status":"pending"}', {}, []),
+        probe.account_policy_denial_response_safety(
+            b'{}', {}, [], 200, b'{"status":"accepted","callback":"private"}', {}, []),
+    )
+    for unsafe in unsafe_evidence:
+      self.assertFalse(unsafe['no_acceptance_or_callback'])
+      self.assertNotIn('private-code', repr(unsafe))
+
+    class DuplicateLocationHeaders(dict):
+      def get_all(self, _name):
+        return ['https://rp.example/ordinary',
+            'https://rp.example/callback?code=private-code']
+
+    duplicate_location = probe.account_policy_denial_response_safety(
+        b'{}', DuplicateLocationHeaders({'Location': 'https://rp.example/ordinary'}), [],
+        200, b'{"status":"pending"}', {}, [])
+    self.assertFalse(duplicate_location['no_acceptance_or_callback'])
+    self.assertNotIn('private-code', repr(duplicate_location))
+    self.assertTrue(safe['response_body_safe'])
+
+  def test_interleaved_concurrent_denial_markers_are_attributed_to_their_opaque_requests(self):
+    first_request = '0123456789abcdef0123456789abcdef'
+    second_request = 'abcdef0123456789abcdef0123456789'
+    prior = ['baseline log']
+    current = prior + [
+        'DEBUG Wallet account policy lookup started (signup=false, registration-enabled=false)',
+        f'DEBUG Wallet account policy rejected proof (request={first_request}, signup=false, registered=false, occupied=false)',
+        'DEBUG Wallet account policy occupancy observed (occupied=true)',
+        f'DEBUG Wallet account policy rejected proof (request={second_request}, signup=false, registered=false, occupied=true)',
+    ]
+    first = probe.new_account_mapping_log_categories(prior, current, first_request)
+    second = probe.new_account_mapping_log_categories(prior, current, second_request)
+    first_result = probe.account_mapping_denial_result(403, 'resolved', first,
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    second_result = probe.account_mapping_denial_result(403, 'resolved', second,
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+
+    self.assertEqual(first, ['account-policy-rejected'])
+    self.assertEqual(second, ['account-policy-rejected'])
+    self.assertTrue(probe.account_policy_denial_is_attributed(first_result))
+    self.assertTrue(probe.account_policy_denial_is_attributed(second_result))
+    self.assertNotIn(first_request, repr((first_result, second_result)))
+    self.assertNotIn(second_request, repr((first_result, second_result)))
+
+  def test_concurrent_account_denial_runner_observes_overlapping_flows(self):
+    import threading
+
+    barrier = threading.Barrier(3)
+    completions = []
+    def make_flow(name):
+      def flow():
+        barrier.wait(timeout=2)
+        return {'outcome': 'policy_denied', 'scenario': name}
+      return flow
+
+    cases = [
+        ('unmapped-account', make_flow('unmapped-account')),
+        ('disabled-account', make_flow('disabled-account')),
+        ('ambiguous-account', make_flow('ambiguous-account')),
+    ]
+    observed = probe.run_concurrent_account_denial_flows(
+        cases, on_case_complete=lambda name, _outcome: completions.append(name))
+
+    self.assertEqual(observed['max_concurrent_flows'], 3)
+    self.assertEqual(set(observed['cases']), {name for name, _flow in cases})
+    self.assertCountEqual(completions, [name for name, _flow in cases])
+
+  def test_account_denial_concurrency_sanitizer_keeps_only_bounded_facts(self):
+    request_id = '0123456789abcdef0123456789abcdef'
+    evidence = probe.sanitize_live_checkpoint({'account_denial_concurrency': {
+        'case_count': 3, 'max_concurrent_flows': 3, 'overlap_observed': True,
+        'all_policy_denied': True, 'request_id': request_id}})
+    self.assertEqual(evidence, {'account_denial_concurrency': {
+        'case_count': 3, 'max_concurrent_flows': 3, 'overlap_observed': True,
+        'all_policy_denied': True}})
+    self.assertNotIn(request_id, repr(evidence))
+    case = probe.account_mapping_denial_result(403, 'resolved', ['account-policy-rejected'],
+        response_safety=SAFE_ACCOUNT_DENIAL_RESPONSE)
+    case.update({'request_id': request_id, 'identity_id': 'private-identity'})
+    case_evidence = probe.sanitize_live_checkpoint({'disabled_account_case': case})
+    self.assertTrue(case_evidence['disabled_account_case']['response_body_safe'])
+    self.assertTrue(case_evidence['disabled_account_case']['headers_safe'])
+    self.assertTrue(case_evidence['disabled_account_case']['location_safe'])
+    self.assertTrue(case_evidence['disabled_account_case']['redirects_safe'])
+    self.assertTrue(case_evidence['disabled_account_case']['status_pending'])
+    self.assertNotIn(request_id, repr(case_evidence))
+    self.assertNotIn('private-identity', repr(case_evidence))
+
+    inconsistent = probe.sanitize_live_checkpoint({'account_denial_concurrency': {
+        'case_count': 3, 'max_concurrent_flows': 1, 'overlap_observed': True,
+        'all_policy_denied': True}})
+    self.assertEqual(inconsistent, {})
 
   def test_signup_template_starts_status_polling_for_signup_as_well_as_login(self):
     source = (Path(__file__).parents[1] / 'src/main/resources/theme-resources/templates/wallet-login.ftl').read_text()

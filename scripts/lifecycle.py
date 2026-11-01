@@ -56,11 +56,146 @@ ISSUE5_GATES = {
   "malformed_result": "not_run",
   "history_incomplete": "not_run",
   "ambiguous_registry_result": "not_run",
+  "mixed_legacy_rotated_head": "not_run",
   "valid_current_key_proof": "not_run",
   "stale_key_denial": "not_run",
   "owner_key_rotation": "not_run",
   "independent_rotation_readback": "not_run",
 }
+ISSUE5_ADVERSARIAL_CASES = {
+  "malformed_result": "hostile-peer-malformed",
+  "history_incomplete": "hostile-peer-history-incomplete",
+  "ambiguous_registry_result": "hostile-peer-ambiguous",
+  "mixed_legacy_rotated_head": "hostile-peer-mixed-head",
+}
+ISSUE5_LIVE_MATRIX_PROFILE = "default"
+
+
+def issue5_adversarial_gate_statuses(evidence: object) -> dict[str, str]:
+  """Map only two complete fail-closed attempts per hostile fixture to unavailable."""
+  matrix = evidence.get("registry_matrix") if isinstance(evidence, dict) else None
+  statuses: dict[str, str] = {}
+  for case_name, fixture_label in ISSUE5_ADVERSARIAL_CASES.items():
+    case = matrix.get(case_name) if isinstance(matrix, dict) else None
+    attempts = case.get("attempts") if isinstance(case, dict) else None
+    attempt_items = attempts if isinstance(attempts, list) and len(attempts) == 2 else []
+    qualified = len(attempt_items) == 2
+    for attempt in attempt_items:
+      if not isinstance(attempt, dict):
+        qualified = False
+        break
+      digests_valid = all(
+          isinstance(attempt.get(field), str)
+          and re.fullmatch(r"[0-9a-f]{64}", attempt[field]) is not None
+          for field in ("fixture_source_sha256", "fixture_case_constants_sha256"))
+      if not (
+          attempt.get("fixture_evidence") == "test-only-hostile-peer"
+          and attempt.get("fixture") == fixture_label
+          and digests_valid
+          and attempt.get("direct_resolution") == "unavailable"
+          and attempt.get("provider_http") == 503
+          and attempt.get("status_http") == 200
+          and attempt.get("status_pending") is True
+          and attempt.get("no_acceptance_or_callback") is True
+          and attempt.get("no_authorization_code") is True
+          and attempt.get("fixture_cli_key_observed") is True
+          and attempt.get("fixture_provider_key_observed") is True
+          and attempt.get("fixture_all_provider_peers_observed") is True
+      ):
+        qualified = False
+        break
+    statuses[case_name] = "unavailable" if qualified else "inconclusive"
+  return statuses
+
+
+def _issue5_two_attempt_status(evidence: object, case_name: str,
+    required_fields: set[str], predicate) -> str:
+  matrix = evidence.get("registry_matrix") if isinstance(evidence, dict) else None
+  case = matrix.get(case_name) if isinstance(matrix, dict) else None
+  attempts = case.get("attempts") if isinstance(case, dict) else None
+  if (not isinstance(attempts, list) or len(attempts) != 2
+      or any(not isinstance(attempt, dict) or not required_fields.issubset(attempt)
+          for attempt in attempts)):
+    return "inconclusive"
+  return "pass" if all(predicate(attempt) for attempt in attempts) else "fail"
+
+
+def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
+  """Map the ordinary two-attempt Registry matrix to explicit receipt gates."""
+  current_fields = {"direct_resolution", "exact_readback", "provider_http",
+      "status_http", "status_pending", "outcome"}
+  missing_fields = {"direct_resolution", "provider_http", "status_http", "status_pending",
+      "no_acceptance_or_callback", "no_authorization_code", "provider_identity_log_read",
+      "provider_identity_not_found_observed", "provider_identity_not_found_marker_count", "outcome"}
+  unavailable_fields = {"direct_resolution", "provider_http", "status_http", "status_pending",
+      "no_acceptance_or_callback", "no_authorization_code", "outcome"}
+  rotation_fields = {"direct_resolution", "exact_readback", "provider_http", "rotation_publish",
+      "current_sequence", "stale_key_proof_http", "current_key_proof_http",
+      "stale_transaction_remains_pending", "current_transaction_accepted", "outcome"}
+  current = _issue5_two_attempt_status(evidence, "current_identity", current_fields,
+      lambda attempt: attempt["direct_resolution"] == "resolved"
+          and attempt["exact_readback"] is True and attempt["provider_http"] == 202
+          and attempt["status_http"] == 200 and attempt["status_pending"] is False
+          and attempt["outcome"] == "current_accepted")
+  missing = _issue5_two_attempt_status(evidence, "missing_identity", missing_fields,
+      lambda attempt: attempt["direct_resolution"] == "not_found"
+          and attempt["provider_http"] == 401 and attempt["status_http"] == 200
+          and attempt["status_pending"] is True
+          and attempt["no_acceptance_or_callback"] is True
+          and attempt["no_authorization_code"] is True
+          and attempt["provider_identity_log_read"] is True
+          and attempt["provider_identity_not_found_observed"] is True
+          and attempt["provider_identity_not_found_marker_count"] == 1
+          and attempt["outcome"] == "provider_not_found")
+  unavailable = _issue5_two_attempt_status(evidence, "unavailable_registry", unavailable_fields,
+      lambda attempt: attempt["direct_resolution"] == "unavailable"
+          and attempt["provider_http"] == 503 and attempt["status_http"] == 200
+          and attempt["status_pending"] is True
+          and attempt["no_acceptance_or_callback"] is True
+          and attempt["no_authorization_code"] is True
+          and attempt["outcome"] == "registry_unavailable")
+  rotation = _issue5_two_attempt_status(evidence, "rotation", rotation_fields,
+      lambda attempt: attempt["direct_resolution"] == "resolved"
+          and attempt["exact_readback"] is True and attempt["provider_http"] == 202
+          and attempt["rotation_publish"] == "passed"
+          and attempt["stale_key_proof_http"] == 401
+          and attempt["current_key_proof_http"] == 202
+          and attempt["stale_transaction_remains_pending"] is True
+          and attempt["current_transaction_accepted"] is True
+          and attempt["outcome"] == "current_accepted")
+  matrix = evidence.get("registry_matrix") if isinstance(evidence, dict) else None
+  rotation_case = matrix.get("rotation") if isinstance(matrix, dict) else None
+  rotation_attempts = rotation_case.get("attempts") if isinstance(rotation_case, dict) else None
+  rotation_attempts = rotation_attempts if isinstance(rotation_attempts, list) else []
+  sequences = [attempt.get("current_sequence") if isinstance(attempt, dict) else None
+      for attempt in rotation_attempts]
+  independent_readback = _issue5_two_attempt_status(evidence, "rotation",
+      {"rotation_publish", "current_sequence", "independent_rotation_readback"},
+      lambda attempt: attempt["rotation_publish"] == "passed"
+          and type(attempt["current_sequence"]) is int
+          and attempt["independent_rotation_readback"] is True)
+  if independent_readback == "pass" and sequences != [2, 3]:
+    independent_readback = "fail"
+  rotated_identity = evidence.get("rotated_identity_case") if isinstance(evidence, dict) else None
+  owner_rotation = rotation
+  if rotation == "pass":
+    if independent_readback != "pass":
+      owner_rotation = "inconclusive" if independent_readback == "inconclusive" else "fail"
+    elif not isinstance(rotated_identity, dict) or "local_mapping_persisted" not in rotated_identity:
+      owner_rotation = "inconclusive"
+    elif rotated_identity["local_mapping_persisted"] is not True:
+      owner_rotation = "fail"
+  return {
+      "current_identity": current,
+      "exact_missing_identity": missing,
+      "registry_unavailable": unavailable,
+      "valid_current_key_proof": rotation,
+      "stale_key_denial": rotation,
+      "owner_key_rotation": owner_rotation,
+      "independent_rotation_readback": independent_readback,
+  }
+
+
 PYTHON_TEST_MODULES = tuple(name.rsplit(".", 1)[-1] for name in PYTHON_TESTS)
 
 
@@ -87,7 +222,7 @@ def core_test_stages() -> list[tuple[str, list[str] | None]]:
   ]
 
 
-def plan(profile: str) -> dict:
+def plan(profile: str, *, retain_image: bool = False) -> dict:
   steps: list[dict] = [
     {"name": "preflight", "command": [sys.executable, "scripts/lifecycle.py", "preflight"]},
   ]
@@ -102,13 +237,20 @@ def plan(profile: str) -> dict:
   ])
   if profile == "issue5-live":
     steps.append({"name": "issue5-live-matrix", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
-                  "env": {"WALLET_IT_PROFILE": "full", "WALLET_IT_IMAGE": "<run-built immutable ID>"},
+                  "env": {"WALLET_IT_PROFILE": ISSUE5_LIVE_MATRIX_PROFILE, "WALLET_IT_IMAGE": "<run-built immutable ID>"},
                   "requires": ["--allow-live"]})
+    steps.append({"name": "issue5-adversarial", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
+                  "env": {"WALLET_IT_PROFILE": "issue5-adversarial", "WALLET_IT_IMAGE": "<run-built immutable ID>"},
+                  "requires": ["--allow-live"]})
+  teardown_action = (
+      "remove run-owned immutable image and temporary source/dependency inputs unless explicitly retained"
+      if not retain_image else
+      "retain run-owned immutable image by explicit opt-in; remove temporary source/dependency inputs")
   steps.extend([
     {"name": "evidence", "action": "retain the finalized sanitized lifecycle receipt"},
-    {"name": "teardown", "action": "remove only the run-owned immutable image tag and temporary source/dependency inputs"},
+    {"name": "teardown", "action": teardown_action},
   ])
-  return {"profile": profile, "steps": steps}
+  return {"profile": profile, "steps": steps, "retain_image_requested": retain_image}
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> int:
@@ -393,6 +535,20 @@ def _cleanup_run_image(engine: str, tag: str, expected_id: str | None) -> int:
   return _image_remove(engine, tag, actual_id)
 
 
+def _retain_run_image(engine: str, tag: str, expected_id: str | None,
+    retain_requested: bool) -> tuple[bool, int]:
+  if not retain_requested or expected_id is None:
+    return False, 0
+  inspected = capture_command(_image_inspect_command(engine, tag))
+  if inspected.returncode:
+    return False, 0
+  actual_id = normalize_image_id(inspected.stdout)
+  if actual_id != expected_id:
+    print("retention: refusing to keep a run tag whose immutable ID changed", file=sys.stderr)
+    return False, 2
+  return True, 0
+
+
 def _run_capture(command: list[str], *, env: dict[str, str] | None = None) -> tuple[int, str]:
   result = subprocess.run(command, cwd=ROOT, env=env, text=True, capture_output=True, check=False)
   if result.stdout:
@@ -402,11 +558,11 @@ def _run_capture(command: list[str], *, env: dict[str, str] | None = None) -> tu
   return result.returncode, result.stdout + result.stderr
 
 
-def run_profile(profile: str, *, pull_base: bool = False) -> int:
+def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = False) -> int:
   run_id = uuid.uuid4().hex
   preflight_status = preflight(live=profile == "issue5-live")
   receipt_path = ROOT / "target/lifecycle/evidence" / f"{run_id}.json"
-  profile_steps = [step["name"] for step in plan(profile)["steps"]]
+  profile_steps = [step["name"] for step in plan(profile, retain_image=retain_image)["steps"]]
   receipt = {
     "schema_version": 1,
     "run_id": run_id,
@@ -415,7 +571,7 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
     "source": fingerprint_source(),
     "steps": {name: {"status": "not_run"} for name in profile_steps},
     "issue5_acceptance_gates": dict(ISSUE5_GATES),
-    "image": {"status": "not_built"},
+    "image": {"status": "not_built", "retention_requested": retain_image, "retained": False},
     "cleanup": {"status": "not_run"},
   }
   write_receipt(receipt_path, receipt)
@@ -508,7 +664,8 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
       _record_step(receipt, receipt_path, "provider-image", "fail", detail="immutable_id_invalid")
       return 2
     receipt["image"] = {"status": "built", "engine": engine, "run_owned_tag": tag,
-                        "immutable_id": built_image_id}
+                        "immutable_id": built_image_id,
+                        "retention_requested": retain_image, "retained": False}
     write_receipt(receipt_path, receipt)
 
     current_step = None
@@ -532,44 +689,123 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
       assert built_image_id is not None
       live_env = dict(os.environ)
       live_env["WALLET_IT_IMAGE"] = built_image_id
-      live_env["WALLET_IT_PROFILE"] = "full"
+      live_env["WALLET_IT_PROFILE"] = ISSUE5_LIVE_MATRIX_PROFILE
       live_status, live_output = _run_capture(
           [sys.executable, "scripts/wallet_login_live_e2e.py"], env=live_env)
       evidence_prefix = "evidence="
+      evidence_lines = [line[len(evidence_prefix):]
+                        for line in live_output.splitlines() if line.startswith(evidence_prefix)]
       if live_status:
+        receipt["issue5_acceptance_gates"].update(
+            {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
+        if len(evidence_lines) == 1:
+          try:
+            partial_evidence = json.loads(evidence_lines[0])
+          except json.JSONDecodeError:
+            partial_evidence = None
+          if isinstance(partial_evidence, dict):
+            receipt["issue5_live_evidence"] = partial_evidence
+            receipt["issue5_acceptance_gates"].update(
+                issue5_live_matrix_gate_statuses(partial_evidence))
         _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
                      detail=f"exit_{live_status}")
         return live_status
-      evidence_lines = [line[len(evidence_prefix):]
-                        for line in live_output.splitlines() if line.startswith(evidence_prefix)]
       if len(evidence_lines) != 1:
+        receipt["issue5_acceptance_gates"].update(
+            {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
         _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
                      detail="sanitized_evidence_missing_or_ambiguous")
         return 2
       try:
         live_evidence = json.loads(evidence_lines[0])
       except json.JSONDecodeError:
-        _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
-                     detail="sanitized_evidence_invalid")
-        return 2
+        live_evidence = None
       if not isinstance(live_evidence, dict):
+        receipt["issue5_acceptance_gates"].update(
+            {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
         _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
                      detail="sanitized_evidence_invalid")
         return 2
       receipt["issue5_live_evidence"] = live_evidence
+      matrix_gate_statuses = issue5_live_matrix_gate_statuses(live_evidence)
+      receipt["issue5_acceptance_gates"].update(matrix_gate_statuses)
+      if any(status != "pass" for status in matrix_gate_statuses.values()):
+        _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
+                     detail="acceptance_gate_evidence_inconclusive_or_failed")
+        return 2
       _record_step(receipt, receipt_path, "issue5-live-matrix", "pass",
-                   detail="harness_completed_evidence_retained_gates_unmapped")
+                   detail="all_mapped_live_matrix_gates_passed")
+      current_step = None
+
+      current_step = "issue5-adversarial"
+      adversarial_env = dict(os.environ)
+      adversarial_env["WALLET_IT_IMAGE"] = built_image_id
+      adversarial_env["WALLET_IT_PROFILE"] = "issue5-adversarial"
+      adversarial_status, adversarial_output = _run_capture(
+          [sys.executable, "scripts/wallet_login_live_e2e.py"], env=adversarial_env)
+      evidence_prefix = "issue5-adversarial-evidence="
+      evidence_lines = [line.split("=", 1)[1].strip()
+                        for line in adversarial_output.splitlines()
+                        if line.startswith(evidence_prefix)]
+      if adversarial_status:
+        receipt["issue5_acceptance_gates"].update(
+            {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+        if len(evidence_lines) == 1:
+          try:
+            receipt["issue5_adversarial_evidence"] = json.loads(evidence_lines[0])
+          except json.JSONDecodeError:
+            pass
+        _record_step(receipt, receipt_path, current_step, "fail",
+                     detail=f"exit_{adversarial_status}")
+        return adversarial_status
+      if len(evidence_lines) != 1:
+        receipt["issue5_acceptance_gates"].update(
+            {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+        _record_step(receipt, receipt_path, current_step, "fail",
+                     detail="sanitized_evidence_missing_or_ambiguous")
+        return 2
+      try:
+        adversarial_evidence = json.loads(evidence_lines[0])
+      except json.JSONDecodeError:
+        adversarial_evidence = None
+      if not isinstance(adversarial_evidence, dict):
+        receipt["issue5_acceptance_gates"].update(
+            {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+        _record_step(receipt, receipt_path, current_step, "fail",
+                     detail="sanitized_evidence_invalid")
+        return 2
+      receipt["issue5_adversarial_evidence"] = adversarial_evidence
+      adversarial_gate_statuses = issue5_adversarial_gate_statuses(adversarial_evidence)
+      receipt["issue5_acceptance_gates"].update(adversarial_gate_statuses)
+      if any(status != "unavailable" for status in adversarial_gate_statuses.values()):
+        _record_step(receipt, receipt_path, current_step, "fail",
+                     detail="adversarial_gate_evidence_inconclusive")
+        return 2
+      _record_step(receipt, receipt_path, current_step, "pass",
+                   detail="bounded_fixture_evidence_mapped_fail_closed")
       current_step = None
     return 0
   except KeyboardInterrupt:
     failure_code = 130
     receipt["interrupted"] = True
+    if current_step == "issue5-live-matrix":
+      receipt["issue5_acceptance_gates"].update(
+          {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
+    if current_step == "issue5-adversarial":
+      receipt["issue5_acceptance_gates"].update(
+          {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
     if current_step and receipt["steps"][current_step]["status"] == "not_run":
       _record_step(receipt, receipt_path, current_step, "interrupted", detail="keyboard_interrupt")
     return failure_code
   except Exception as error:
     failure_code = 2
     receipt["failure_category"] = type(error).__name__
+    if current_step == "issue5-live-matrix":
+      receipt["issue5_acceptance_gates"].update(
+          {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
+    if current_step == "issue5-adversarial":
+      receipt["issue5_acceptance_gates"].update(
+          {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
     if current_step and receipt["steps"][current_step]["status"] == "not_run":
       _record_step(receipt, receipt_path, current_step, "fail", detail=f"exception_{type(error).__name__}")
     print(f"lifecycle failed: {type(error).__name__}", file=sys.stderr)
@@ -581,12 +817,20 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
         source_parent.cleanup()
       except OSError:
         cleanup_failures.append("temporary_source_cleanup_failed")
+    image_retained = False
     if image_build_started:
-      image_cleanup = _cleanup_run_image(engine, tag, built_image_id)
-      if image_cleanup:
-        cleanup_failures.append("image_cleanup_failed")
+      image_retained, retention_status = _retain_run_image(
+          engine, tag, built_image_id, retain_image)
+      if retention_status:
+        cleanup_failures.append("run_image_identity_changed")
+      elif not image_retained:
+        image_cleanup = _cleanup_run_image(engine, tag, built_image_id)
+        if image_cleanup:
+          cleanup_failures.append("image_cleanup_failed")
+    receipt["image"]["retained"] = image_retained
     cleanup_code = 2 if cleanup_failures else 0
-    receipt["cleanup"] = {"status": "pass" if cleanup_code == 0 else "fail"}
+    receipt["cleanup"] = {"status": "pass" if cleanup_code == 0 else "fail",
+        "image_retained": image_retained}
     if cleanup_failures:
       failure_code = cleanup_code
       receipt["cleanup"]["detail"] = ",".join(cleanup_failures)
@@ -603,6 +847,204 @@ def run_profile(profile: str, *, pull_base: bool = False) -> int:
     print(f"lifecycle receipt: {receipt_path}")
     if cleanup_code:
       raise SystemExit(cleanup_code)
+
+
+def promotion_source_from_receipt(receipt: object) -> tuple[str, str, str]:
+  """Require a complete successful Issue #5 live receipt and its retained immutable image."""
+  if not isinstance(receipt, dict) or receipt.get("profile") != "issue5-live" or receipt.get("exit_code") != 0:
+    raise ValueError("promotion requires a successful issue5-live receipt")
+  gates = receipt.get("issue5_acceptance_gates")
+  if not isinstance(gates, dict) or set(gates) != set(ISSUE5_GATES):
+    raise ValueError("promotion receipt has incomplete acceptance gates")
+  expected_gates = {
+      name: ("unavailable" if name in ISSUE5_ADVERSARIAL_CASES else "pass")
+      for name in ISSUE5_GATES
+  }
+  if gates != expected_gates:
+    raise ValueError("promotion requires all Issue #5 acceptance gates to pass")
+  cleanup = receipt.get("cleanup")
+  if not isinstance(cleanup, dict) or cleanup.get("status") != "pass":
+    raise ValueError("promotion receipt cleanup is not verified")
+  image = receipt.get("image")
+  if not isinstance(image, dict) or image.get("status") != "built":
+    raise ValueError("promotion receipt has no built image")
+  if image.get("retention_requested") is not True or image.get("retained") is not True:
+    raise ValueError("promotion requires explicit retention of the accepted local image")
+  engine = image.get("engine")
+  if engine not in {"podman", "docker"}:
+    raise ValueError("promotion receipt has an unsupported image engine")
+  image_id = normalize_image_id(image.get("immutable_id", ""))
+  tag = image.get("run_owned_tag")
+  if image_id is None or not isinstance(tag, str) or not tag.startswith(
+      "decent-keycloak-wallet-provider:lifecycle-"):
+    raise ValueError("promotion receipt has invalid immutable image provenance")
+  source = receipt.get("source")
+  if not isinstance(source, dict):
+    raise ValueError("promotion receipt lacks source provenance")
+  revision = source.get("revision")
+  if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) is None:
+    raise ValueError("promotion receipt has invalid source revision")
+  for field in ("harness_sha256", "resolver_manifest_sha256",
+      "resolver_dependency_provenance_sha256", "resolver_requirements_sha256"):
+    if not isinstance(source.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", source[field]) is None:
+      raise ValueError("promotion receipt lacks complete source digest provenance")
+  return engine, tag, image_id
+
+
+def manifest_identity(raw_manifest: bytes, expected_image_id: str) -> tuple[str, str]:
+  try:
+    manifest = json.loads(raw_manifest)
+  except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise ValueError("registry manifest is invalid") from error
+  config = manifest.get("config") if isinstance(manifest, dict) else None
+  config_digest = config.get("digest") if isinstance(config, dict) else None
+  if not isinstance(config_digest, str) or config_digest != expected_image_id:
+    raise ValueError("manifest image identity does not match accepted immutable ID")
+  return "sha256:" + hashlib.sha256(raw_manifest).hexdigest(), config_digest
+
+
+def validate_release_candidate_destination(destination: str) -> str:
+  if not isinstance(destination, str) or not destination.startswith("docker://"):
+    raise ValueError("destination must use the docker:// registry transport")
+  reference = destination[len("docker://"):]
+  pattern = (r"[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?/"
+      r"[a-z0-9]+(?:[._/-][a-z0-9]+)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+  if re.fullmatch(pattern, reference) is None or "@" in reference:
+    raise ValueError("destination must be a registry repository with an explicit tag and no credentials")
+  tag = reference.rsplit(":", 1)[1]
+  if "rc" not in tag.casefold() and "candidate" not in tag.casefold():
+    raise ValueError("destination tag must identify a release candidate")
+  return destination
+
+
+def capture_binary_command(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+  print("+ " + shlex.join(command), flush=True)
+  return subprocess.run(command, cwd=ROOT, capture_output=True, check=False)
+
+
+def run_promotion(receipt_path: str, destination: str, *, allow_publish: bool) -> int:
+  if not allow_publish:
+    print("promotion requires explicit --allow-publish authorization", file=sys.stderr)
+    return 2
+  try:
+    destination = validate_release_candidate_destination(destination)
+    path = Path(receipt_path).expanduser()
+    if not path.is_absolute():
+      path = ROOT / path
+    raw_receipt = path.read_bytes()
+    receipt = json.loads(raw_receipt)
+    engine, source_tag, image_id = promotion_source_from_receipt(receipt)
+  except (OSError, json.JSONDecodeError, ValueError) as error:
+    print(f"promotion preflight failed: {type(error).__name__}: {error}", file=sys.stderr)
+    return 2
+  if not check_tool("container engine", [engine, "--version"], "version"):
+    return 2
+  if not check_tool("Skopeo", ["skopeo", "--version"], "skopeo version"):
+    return 2
+  info_command = ([engine, "info", "--format", "{{json .}}"] if engine == "docker"
+      else [engine, "info", "--format", "json"])
+  info = subprocess.run(info_command, cwd=ROOT, text=True, capture_output=True, check=False)
+  if info.returncode:
+    print("promotion preflight failed: container engine daemon is unavailable", file=sys.stderr)
+    return 2
+
+  promotion_id = uuid.uuid4().hex
+  temporary_tag = f"localhost/decent-issue5-promotion:{promotion_id}"
+  promotion_path = ROOT / "target/lifecycle/promotions" / f"{promotion_id}.json"
+  promotion = {
+      "schema_version": 1,
+      "promotion_id": promotion_id,
+      "status": "failed",
+      "source_receipt_sha256": hashlib.sha256(raw_receipt).hexdigest(),
+      "source_image_id": image_id,
+      "source_run_tag": source_tag,
+      "destination": destination,
+      "steps": {"local_tag": "not_run", "local_manifest": "not_run",
+          "registry_copy": "not_run", "registry_readback": "not_run",
+          "temporary_tag_cleanup": "not_run"},
+  }
+  failure_code = 1
+  local_tag_created = False
+  try:
+    existing = capture_command(_image_inspect_command(engine, temporary_tag))
+    if existing.returncode == 0:
+      promotion["failure_category"] = "temporary_tag_collision"
+      failure_code = 2
+      return failure_code
+    source_check = capture_command(_image_inspect_command(engine, source_tag))
+    if source_check.returncode or normalize_image_id(source_check.stdout) != image_id:
+      promotion["failure_category"] = "retained_source_image_mismatch"
+      failure_code = 2
+      return failure_code
+    tag_command = ([engine, "image", "tag", source_tag, temporary_tag]
+        if engine == "docker" else [engine, "tag", source_tag, temporary_tag])
+    if run(tag_command):
+      promotion["failure_category"] = "local_tag_failed"
+      failure_code = 1
+      return failure_code
+    local_tag_created = True
+    tagged = capture_command(_image_inspect_command(engine, temporary_tag))
+    if tagged.returncode or normalize_image_id(tagged.stdout) != image_id:
+      promotion["failure_category"] = "temporary_tag_identity_mismatch"
+      failure_code = 2
+      return failure_code
+    promotion["steps"]["local_tag"] = "pass"
+    transport = "containers-storage" if engine == "podman" else "docker-daemon"
+    local_manifest_result = capture_binary_command([
+        "skopeo", "inspect", "--raw", f"{transport}:{temporary_tag}"])
+    if local_manifest_result.returncode:
+      promotion["failure_category"] = "local_manifest_unavailable"
+      failure_code = 1
+      return failure_code
+    try:
+      source_manifest_digest, _ = manifest_identity(local_manifest_result.stdout, image_id)
+    except ValueError:
+      promotion["failure_category"] = "local_manifest_identity_mismatch"
+      failure_code = 2
+      return failure_code
+    promotion["source_manifest_digest"] = source_manifest_digest
+    promotion["steps"]["local_manifest"] = "pass"
+    if run(["skopeo", "copy", "--preserve-digests",
+        f"{transport}:{temporary_tag}", destination]):
+      promotion["failure_category"] = "registry_copy_failed"
+      failure_code = 1
+      return failure_code
+    promotion["steps"]["registry_copy"] = "pass"
+    manifest_result = capture_binary_command(["skopeo", "inspect", "--raw", destination])
+    if manifest_result.returncode:
+      promotion["failure_category"] = "registry_readback_failed"
+      failure_code = 1
+      return failure_code
+    try:
+      manifest_digest, config_digest = manifest_identity(manifest_result.stdout, image_id)
+    except ValueError:
+      promotion["failure_category"] = "registry_image_identity_mismatch"
+      failure_code = 2
+      return failure_code
+    if manifest_digest != promotion["source_manifest_digest"]:
+      promotion["failure_category"] = "registry_manifest_digest_mismatch"
+      failure_code = 2
+      return failure_code
+    promotion["registry_manifest_digest"] = manifest_digest
+    promotion["remote_config_digest"] = config_digest
+    promotion["steps"]["registry_readback"] = "pass"
+    promotion["status"] = "pass"
+    failure_code = 0
+  finally:
+    if local_tag_created:
+      cleanup = _image_remove(engine, temporary_tag, image_id)
+      promotion["steps"]["temporary_tag_cleanup"] = "pass" if cleanup == 0 else "fail"
+      if cleanup:
+        promotion["status"] = "fail"
+        promotion["failure_category"] = "temporary_tag_cleanup_failed"
+        failure_code = 2
+    else:
+      promotion["steps"]["temporary_tag_cleanup"] = "not_needed"
+    if failure_code and "failure_category" not in promotion:
+      promotion["failure_category"] = "promotion_failed"
+    write_receipt(promotion_path, promotion)
+    print(f"promotion receipt: {promotion_path}")
+  return failure_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -623,6 +1065,13 @@ def main(argv: list[str] | None = None) -> int:
   run_parser.add_argument("--allow-live", action="store_true", help="authorize live loopback qualification")
   run_parser.add_argument("--pull-base-images", action="store_true",
                           help="allow the Podman engine to pull pinned base images")
+  run_parser.add_argument("--retain-image", action="store_true",
+                          help="explicitly retain this run's immutable local image after receipt finalization")
+  promote_parser = subparsers.add_parser("promote", help="promote an accepted retained image to a release-candidate registry tag")
+  promote_parser.add_argument("--receipt", required=True, help="successful issue5-live lifecycle receipt")
+  promote_parser.add_argument("--destination", required=True, help="explicit docker:// registry/repository:rc-tag")
+  promote_parser.add_argument("--allow-publish", action="store_true", required=True,
+                              help="authorize publishing this exact accepted image digest")
   args = parser.parse_args(argv)
 
   if args.action == "profiles":
@@ -641,9 +1090,11 @@ def main(argv: list[str] | None = None) -> int:
     return verify_provider()
   if args.action == "diff-check":
     return diff_check()
+  if args.action == "promote":
+    return run_promotion(args.receipt, args.destination, allow_publish=args.allow_publish)
   if args.profile == "issue5-live" and not args.allow_live:
     parser.error("issue5-live requires explicit --allow-live authorization")
-  execution_plan = plan(args.profile)
+  execution_plan = plan(args.profile, retain_image=args.retain_image)
   if args.plan:
     print(json.dumps(execution_plan, sort_keys=True) if args.json else "\n".join(
       f"{step['name']}: {shlex.join(step['command']) if 'command' in step else step['action']}"
@@ -651,7 +1102,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
   if args.json:
     parser.error("--json is only valid with --plan")
-  return run_profile(args.profile, pull_base=args.pull_base_images)
+  return run_profile(args.profile, pull_base=args.pull_base_images,
+      retain_image=args.retain_image)
 
 
 if __name__ == "__main__":

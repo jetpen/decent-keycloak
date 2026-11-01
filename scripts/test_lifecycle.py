@@ -1,5 +1,6 @@
 """Public contract tests for the repository lifecycle CLI."""
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -115,6 +116,88 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertEqual(0, result)
     remove.assert_called_once_with("podman", "run-unique-tag", image_id)
 
+  def test_run_profile_retains_image_only_with_opt_in_and_matching_owned_id(self):
+    image_id = "sha256:" + "a" * 64
+    absent = subprocess.CompletedProcess([], 1, "", "")
+    present = subprocess.CompletedProcess([], 0, image_id + "\n", "")
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      with mock.patch.object(lifecycle, "ROOT", root), \
+          mock.patch.object(lifecycle, "preflight", return_value=0), \
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
+          mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
+          mock.patch.object(lifecycle, "run", return_value=0), \
+          mock.patch.object(lifecycle, "verify_provider", return_value=0), \
+          mock.patch.object(lifecycle, "_run_capture",
+              return_value=(0, "Keycloak 26.8.0\\nJVM: 21.0.12.1")), \
+          mock.patch.object(lifecycle, "diff_check", return_value=0), \
+          mock.patch.object(lifecycle, "capture_command", side_effect=[absent, present, present]), \
+          mock.patch.object(lifecycle, "_cleanup_run_image") as cleanup:
+        result = lifecycle.run_profile("offline", retain_image=True)
+
+      receipt = json.loads(next((root / "target/lifecycle/evidence").glob("*.json")).read_text())
+      self.assertEqual(0, result)
+      self.assertTrue(receipt["image"]["retained"])
+      self.assertTrue(receipt["cleanup"]["image_retained"])
+      self.assertEqual("pass", receipt["cleanup"]["status"])
+      cleanup.assert_not_called()
+
+  def test_promotion_requires_complete_live_receipt_and_explicit_image_retention(self):
+    image_id = "sha256:" + "a" * 64
+    gates = {
+        name: ("unavailable" if name in lifecycle.ISSUE5_ADVERSARIAL_CASES else "pass")
+        for name in lifecycle.ISSUE5_GATES
+    }
+    receipt = {
+        "profile": "issue5-live", "exit_code": 0,
+        "source": {"revision": "c" * 40, "harness_sha256": "d" * 64,
+            "resolver_manifest_sha256": "e" * 64,
+            "resolver_dependency_provenance_sha256": "f" * 64,
+            "resolver_requirements_sha256": "1" * 64},
+        "issue5_acceptance_gates": gates,
+        "image": {"status": "built", "engine": "podman", "run_owned_tag": "decent-keycloak-wallet-provider:lifecycle-abc",
+            "immutable_id": image_id, "retention_requested": True, "retained": True},
+        "cleanup": {"status": "pass"},
+    }
+
+    self.assertEqual(("podman", "decent-keycloak-wallet-provider:lifecycle-abc", image_id),
+        lifecycle.promotion_source_from_receipt(receipt))
+    receipt["issue5_acceptance_gates"]["exact_missing_identity"] = "not_run"
+    with self.assertRaisesRegex(ValueError, "acceptance gates"):
+      lifecycle.promotion_source_from_receipt(receipt)
+
+  def test_promotion_manifest_witness_binds_manifest_and_config_to_accepted_image_id(self):
+    image_id = "sha256:" + "a" * 64
+    manifest = json.dumps({"schemaVersion": 2, "config": {"digest": image_id},
+        "layers": []}, separators=(",", ":")).encode()
+
+    digest, config_digest = lifecycle.manifest_identity(manifest, image_id)
+
+    self.assertEqual("sha256:" + hashlib.sha256(manifest).hexdigest(), digest)
+    self.assertEqual(image_id, config_digest)
+    altered = json.dumps({"schemaVersion": 2, "config": {"digest": "sha256:" + "b" * 64},
+        "layers": []}, separators=(",", ":")).encode()
+    with self.assertRaisesRegex(ValueError, "image identity"):
+      lifecycle.manifest_identity(altered, image_id)
+
+  def test_release_candidate_destination_rejects_credentials_and_non_rc_tags(self):
+    valid = "docker://registry.example.invalid/team/provider:v1.0.0-rc.1"
+    self.assertEqual(valid, lifecycle.validate_release_candidate_destination(valid))
+    for invalid in (
+        "docker://user@registry.example.invalid/team/provider:v1.0.0-rc.1",
+        "docker://registry.example.invalid/team/provider:latest",
+    ):
+      with self.assertRaises(ValueError):
+        lifecycle.validate_release_candidate_destination(invalid)
+
+  def test_promotion_requires_explicit_publish_opt_in_before_reading_receipt(self):
+    result = self.run_cli("promote", "--receipt", "missing.json", "--destination",
+        "docker://registry.example.invalid/team/provider:v1.0.0-rc.1")
+
+    self.assertNotEqual(0, result.returncode)
+    self.assertIn("--allow-publish", result.stderr)
+
   def make_git_worktree(self, root: Path):
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.name", "Lifecycle Test"], check=True)
@@ -193,8 +276,110 @@ class LifecycleCliTest(unittest.TestCase):
     steps = {step["name"]: step for step in plan["steps"]}
     self.assertIn("provider-image", steps)
     self.assertIn("issue5-live-matrix", steps)
-    self.assertEqual("full", steps["issue5-live-matrix"]["env"]["WALLET_IT_PROFILE"])
+    self.assertEqual(lifecycle.ISSUE5_LIVE_MATRIX_PROFILE,
+        steps["issue5-live-matrix"]["env"]["WALLET_IT_PROFILE"])
     self.assertIn("--allow-live", steps["issue5-live-matrix"]["requires"])
+    self.assertIn("issue5-adversarial", steps)
+    self.assertEqual("issue5-adversarial", steps["issue5-adversarial"]["env"]["WALLET_IT_PROFILE"])
+    self.assertEqual("<run-built immutable ID>", steps["issue5-adversarial"]["env"]["WALLET_IT_IMAGE"])
+    self.assertIn("--allow-live", steps["issue5-adversarial"]["requires"])
+
+
+  def test_adversarial_gates_only_record_unavailable_for_two_complete_failed_closed_attempts(self):
+    cases = {
+        "malformed_result": "hostile-peer-malformed",
+        "history_incomplete": "hostile-peer-history-incomplete",
+        "ambiguous_registry_result": "hostile-peer-ambiguous",
+        "mixed_legacy_rotated_head": "hostile-peer-mixed-head",
+    }
+    def attempt(label):
+      return {
+          "fixture_evidence": "test-only-hostile-peer",
+          "fixture": label,
+          "fixture_source_sha256": "a" * 64,
+          "fixture_case_constants_sha256": "b" * 64,
+          "direct_resolution": "unavailable",
+          "provider_http": 503,
+          "status_http": 200,
+          "status_pending": True,
+          "no_acceptance_or_callback": True,
+          "no_authorization_code": True,
+          "fixture_cli_key_observed": True,
+          "fixture_provider_key_observed": True,
+          "fixture_all_provider_peers_observed": True,
+      }
+    evidence = {"registry_matrix": {
+        name: {"attempts": [attempt(label), attempt(label)]}
+        for name, label in cases.items()
+    }}
+
+    statuses = lifecycle.issue5_adversarial_gate_statuses(evidence)
+    self.assertEqual({name: "unavailable" for name in cases}, statuses)
+
+    evidence["registry_matrix"]["malformed_result"]["attempts"][0]["direct_resolution"] = "not_found"
+    evidence["registry_matrix"]["history_incomplete"]["attempts"][1]["provider_http"] = 200
+    statuses = lifecycle.issue5_adversarial_gate_statuses(evidence)
+    self.assertEqual("inconclusive", statuses["malformed_result"])
+    self.assertEqual("inconclusive", statuses["history_incomplete"])
+    self.assertEqual("unavailable", statuses["ambiguous_registry_result"])
+
+  def test_live_matrix_gates_require_complete_two_attempt_receipts(self):
+    current = lambda: {
+        "direct_resolution": "resolved", "exact_readback": True,
+        "provider_http": 202, "status_http": 200, "status_pending": False,
+        "outcome": "current_accepted",
+    }
+    missing = lambda: {
+        "direct_resolution": "not_found", "provider_http": 401,
+        "status_http": 200, "status_pending": True,
+        "no_acceptance_or_callback": True, "no_authorization_code": True,
+        "provider_identity_log_read": True,
+        "provider_identity_not_found_observed": True,
+        "provider_identity_not_found_marker_count": 1,
+        "outcome": "provider_not_found",
+    }
+    unavailable = lambda: {
+        "direct_resolution": "unavailable", "provider_http": 503,
+        "status_http": 200, "status_pending": True,
+        "no_acceptance_or_callback": True, "no_authorization_code": True,
+        "outcome": "registry_unavailable",
+    }
+    rotation = lambda sequence: {
+        "direct_resolution": "resolved", "exact_readback": True,
+        "provider_http": 202, "rotation_publish": "passed",
+        "current_sequence": sequence, "stale_key_proof_http": 401,
+        "current_key_proof_http": 202,
+        "stale_transaction_remains_pending": True,
+        "current_transaction_accepted": True,
+        "independent_rotation_readback": True,
+        "outcome": "current_accepted",
+    }
+    evidence = {
+        "issue5_profile": {"stage": "complete"},
+        "registry_matrix": {
+            "current_identity": {"attempts": [current(), current()]},
+            "missing_identity": {"attempts": [missing(), missing()]},
+            "unavailable_registry": {"attempts": [unavailable(), unavailable()]},
+            "rotation": {"attempts": [rotation(2), rotation(3)]},
+        },
+        "rotated_identity_case": {"local_mapping_persisted": True},
+    }
+
+    statuses = lifecycle.issue5_live_matrix_gate_statuses(evidence)
+    self.assertEqual({
+        "current_identity": "pass",
+        "exact_missing_identity": "pass",
+        "registry_unavailable": "pass",
+        "valid_current_key_proof": "pass",
+        "stale_key_denial": "pass",
+        "owner_key_rotation": "pass",
+        "independent_rotation_readback": "pass",
+    }, statuses)
+
+    evidence["registry_matrix"]["missing_identity"]["attempts"][1]["direct_resolution"] = "unavailable"
+    self.assertEqual("fail", lifecycle.issue5_live_matrix_gate_statuses(evidence)["exact_missing_identity"])
+    evidence["registry_matrix"]["rotation"]["attempts"][0].pop("independent_rotation_readback")
+    self.assertEqual("inconclusive", lifecycle.issue5_live_matrix_gate_statuses(evidence)["independent_rotation_readback"])
 
 
 if __name__ == "__main__":

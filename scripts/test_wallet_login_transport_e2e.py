@@ -247,6 +247,41 @@ class AuthStatusBindingProbeTest(unittest.TestCase):
     self.assertNotIn('expiry_case', selected)
     self.assertEqual(202, checkpoints[0]['wallet_login']['proof_post_http'])
 
+  def test_keycloak_startup_timeout_never_prints_raw_logs_or_exception_details(self):
+    import subprocess
+    import tempfile
+    import urllib.error
+    from contextlib import ExitStack, redirect_stdout
+    from io import StringIO
+    from pathlib import Path
+    from types import SimpleNamespace
+    import wallet_login_live_e2e as probe
+
+    output = StringIO()
+    private_logs = 'ERROR password=private-startup-value\nstarted https://private-host/?code=private-code\n'
+    client = SimpleNamespace(request=lambda *args, **kwargs: (_ for _ in ()).throw(
+        urllib.error.URLError('private-connection-value')))
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      cid_dir = Path(scratch) / 'cids'
+      cid_dir.mkdir()
+      stack.enter_context(patch.object(probe, 'SCRATCH', Path(scratch)))
+      stack.enter_context(patch.object(probe, 'RUN_CID_DIR', cid_dir))
+      stack.enter_context(patch.object(probe, 'Client', return_value=client))
+      stack.enter_context(patch.object(probe.time, 'sleep'))
+      stack.enter_context(redirect_stdout(output))
+      stack.enter_context(patch.object(probe, 'start_owned_container', return_value=(
+          subprocess.CompletedProcess([], 0, 'c' * 64), 'c' * 64)))
+      stack.enter_context(patch.object(probe, 'run', side_effect=lambda argv, **kwargs:
+          subprocess.CompletedProcess(argv, 0, private_logs if argv[0] == 'podman' else '', '')))
+      bounded = stack.enter_context(patch.object(probe, '_bounded_command_tail',
+          return_value=subprocess.CompletedProcess([], 0, private_logs, '')))
+      with self.assertRaisesRegex(RuntimeError, 'Keycloak OIDC discovery startup'):
+        probe.start_keycloak('fixture', 'private-password', None, 0, None, 'image')
+      self.assertNotIn('private-', output.getvalue())
+      bounded.assert_called_once_with(['podman', 'logs', '--tail', '80', 'c' * 64],
+          timeout=15, max_bytes=65536)
+      self.assertIn('keycloak-startup-diagnostics=', output.getvalue())
+
   def test_keycloak_nonzero_run_recovers_verified_cid_before_credential_unlink(self):
     import subprocess
     import tempfile

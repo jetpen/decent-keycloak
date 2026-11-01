@@ -616,11 +616,14 @@ class AcceptanceLedgerTest(unittest.TestCase):
   def test_provider_401_is_not_inferred_as_registry_miss(self):
     harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()
     start = harness.index('def classify_provider_identity_outcome(')
-    end = harness.index('\n\ndef missing_identity_flow(', start)
+    end = harness.index('\n\ndef _redirect_count(', start)
     classifier = harness[start:end]
     self.assertIn("if provider_http == 401:", classifier)
     self.assertIn("return 'provider_denied_unclassified'", classifier)
-    self.assertNotIn('not_found', classifier)
+    self.assertIn("provider_identity_not_found_observed", classifier)
+    self.assertIn("provider_identity_not_found_marker_count", classifier)
+    self.assertIn("== 1", classifier)
+    self.assertNotIn("return 'not_found'", classifier)
 
   def test_registry_listener_is_loopback_only(self):
     harness = (README.parent / "scripts/wallet_login_live_e2e.py").read_text()

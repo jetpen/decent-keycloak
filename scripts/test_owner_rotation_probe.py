@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import json
+import io
+import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 PROJECT = Path(__file__).parents[1]
 LIVE_PROBE = PROJECT / 'scripts/wallet_login_live_e2e.py'
+sys.path.insert(0, str(Path(__file__).parent))
+import wallet_login_live_e2e as live  # noqa: E402
+import rotation_registry_roundtrip as rotation_helper  # noqa: E402
 
 
 class OwnerRotationProbeTest(unittest.TestCase):
@@ -26,6 +36,7 @@ class OwnerRotationProbeTest(unittest.TestCase):
     self.assertIn("helper = project / 'scripts/rotation_registry_roundtrip.py'", flow)
     self.assertNotIn("str(PROJECTS / 'decent-registry/.venv/bin/python')", flow)
     self.assertIn("'/opt/decent-resolver/rotation_registry_roundtrip.py'", flow)
+    self.assertIn("'--checkpoint', str(helper_checkpoint_path)", flow)
     self.assertIn("str(old_key_in_tools)", flow)
     self.assertIn("str(new_key_in_tools)", flow)
     assert "readback[0] == str(expected_sequence)" in flow
@@ -44,9 +55,11 @@ class OwnerRotationProbeTest(unittest.TestCase):
     self.assertEqual(main.count("label='wallet-login-rotated'"), 1)
     self.assertIn("rotated_key = generate_owner_key(temp, 'wallet-login-rotated-successor', IMAGE)", main)
     self.assertIn("rotation_result = stale_key_rotation_flow(", main)
+    self.assertIn('expected_sequence=3, authorizing_keys=(rotated_old_key,)', main)
 
   def test_rotation_helper_uses_registry_predecessor_and_publish_readback_apis(self):
     helper = (PROJECT / 'scripts/rotation_registry_roundtrip.py').read_text()
+    self.assertEqual(helper, (PROJECT / 'container/rotation_registry_roundtrip.py').read_text())
     module = ast.parse(helper)
     rotate = next(node for node in module.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == 'rotate_and_confirm')
@@ -64,6 +77,117 @@ class OwnerRotationProbeTest(unittest.TestCase):
     self.assertIn('observed.seq == expected_seq', rotate_source)
     self.assertIn('observed.owner_public_key_hex == expected_key', rotate_source)
     self.assertIn('trio.run(rotate_and_confirm, args)', helper)
+
+  def test_rotation_helper_checkpoint_is_fixed_schema_and_redacts_exception_text(self):
+    with TemporaryDirectory() as temp:
+      path = Path(temp) / 'rotation-checkpoint.json'
+      category = rotation_helper.classify_rotation_failure(
+          ValueError('sensitive identifier=rotation-fixture@example.invalid'))
+      self.assertEqual('registry_validation_error', category)
+      rotation_helper.write_rotation_checkpoint(
+          path, 'registry_publish', 'failed', category)
+
+      expected = {
+          'failure_category': 'registry_validation_error',
+          'stage': 'registry_publish',
+          'status': 'failed',
+      }
+      self.assertEqual(expected, json.loads(path.read_text()))
+      self.assertNotIn('sensitive', path.read_text())
+      self.assertEqual(expected, rotation_helper.read_rotation_checkpoint(path))
+
+  def test_rotation_helper_checkpoint_classifies_known_validation_failure(self):
+    category = rotation_helper.classify_rotation_failure(
+        ValueError('legacy owner rotation proof signer_id must be null'))
+    self.assertEqual('rotation_proof_signer_invalid', category)
+
+  def test_rotation_helper_entrypoint_retains_only_sanitized_child_failure(self):
+    with TemporaryDirectory() as temp:
+      root = Path(temp)
+      checkpoint = root / 'rotation-checkpoint.json'
+      argv = [
+          'rotation_registry_roundtrip.py', '--identifier', 'fixture@example.invalid',
+          '--old-key', str(root / 'old.pem'), '--new-key', str(root / 'new.pem'),
+          '--bootstrap', '127.0.0.1', '--datastore', str(root / 'db'),
+          '--envelope', str(root / 'envelope.cbor'), '--readback', str(root / 'readback.txt'),
+          '--checkpoint', str(checkpoint),
+      ]
+
+      def fail_with_sensitive_message(*_args):
+        raise ValueError('sensitive identifier=fixture@example.invalid')
+
+      output = io.StringIO()
+      with patch('sys.argv', argv), patch.dict(sys.modules,
+          {'trio': SimpleNamespace(run=fail_with_sensitive_message)}), \
+          contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+        rotation_helper.main()
+
+      self.assertEqual(1, raised.exception.code)
+      self.assertEqual('rotation_helper_failure=registry_validation_error\n', output.getvalue())
+      self.assertEqual({
+          'failure_category': 'registry_validation_error',
+          'stage': 'owner_key_load',
+          'status': 'failed',
+      }, rotation_helper.read_rotation_checkpoint(checkpoint))
+      self.assertNotIn('fixture@example.invalid', checkpoint.read_text())
+
+  def test_rotation_helper_entrypoint_marks_successful_checkpoint_as_passed(self):
+    with TemporaryDirectory() as temp:
+      root = Path(temp)
+      checkpoint = root / 'rotation-checkpoint.json'
+      argv = [
+          'rotation_registry_roundtrip.py', '--identifier', 'fixture@example.invalid',
+          '--old-key', str(root / 'old.pem'), '--new-key', str(root / 'new.pem'),
+          '--bootstrap', '127.0.0.1', '--datastore', str(root / 'db'),
+          '--envelope', str(root / 'envelope.cbor'), '--readback', str(root / 'readback.txt'),
+          '--checkpoint', str(checkpoint),
+      ]
+
+      def complete_rotation(_function, args):
+        args._rotation_stage = 'complete'
+        rotation_helper.write_rotation_checkpoint(args.checkpoint, 'complete', 'running')
+
+      with patch('sys.argv', argv), patch.dict(sys.modules,
+          {'trio': SimpleNamespace(run=complete_rotation)}):
+        rotation_helper.main()
+
+      self.assertEqual({'stage': 'complete', 'status': 'passed'},
+          rotation_helper.read_rotation_checkpoint(checkpoint))
+
+  def test_rotation_helper_checkpoint_rejects_unknown_stage_and_extra_fields(self):
+    with TemporaryDirectory() as temp:
+      path = Path(temp) / 'rotation-checkpoint.json'
+      with self.assertRaises(ValueError):
+        rotation_helper.write_rotation_checkpoint(path, 'arbitrary path', 'failed', 'other')
+      path.write_text(json.dumps({
+          'failure_category': 'other', 'stage': 'registry_publish', 'status': 'failed',
+          'raw_exception': 'do not retain',
+      }))
+      self.assertIsNone(rotation_helper.read_rotation_checkpoint(path))
+
+  def test_rotation_helper_diagnostic_survives_stage_checkpoint_projection(self):
+    result = {}
+
+    live.checkpoint_rotation_stage(result, 'publish', {
+        'rotation_publish': 'failed',
+        'rotation_helper_stage': 'predecessor_envelope_read',
+        'rotation_helper_failure_category': 'predecessor_unavailable',
+    }, lambda: None)
+
+    self.assertEqual('predecessor_envelope_read',
+        result['rotated_identity_case']['rotation_helper_stage'])
+    self.assertEqual('predecessor_unavailable',
+        result['rotated_identity_case']['rotation_helper_failure_category'])
+
+  def test_rotation_helper_diagnostic_survives_final_checkpoint_sanitizer(self):
+    candidate = {'rotated_identity_case': {
+        'stage': 'publish',
+        'rotation_publish': 'failed',
+        'rotation_helper_stage': 'registry_publish',
+        'rotation_helper_failure_category': 'predecessor_history_unavailable',
+    }}
+
+    self.assertEqual(candidate, live.sanitize_live_checkpoint(candidate))
 
 
   def test_live_probe_signing_inputs_use_short_lived_private_tempfiles(self):

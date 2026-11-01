@@ -18,7 +18,7 @@ The repository's lifecycle command is the canonical build and offline-acceptance
 python3.11 scripts/lifecycle.py run offline
 ```
 
-The lifecycle checks prerequisites, runs Maven/Surefire and the canonical Python acceptance suite, compiles Python sources, verifies pinned resolver sources and every recorded binary dependency provenance entry, checks provider registration, builds and smoke-tests the Keycloak image, checks whitespace, writes a sanitized receipt under `target/lifecycle/evidence/`, and tears down its run-owned image tag. Inspect the receipt; a successful offline run is not live Registry or wallet qualification. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and the contributor workflow.
+The lifecycle checks prerequisites, runs Maven/Surefire and the canonical Python acceptance suite, compiles Python sources, verifies pinned resolver sources and every recorded binary dependency provenance entry, checks provider registration, builds and smoke-tests the Keycloak image, checks whitespace, writes a sanitized receipt under `target/lifecycle/evidence/`, and removes its run-owned image tag. Use `--retain-image` only when a workflow explicitly requires the local immutable image; the default remains cleanup. Inspect the receipt; a successful offline run is not live Registry or wallet qualification. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and the contributor workflow.
 
 To inspect the steps without running them:
 
@@ -32,11 +32,11 @@ CI invokes the same lifecycle with `ci` on pull requests. `issue5-live` is a sep
 python3.11 scripts/lifecycle.py run issue5-live --allow-live
 ```
 
-Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry.
+Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry. Retaining a local image is a separate opt-in (`--retain-image`) and does not publish it. Registry promotion is a separate command that requires a successful, fully gated `issue5-live` receipt, the retained image's exact immutable ID, an explicit release-candidate destination, and `--allow-publish`; it pushes and reads back the registry manifest before reporting success. No destination or publication is configured by default.
 
 ## Build an installable local image
 
-No release image is published by this repository. The offline lifecycle deliberately removes its temporary image after smoke testing. To keep a local image for evaluation, first run the offline lifecycle above, then build a separately tagged image from the same pinned sources. The following Podman example assumes the lifecycle prerequisites are installed and pinned base images are already present locally; it leaves the resulting image in Podman and removes its temporary source and dependency downloads:
+No release image is published by this repository. The offline lifecycle removes its temporary image by default after smoke testing; `--retain-image` is an explicit opt-in to keep that exact local image and is not a publication step. To keep a separately built local image for evaluation, first run the offline lifecycle above. The following Podman example assumes the lifecycle prerequisites are installed and pinned base images are already present locally; it leaves the resulting image in Podman and removes its temporary source and dependency downloads:
 
 ```bash
 set -eu

@@ -23,7 +23,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
     self.assertEqual(candidate, sanitize_live_checkpoint(candidate))
 
-  def _run_missing_identity_probe(self, redirect_during=None):
+  def _run_missing_identity_probe(self, redirect_during=None, provider_http=503, log_mode=None,
+      provider_body=b'', provider_headers=None, status_headers=None, probe='missing'):
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -58,13 +59,13 @@ class IdentityLookupClassificationTest(unittest.TestCase):
             self.redirects.append({'status': 302, 'method': 'POST',
                 'source_path': '/transaction', 'target_path': '/callback',
                 'target_query_names': ['code', 'state']})
-          return 503, {}, b''
+          return provider_http, provider_headers or {}, provider_body
         if method == 'GET' and path == status_url:
           if self.redirect_here == 'status':
             self.redirects.append({'status': 302, 'method': 'GET',
                 'source_path': '/status', 'target_path': '/callback',
                 'target_query_names': ['code', 'state']})
-          return 200, {}, b'{"status":"pending"}'
+          return 200, status_headers or {}, b'{"status":"pending"}'
         raise AssertionError(f'unexpected mocked request: {method} {path}')
 
     def fake_generate_owner_key(temp, label, image):
@@ -77,7 +78,16 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       resolver_arguments.append(arguments)
       return SimpleNamespace(returncode=1, stdout='not found')
 
+    log_reads = []
     def fake_openssl(arguments, **kwargs):
+      if arguments[:2] == ['podman', 'logs']:
+        log_reads.append(True)
+        marker = ('Wallet Identity lookup completed (request='
+            + live.account_policy_request_id(locator) + ', outcome=not_found)')
+        text = 'baseline\n'
+        if len(log_reads) > 1 and log_mode == 'witness':
+          text += marker + '\n'
+        return SimpleNamespace(returncode=0, stdout=text)
       if arguments[:3] == ['openssl', 'pkeyutl', '-sign']:
         signing_inputs.append(Path(arguments[arguments.index('-in') + 1]).read_bytes())
         return SimpleNamespace(returncode=0, stdout=b'\x91' * 64)
@@ -91,10 +101,13 @@ class IdentityLookupClassificationTest(unittest.TestCase):
           patch.object(live, 'generate_owner_key', side_effect=fake_generate_owner_key), \
           patch.object(live, 'run_image_resolver', side_effect=fake_resolver), \
           patch.object(live, 'classify_identity_lookup',
-              return_value=('unavailable', ['dial_warning', 'not_found'])), \
+              return_value=(('not_found', ['registry_miss', 'not_found']) if log_mode
+                  else ('unavailable', ['dial_warning', 'not_found']))), \
           patch.object(live.subprocess, 'run', side_effect=fake_openssl), \
           patch.dict(os.environ, {'WALLET_IT_RESOLVER_TOOLS_CONTAINER': 'resolver-tools'}):
-        result = live.missing_identity_flow(Path(temp), 18887, 'bootstrap', 'image')
+        flow = live.missing_identity_flow if probe == 'missing' else live.registry_proof_probe
+        result = flow(Path(temp), 18887, 'bootstrap', 'image',
+            container='provider-container' if log_mode else None)
     return result, generated_keys, resolver_arguments, submitted_proofs, signing_inputs, clients
 
   def test_missing_identity_probe_signs_exact_unpublished_identity(self):
@@ -137,8 +150,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
       status = next(statuses)
       if status == 503:
         raise live.AuthFlowFailure({
-            'proof_post_http': 503, 'status_poll_http': 200, 'status_pending': True})
-      return {'proof_post_http': 202, 'status_poll_http': 200}
+            'proof_post_http': 503, 'initial_status_http': 200, 'status_pending': True})
+      return {'proof_post_http': 202, 'initial_status_http': 200}
 
     def resolver_lookup(_attempt):
       return SimpleNamespace(stdout='{"identity_id":"id-1","owner_public_key":"'
@@ -159,6 +172,28 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertEqual([200, 200], [attempt['status_http'] for attempt in attempts])
     self.assertTrue(attempts[0]['status_pending'])
     self.assertTrue(all(attempt['exact_readback'] for attempt in attempts))
+
+  def test_current_identity_attempt_checkpoints_resolver_failure_without_raw_error(self):
+    checkpoints = []
+    def mark_stage(stage, failure_category=None):
+      checkpoints.append((stage, failure_category))
+    def failed_lookup(_attempt_number):
+      raise RuntimeError('raw resolver failure must not be copied')
+
+    with self.assertRaisesRegex(RuntimeError, 'raw resolver failure'):
+      live.invoke_current_identity_attempt('id-1', Path('/fixture.key'), 'kc', 'image', 1,
+          failed_lookup, stage_checkpoint=mark_stage)
+
+    self.assertEqual([
+        ('current_identity_direct_lookup_start', None),
+        ('current_identity_direct_lookup_start', 'runtime_error'),
+    ], checkpoints)
+    projected = sanitize_live_checkpoint({'issue5_profile': {
+        'stage': checkpoints[-1][0], 'failure_category': checkpoints[-1][1],
+        'exception_text': 'raw resolver failure must not be copied'}})
+    self.assertEqual({
+        'stage': 'current_identity_direct_lookup_start', 'failure_category': 'runtime_error'},
+        projected['issue5_profile'])
 
   def test_live_probe_rotates_registry_identity_and_checks_old_and_new_keys(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
@@ -242,7 +277,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     main_body = source[main_start:]
     self.assertIn('stale_key_rotation_flow(', source)
     self.assertIn("result['rotated_identity_case']", main_body)
-    self.assertIn("account_policy_denial_is_attributed(ambiguity_result)", source)
+    self.assertIn("account_policy_denial_is_attributed(outcome)", main_body)
+    self.assertIn("max_concurrent >= 2", main_body)
     self.assertIn("'username': 'wallet-owner-duplicate', 'enabled': True", source)
     self.assertIn("provision_identity_attribute(client, token, 'wallet-owner-duplicate', identifier)", main_body)
 
@@ -260,8 +296,11 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
     main_body = source[source.index('def main():'):]
     duplicate_fixture = "provision_identity_attribute(client, token, 'wallet-owner-duplicate', identifier)"
-    duplicate_denial = "client, key, identifier, 'ambiguous-account'"
-    self.assertLess(main_body.index(duplicate_fixture), main_body.index(duplicate_denial))
+    self.assertIn(duplicate_fixture, main_body)
+    concurrent_runner = "run_concurrent_account_denial_flows(["
+    duplicate_denial = "('ambiguous-account', lambda: account_mapping_denial_flow("
+    self.assertLess(main_body.index(duplicate_fixture), main_body.index(concurrent_runner))
+    self.assertLess(main_body.index(concurrent_runner), main_body.index(duplicate_denial))
 
   def test_live_probe_exercises_streaming_body_limit_and_retry_semantics(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
@@ -398,7 +437,18 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertTrue(live._response_has_acceptance_evidence({}, b'{"code":"redacted"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'{"callback_url":"redacted"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'{"accepted_receipt":"redacted"}'))
+    self.assertTrue(live._response_has_acceptance_evidence({}, b'{"status":"accepted","status":"pending"}'))
     self.assertTrue(live._response_has_acceptance_evidence({}, b'unstructured response'))
+    for headers in ({'XAuthorizationCode': 'opaque'}, {'XCallbackUrl': 'opaque'},
+        {'XReceiptId': 'opaque'}):
+      with self.subTest(headers=headers):
+        self.assertTrue(live._response_has_acceptance_evidence(headers,
+            b'{"status":"pending"}'))
+    duplicate_locations = Message()
+    duplicate_locations.add_header('Location', '/ordinary-one')
+    duplicate_locations.add_header('Location', '/ordinary-two')
+    self.assertTrue(live._response_has_acceptance_evidence(
+        duplicate_locations, b'{"status":"pending"}'))
     self.assertFalse(live._response_has_acceptance_evidence(
         {}, b'provider unavailable', terminal_http_status=503))
     self.assertFalse(live._response_has_acceptance_evidence(
@@ -406,21 +456,198 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertTrue(live._response_has_acceptance_evidence(
         {}, b'{"code":"redacted"}', terminal_http_status=401))
 
+  def test_terminal_denial_sensitive_material_never_counts_as_safe(self):
+    for status in (401, 503):
+      for headers, body in (
+          ({}, b'authorization code=redacted'),
+          ({}, b'code = redacted'),
+          ({}, b'{"message":"receipt=redacted"}'),
+          ({}, b'callback=https%3A%2F%2Fexample.invalid'),
+          ({}, b'accepted'),
+          ({'Location': '/other?code='}, b''),
+          ({'Location': '/other?receipt=redacted'}, b''),
+          ({'Location': '/other#authorization_code='}, b''),
+          ({'Location': '/other?co%64e='}, b''),
+      ):
+        with self.subTest(status=status, headers=headers, body=body):
+          self.assertTrue(live._response_has_acceptance_evidence(headers, body, status))
+
+  def test_same_line_duplicated_or_malformed_identity_marker_cannot_attribute_absence(self):
+    request = 'ab' * 16
+    marker = f'Wallet Identity lookup completed (request={request}, outcome=not_found)'
+    for line in (marker + ' ' + marker,
+        'Wallet Identity lookup completed (malformed) ' + marker):
+      with self.subTest(line=line):
+        evidence = live.new_identity_lookup_log_evidence(['baseline'], ['baseline', line], request)
+        self.assertFalse(evidence['provider_identity_not_found_observed'])
+        self.assertEqual('provider_denied_unclassified', live.classify_provider_identity_outcome(401, evidence))
+
   def test_provider_not_found_diagnostic_profile_is_explicitly_separate(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
     main = source[source.index('def main():'):]
     self.assertIn("'provider-not-found-diagnostic'", main)
     self.assertNotIn("'issue4-not-found'", main)
-    self.assertIn('provider_missing_identity_is_qualified', main)
+    self.assertIn('run_provider_missing_identity_profile', main)
+    self.assertIn('provider_missing_identity_is_qualified(evidence)', source)
     self.assertNotIn('issue4_missing_identity_is_qualified', main)
     self.assertNotIn('Issue #4 clean provider-level terminal', main)
+
+  def test_provider_missing_identity_profile_checkpoints_two_distinct_denials(self):
+    seen = []
+    checkpoints = []
+    def attempt(number):
+      result, _, _, proofs, *_ = self._run_missing_identity_probe(provider_http=401, log_mode='witness')
+      seen.append((number, proofs[0]['identity_id']))
+      return result
+    snapshot = live.run_provider_missing_identity_profile(attempt, checkpoints.append)
+    self.assertEqual([1, 2], [number for number, _ in seen])
+    self.assertEqual(2, len({identity for _, identity in seen}))
+    self.assertEqual(2, len(checkpoints))
+    attempts = snapshot['registry_matrix']['missing_identity']['attempts']
+    self.assertEqual(['provider_not_found'] * 2, [item['outcome'] for item in attempts])
+    self.assertEqual([1, 1], [item['provider_identity_not_found_marker_count'] for item in attempts])
+    self.assertEqual(snapshot, live.sanitize_live_checkpoint(snapshot))
+
+  def test_provider_missing_identity_profile_checkpoints_then_stops_on_unattributed_denial(self):
+    seen = []
+    checkpoints = []
+    def attempt(number):
+      seen.append(number)
+      return self._run_missing_identity_probe(provider_http=401, log_mode='absent')[0]
+    with self.assertRaisesRegex(RuntimeError, 'fresh correlated absence evidence'):
+      live.run_provider_missing_identity_profile(attempt, checkpoints.append)
+    self.assertEqual([1], seen)
+    self.assertEqual(1, len(checkpoints))
+    self.assertEqual('provider_denied_unclassified',
+        checkpoints[0]['registry_matrix']['missing_identity']['attempts'][0]['outcome'])
+
+  def test_registry_proof_probe_uses_same_correlated_missing_identity_observer(self):
+    result, *_ = self._run_missing_identity_probe(provider_http=401, log_mode='witness', probe='registry')
+    self.assertEqual('provider_not_found', result['provider_resolution_outcome'])
+    self.assertTrue(result['provider_identity_not_found_observed'])
+    self.assertTrue(result['no_authorization_code'])
+    self.assertEqual('provider_not_found', live.classify_registry_matrix_attempt(
+        result['cli_resolution'], result['direct_provider_http'], status_pending=result['status_pending'],
+        exact_readback=False, provider_evidence=result))
+
+  def test_registry_proof_probe_rejects_sensitive_headers_and_duplicate_locations(self):
+    duplicate_locations = Message()
+    duplicate_locations.add_header('Location', '/ordinary-one')
+    duplicate_locations.add_header('Location', '/ordinary-two')
+    unsafe_headers = (
+        {'XAuthorizationCode': 'opaque'},
+        {'XCallbackUrl': 'opaque'},
+        {'XReceiptId': 'opaque'},
+        duplicate_locations,
+    )
+    for headers in unsafe_headers:
+      with self.subTest(headers=headers):
+        result, *_ = self._run_missing_identity_probe(
+            provider_http=401, log_mode='witness', provider_headers=headers, probe='registry')
+        self.assertFalse(result['no_authorization_code'])
+        self.assertFalse(result['no_acceptance_or_callback'])
+        self.assertNotIn('opaque', repr(result))
+    for headers in unsafe_headers:
+      with self.subTest(status_headers=headers):
+        result, *_ = self._run_missing_identity_probe(
+            provider_http=401, log_mode='witness', status_headers=headers, probe='registry')
+        self.assertFalse(result['no_authorization_code'])
+        self.assertFalse(result['no_acceptance_or_callback'])
+
+  def test_missing_identity_probe_rejects_sensitive_response_even_with_valid_absence_witness(self):
+    duplicate_locations = Message()
+    duplicate_locations.add_header('Location', '/ordinary-one')
+    duplicate_locations.add_header('Location', '/ordinary-two')
+    for headers, body in (({}, b'authorization code=redacted'),
+        ({}, b'{"message":"receipt=redacted"}'),
+        ({}, b'{"status":"accepted","status":"pending"}'),
+        ({'Location': '/other?code='}, b''),
+        ({'XAuthorizationCode': 'opaque'}, b''),
+        ({'XCallbackUrl': 'opaque'}, b''),
+        ({'XReceiptId': 'opaque'}, b''), (duplicate_locations, b'')):
+      with self.subTest(headers=headers, body=body):
+        with self.assertRaisesRegex(RuntimeError, 'no accepted receipt, callback, or code') as raised:
+          self._run_missing_identity_probe(provider_http=401, log_mode='witness',
+              provider_body=body, provider_headers=headers)
+        self.assertNotIn('redacted', str(raised.exception))
+    for headers in ({'XAuthorizationCode': 'opaque'}, {'XCallbackUrl': 'opaque'},
+        {'XReceiptId': 'opaque'}, duplicate_locations):
+      with self.subTest(status_headers=headers):
+        with self.assertRaisesRegex(RuntimeError, 'no accepted receipt, callback, or code'):
+          self._run_missing_identity_probe(provider_http=401, log_mode='witness',
+              status_headers=headers)
+
+  def test_provider_missing_identity_probe_retains_only_correlated_branch_witness(self):
+    result, *_ = self._run_missing_identity_probe(provider_http=401, log_mode='witness')
+    self.assertEqual('provider_not_found', result['provider_resolution_outcome'])
+    self.assertTrue(live.provider_missing_identity_is_qualified(result))
+    safe = live.sanitize_live_checkpoint({'missing_identity_case': result})
+    self.assertTrue(safe['missing_identity_case']['provider_identity_not_found_observed'])
+    self.assertEqual(1, safe['missing_identity_case']['provider_identity_not_found_marker_count'])
+    self.assertNotIn('test-handle', json.dumps(safe))
+
+  def test_provider_missing_identity_probe_does_not_attribute_unwitnessed_401(self):
+    result, *_ = self._run_missing_identity_probe(provider_http=401, log_mode='absent')
+    self.assertEqual('provider_denied_unclassified', result['provider_resolution_outcome'])
+    self.assertFalse(live.provider_missing_identity_is_qualified(result))
+
+  def test_provider_missing_identity_witness_cannot_relabel_503(self):
+    result, *_ = self._run_missing_identity_probe(provider_http=503, log_mode='witness')
+    self.assertEqual('unavailable', result['provider_resolution_outcome'])
+    self.assertFalse(live.provider_missing_identity_is_qualified(result))
+
+  def test_identity_lookup_witness_requires_fresh_single_exact_request_record(self):
+    request = 'ab' * 16
+    marker = f'Wallet Identity lookup completed (request={request}, outcome=not_found)'
+    valid = live.new_identity_lookup_log_evidence(['baseline'], ['baseline', marker], request)
+    self.assertTrue(valid['provider_identity_not_found_observed'])
+    self.assertEqual('provider_not_found', live.classify_provider_identity_outcome(401, valid))
+    for before, after, expected in (
+        (None, [marker], request), (['baseline'], None, request),
+        (['before'], [marker], request), (['baseline', marker], ['baseline', marker], request),
+        (['baseline'], ['baseline', marker.replace(request, 'cd' * 16)], request),
+        (['baseline'], ['baseline', marker, marker], request),
+        (['baseline'], ['baseline', marker + ' private=value'], request),
+        (['baseline'], ['baseline', marker.replace('not_found', 'unknown')], request),
+        (['baseline'], ['baseline', marker], 'invalid correlation token'),
+        (['baseline'], ['baseline', marker, f'Wallet Identity resolver unavailable (request={request}, IdentityResolutionException)'], request),
+        (['baseline'], ['baseline'] * 121, request),
+    ):
+      with self.subTest(before=before, after=after):
+        evidence = live.new_identity_lookup_log_evidence(before, after, expected)
+        self.assertFalse(evidence['provider_identity_not_found_observed'])
+        self.assertEqual('provider_denied_unclassified', live.classify_provider_identity_outcome(401, evidence))
+        self.assertNotIn(request, json.dumps(evidence))
+        self.assertNotIn('private=value', json.dumps(evidence))
+
+  def test_missing_identity_attribution_checkpoint_rejects_unknown_and_sensitive_fields(self):
+    fields = {'provider_resolution_outcome': 'provider_not_found',
+        'provider_identity_log_read': True, 'provider_identity_not_found_observed': True,
+        'provider_identity_not_found_marker_count': 1}
+    candidate = {'missing_identity_case': {**fields, 'request_id': 'private', 'raw_logs': 'private'}}
+    self.assertEqual({'missing_identity_case': fields}, live.sanitize_live_checkpoint(candidate))
+    for bad_count in (True, -1, 11, '1'):
+      safe = live.sanitize_live_checkpoint({'missing_identity_case': {
+          **fields, 'provider_identity_not_found_marker_count': bad_count}})
+      self.assertNotIn('provider_identity_not_found_marker_count', safe['missing_identity_case'])
+
+  def test_provider_missing_identity_cannot_qualify_without_correlated_provider_evidence(self):
+    evidence = {
+        'cli_resolution': 'not_found', 'cli_output_categories': ['registry_miss', 'not_found'],
+        'direct_provider_http': 401, 'provider_resolution_outcome': 'provider_denied_unclassified',
+        'status_pending': True, 'redirects_safe': True, 'no_acceptance_or_callback': True,
+    }
+    self.assertFalse(live.provider_missing_identity_is_qualified(evidence))
 
   def test_provider_not_found_diagnostic_requires_exact_clean_miss_and_denial(self):
     accepted = {
         'cli_resolution': 'not_found',
         'cli_output_categories': ['registry_miss', 'not_found'],
         'direct_provider_http': 401,
-        'provider_resolution_outcome': 'provider_denied_unclassified',
+        'provider_resolution_outcome': 'provider_not_found',
+        'provider_identity_not_found_observed': True,
+        'provider_identity_log_read': True,
+        'provider_identity_not_found_marker_count': 1,
         'status_pending': True,
         'redirects_safe': True,
         'no_acceptance_or_callback': True,
@@ -445,7 +672,7 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertIn("['get', '--identifier', missing_id", body)
     self.assertIn("'identity_id': missing_id, 'signature': b64url(signature.stdout)", body)
     self.assertIn("'direct_provider_http': provider_http", body)
-    self.assertIn('provider_resolution_outcome = classify_provider_identity_outcome(provider_http)', body)
+    self.assertIn('provider_resolution_outcome = classify_provider_identity_outcome(provider_http, provider_evidence)', body)
     self.assertIn('provider_headers, provider_body, terminal_http_status=provider_http)', body)
     self.assertIn("', status_evidence=' + status_acceptance_category", body)
     self.assertIn("return 'provider_denied_unclassified'", source)
@@ -559,6 +786,55 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     parsed = parse_exact_identity_result(escaped, identity)
     self.assertTrue(json_object_is_balanced(escaped))
     self.assertEqual(escaped_value, parsed['authorization']['status'])
+
+  def test_rotation_cli_summary_and_sorted_authorization_are_exact(self):
+    identity = 'rotation-parser@example.invalid'
+    expected_key = 'ab' * 32
+    payload = {
+      'identifier': identity, 'owner_name_hex': identity.encode().hex(),
+      'owner_public_key_hex': expected_key, 'seq': 2,
+      'authorization': {'version': 1, 'operation': 5, 'epoch': 1, 'threshold': 2,
+        'signer_set': [{'signer_id': name, 'public_key': key * 32}
+          for name, key in [('new', 'ab'), ('old', 'cd'), ('cosigner', 'ef')]],
+        'predecessor_state_hash': '12' * 32, 'state_hash': '34' * 32},
+    }
+    output = json.dumps(payload, indent=2, sort_keys=True)
+    summary = 'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=0 failed=0 timeouts=0 incomplete=0'
+    for decorated in (summary + '\n' + output, output + '\n' + summary):
+      with self.subTest(summary_before_json=decorated.startswith(summary)):
+        resolution, categories = classify_identity_lookup(decorated, 0, identity)
+        self.assertEqual('resolved', resolution)
+        self.assertTrue(all(category == 'json' for category in categories))
+        self.assertEqual(payload, parse_exact_identity_result(decorated, identity))
+        self.assertTrue(packaged_resolver_readback(decorated, 0, identity, expected_key))
+        self.assertFalse(packaged_resolver_readback(decorated, 1, identity, expected_key))
+        self.assertFalse(packaged_resolver_readback(decorated, 0, identity, 'ff' * 32))
+        self.assertFalse(packaged_resolver_readback(decorated, 0, 'other@example.invalid', expected_key))
+
+  def test_rotation_summary_cannot_hide_unknown_output_or_lookup_uncertainty(self):
+    identity = 'rotation-parser@example.invalid'
+    expected_key = 'ab' * 32
+    output = json.dumps({'identifier': identity, 'owner_name_hex': identity.encode().hex(),
+      'owner_public_key_hex': expected_key, 'seq': 2}, indent=2, sort_keys=True)
+    summary = 'DHT_LOOKUP_SUMMARY stage=get_value attempts=1 empty=0 failed=0 timeouts=0 incomplete=0'
+    for prefix in (
+      summary + '\n' + summary,
+      summary.replace('failed=0', 'failed=1'),
+      summary.replace('incomplete=0', 'incomplete=1'),
+      summary.replace('timeouts=0', 'timeouts=1'),
+      summary.replace('attempts=1', 'attempts=1000'),
+      summary.replace('attempts=1', 'attempts=0'),
+      summary.replace('empty=0', 'empty=999'),
+      summary + '\nunknown transport text',
+    ):
+      with self.subTest(prefix_kind=prefix.splitlines()[0]):
+        decorated = prefix + '\n' + output
+        self.assertEqual('unavailable', classify_identity_lookup(decorated, 0, identity)[0])
+        self.assertIsNone(parse_exact_identity_result(decorated, identity))
+        self.assertFalse(packaged_resolver_readback(decorated, 0, identity, expected_key))
+    for trailing in ('\nunknown transport text', '\n{"second": "object"}', '\n]'):
+      decorated = summary + '\n' + output + trailing
+      self.assertFalse(packaged_resolver_readback(decorated, 0, identity, expected_key))
 
   def test_classify_identity_lookup_accepts_exact_single_line_json(self):
     identity = 'mailto:single-line@example.invalid'
@@ -1158,17 +1434,120 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'kc.db = dev-file (PersistedConfigSource)\n'
         'kc.cache = local (SysPropConfigSource)\n'
         'kc.cache-stack = jdbc-ping (ConfigSource)\n'
-        'kc.spi-single-use-object--provider-default = infinispan (classpath application.properties)\n'
         'kc.db = postgres (EnvVarConfigSource)\n'
         'kc.hostname = idp.example (SysPropConfigSource)\n'
         'kc.cache=unsafe value (sensitive-source)\n')
-    self.assertEqual({'cache_mode_effective': 'local', 'cache_stack_effective': 'jdbc-ping',
-        'single_use_object_provider_configured': 'infinispan'}, facts)
+    self.assertEqual({'cache_mode_effective': 'local', 'cache_stack_effective': 'jdbc-ping'}, facts)
     self.assertNotIn('PersistedConfigSource', json.dumps(facts))
     self.assertNotIn('idp.example', json.dumps(facts))
     self.assertEqual({}, probe.parse_keycloak_show_config(
         'kc.spi-single-use-object--provider-default = infinispan\n'
         'kc.spi-single-use-object--provider-default = jpa\n'))
+
+  def test_runtime_show_config_does_not_parse_provider_value_when_keycloak_masks_it(self):
+    import wallet_login_live_e2e as probe
+    output = ('kc.db = dev-file (Persisted)\n'
+        'kc.cache = local (Persisted)\n'
+        'kc.spi-single-use-object--provider-default = ******* (Persisted)\n')
+    self.assertEqual({'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local'},
+        probe.parse_keycloak_show_config(output))
+
+  def test_duplicate_unmasked_provider_values_do_not_pass_show_config_parser(self):
+    import wallet_login_live_e2e as probe
+    self.assertEqual({}, probe.parse_keycloak_show_config(
+        'kc.spi-single-use-object--provider-default = infinispan\n'
+        'kc.spi-single-use-object--provider-default = jpa\n'))
+
+  def test_show_config_unmasked_provider_is_accepted_only_when_serverinfo_advertises_it(self):
+    import wallet_login_live_e2e as probe
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    class InfoClient:
+      def request(self, *_args, **_kwargs):
+        return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'},
+            'providers': {'single-use-object': {'providers': {
+                'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
+
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local"]\n'),
+        SimpleNamespace(returncode=0, stdout='kc.db = dev-file (Persisted)\n'
+            'kc.cache = local (Persisted)\n'
+            'kc.spi-single-use-object--provider-default = infinispan (Persisted)\n'),
+        SimpleNamespace(returncode=0, stdout='Infinispan configuration:\n<local-cache name="sessions"/>')]):
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+    self.assertEqual('infinispan', facts['single_use_object_provider_configured'])
+    self.assertEqual('show_config_fields_complete', facts['keycloak_config_read_status'])
+
+  def test_show_config_provider_not_advertised_is_unavailable(self):
+    import wallet_login_live_e2e as probe
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    class InfoClient:
+      def request(self, *_args, **_kwargs):
+        return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'},
+            'providers': {'single-use-object': {'providers': {
+                'jpa': {'order': 0, 'operationalInfo': {}}}}}}).encode())
+
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local"]\n'),
+        SimpleNamespace(returncode=0, stdout='kc.db = dev-file (Persisted)\n'
+            'kc.cache = local (Persisted)\n'
+            'kc.spi-single-use-object--provider-default = infinispan (Persisted)\n'),
+        SimpleNamespace(returncode=0, stdout='Infinispan configuration:\n<local-cache name="sessions"/>')]):
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+    self.assertEqual('unavailable', facts['single_use_object_provider_configured'])
+    self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
+
+  def test_account_denial_runtime_provider_facts_are_sanitized_into_top_level_runtime(self):
+    import wallet_login_live_e2e as probe
+    facts = {'resolver_runtime': {'runtime_qualification_status': 'open_runtime_facts_unavailable'}}
+    facts['ambiguous_account_case'] = {
+        'single_use_object_provider_path': 'infinispan',
+        'single_use_object_provider_evidence': 'request_correlated_consumed_transaction',
+        'runtime_qualification_status': 'runtime_facts_verified',
+        'request_id': 'private-request', 'raw_logs': 'private-log'}
+    safe = probe.sanitize_live_checkpoint(facts)
+    runtime = safe['resolver_runtime']
+    self.assertEqual('infinispan', runtime['single_use_object_provider_path'])
+    self.assertEqual('request_correlated_consumed_transaction',
+        runtime['single_use_object_provider_evidence'])
+    self.assertEqual('runtime_facts_verified', runtime['runtime_qualification_status'])
+    self.assertNotIn('private-request', json.dumps(safe))
+    self.assertNotIn('private-log', json.dumps(safe))
+
+  def test_fresh_provider_log_window_classifies_only_the_exact_consumed_transaction(self):
+    request_id = 'a' * 32
+    line = ('INFO [org.decentwallet.keycloak.wallet.WalletLoginTransportHandler] '
+        '(executor-thread-1) Wallet proof transaction consumed '
+        f'(request={request_id}, provider=infinispan)')
+    before = ['startup log']
+    after = ['startup log', line]
+    fresh = live.fresh_log_window_lines(before, after)
+    self.assertEqual([line], fresh)
+    self.assertIsNotNone(fresh)
+    witness = live.classify_success_provider_witness('\n'.join(fresh or []), request_id)
+    self.assertEqual({'status': 'observed', 'provider_id': 'infinispan'}, witness)
+    self.assertIsNone(live.sanitize_success_provider_witness(line, 'b' * 32))
+
+  def test_top_level_runtime_gate_accepts_selected_provider_witness_when_show_config_masks_it(self):
+    import wallet_login_live_e2e as probe
+    candidate = {'resolver_runtime': {
+        'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
+        'database_mode_configured': 'dev-file', 'database_mode_effective': 'dev-file',
+        'cache_mode_configured': 'local', 'cache_mode_effective': 'local',
+        'cache_stack_effective': None, 'keycloak_config_read_status': 'show_config_fields_missing',
+        'single_use_object_provider_configured': 'unavailable',
+        'single_use_object_provider_ids': ['infinispan'],
+        'single_use_object_provider_path': 'infinispan',
+        'single_use_object_provider_evidence': 'request_correlated_consumed_transaction',
+        'runtime_qualification_status': 'open_runtime_facts_unavailable'}}
+    safe = probe.sanitize_live_checkpoint(candidate)
+    self.assertEqual('runtime_facts_verified', safe['resolver_runtime']['runtime_qualification_status'])
+    self.assertEqual('show_config_fields_missing', safe['resolver_runtime']['keycloak_config_read_status'])
 
   def test_runtime_cache_mode_requires_unambiguous_applied_infinispan_configuration(self):
     import wallet_login_live_e2e as probe
@@ -1181,6 +1560,155 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         prefix + '<local-cache name="sessions"/>\nInfinispan configuration: <local-cache/>'))
     self.assertIsNone(probe.parse_infinispan_runtime_cache_mode(
         '<local-cache name="sessions"/>'))
+
+  def test_request_correlated_store_outcome_rejects_duplicates_malformed_and_unknown(self):
+    import wallet_login_live_e2e as probe
+    prefix = ('INFO [org.decentwallet.keycloak.wallet.WalletLoginTransportHandler] '
+        '(executor-thread-1) ')
+    valid = prefix + 'Wallet proof transaction consumed (request=' + 'a' * 32 + ', provider=infinispan)'
+    self.assertEqual({'request_id': 'a' * 32, 'provider_id': 'infinispan'},
+        probe.parse_request_correlated_store_outcome(valid))
+    for text in (None, '', valid + '\n' + valid,
+        valid + '\n' + prefix + 'Wallet proof transaction consumed malformed',
+        valid.replace('provider=infinispan', 'provider=unknown-private-value'),
+        valid.replace('a' * 32, 'PRIVATE-ID'),
+        valid.replace('WalletLoginTransportHandler', 'DifferentLogger'),
+        valid + ' private-value'):
+      with self.subTest(text=text):
+        self.assertIsNone(probe.parse_request_correlated_store_outcome(text))
+
+  def test_runtime_provenance_profile_starts_only_one_keycloak_and_no_wallet_flow(self):
+    from contextlib import ExitStack, redirect_stdout
+    from io import StringIO
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    facts = {'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
+        'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+        'single_use_object_provider_path': 'infinispan',
+        'single_use_object_provider_ids': ['infinispan'],
+        'single_use_object_provider_evidence': 'request_correlated_production_acceptance',
+        'runtime_qualification_status': 'runtime_facts_verified'}
+    output = StringIO()
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE': 'runtime-provenance'}))
+      stack.enter_context(patch.object(probe, 'SCRATCH', Path(scratch)))
+      stack.enter_context(redirect_stdout(output))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('a' * 64, 'sha256:' + 'b' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      start = stack.enter_context(patch.object(probe, 'start_keycloak',
+          return_value=SimpleNamespace(wallet_container_id='c' * 64)))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='private-token'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value=facts))
+      cleanup = stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=0))
+      forbidden = [stack.enter_context(patch.object(probe, name)) for name in
+          ('start_registry', 'start_resolver_tools', 'write_identity', 'configure_realm', 'auth_flow')]
+      probe.main()
+      start.assert_called_once()
+      cleanup.assert_called_once()
+      for mocked in forbidden:
+        mocked.assert_not_called()
+    self.assertIn('runtime-provenance-evidence=', output.getvalue())
+    self.assertIn('runtime_facts_verified', output.getvalue())
+    self.assertNotIn('private-token', output.getvalue())
+
+  def test_runtime_provenance_profile_preserves_unqualified_evidence_on_failure(self):
+    from contextlib import ExitStack, redirect_stdout
+    from io import StringIO
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    output = StringIO()
+    facts = {'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
+        'single_use_object_provider_path': 'unavailable',
+        'runtime_qualification_status': 'open_runtime_facts_unavailable'}
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE': 'runtime-provenance'}))
+      stack.enter_context(patch.object(probe, 'SCRATCH', Path(scratch)))
+      stack.enter_context(redirect_stdout(output))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('a' * 64, 'sha256:' + 'b' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      stack.enter_context(patch.object(probe, 'start_keycloak',
+          return_value=SimpleNamespace(wallet_container_id='c' * 64)))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='private-token'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value=facts))
+      cleanup = stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=0))
+      with self.assertRaisesRegex(RuntimeError, 'runtime provenance verified'):
+        probe.main()
+      cleanup.assert_called_once()
+    line = next(line for line in output.getvalue().splitlines() if line.startswith('partial_evidence='))
+    evidence = json.loads(line.partition('=')[2])
+    self.assertEqual('runtime_read', evidence['resolver_runtime']['provenance_probe_stage'])
+    self.assertEqual('open_runtime_facts_unavailable', evidence['resolver_runtime']['runtime_qualification_status'])
+    self.assertNotIn('private-token', output.getvalue())
+
+  def test_runtime_provenance_profile_does_not_lose_facts_on_cleanup_failure(self):
+    from contextlib import ExitStack, redirect_stdout
+    from io import StringIO
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+    facts = {'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
+        'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
+        'single_use_object_provider_path': 'infinispan',
+        'single_use_object_provider_ids': ['infinispan'],
+        'runtime_qualification_status': 'runtime_facts_verified'}
+    output = StringIO()
+    with tempfile.TemporaryDirectory() as scratch, ExitStack() as stack:
+      stack.enter_context(patch.dict(os.environ, {'WALLET_IT_PROFILE': 'runtime-provenance'}))
+      stack.enter_context(patch.object(probe, 'SCRATCH', Path(scratch)))
+      stack.enter_context(redirect_stdout(output))
+      stack.enter_context(patch.object(probe, 'resolve_immutable_image',
+          return_value=('a' * 64, 'sha256:' + 'b' * 64)))
+      stack.enter_context(patch.object(probe, '_prepare_resolver_runtime', return_value={}))
+      stack.enter_context(patch.object(probe, 'start_keycloak',
+          return_value=SimpleNamespace(wallet_container_id='c' * 64)))
+      stack.enter_context(patch.object(probe, 'admin_token', return_value='private-token'))
+      stack.enter_context(patch.object(probe, 'keycloak_runtime_provenance', return_value=facts))
+      cleanup = stack.enter_context(patch.object(probe, 'cleanup_owned_resources', return_value=1))
+      with self.assertRaisesRegex(RuntimeError, 'owned container cleanup incomplete'):
+        probe.main()
+      cleanup.assert_called_once()
+    self.assertNotIn('runtime-provenance-evidence=', output.getvalue())
+    line = next(line for line in output.getvalue().splitlines() if line.startswith('partial_evidence='))
+    self.assertEqual('cleanup', json.loads(line.partition('=')[2])['resolver_runtime']['provenance_probe_stage'])
+
+  def test_runtime_provenance_uses_request_correlated_acceptance_not_masked_config(self):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import wallet_login_live_e2e as probe
+
+    class InfoClient:
+      def request(self, *_args, **_kwargs):
+        return (200, {}, json.dumps({'systemInfo': {'version': '26.8.0'},
+            'providers': {'single-use-object': {'providers': {
+                'infinispan': {'order': 0, 'operationalInfo': {}}}}}}).encode())
+
+    log = ('INFO [org.decentwallet.keycloak.wallet.WalletLoginTransportHandler] '
+        '(executor-thread-1) Wallet proof transaction consumed (request=' + 'a' * 32
+        + ', provider=infinispan)\n'
+        'Infinispan configuration:\n<local-cache name="sessions"/>')
+    with patch.object(probe, 'run', side_effect=[
+        SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local"]\n'),
+        SimpleNamespace(returncode=0, stdout='kc.db = dev-file (Persisted)\n'
+            'kc.cache = local (Persisted)\n'
+            'kc.spi-single-use-object--provider-default = ******* (Persisted)\n'),
+        SimpleNamespace(returncode=0, stdout=log, stderr='')]):
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+    self.assertEqual('infinispan', facts['single_use_object_provider_path'])
+    self.assertEqual('request_correlated_consumed_transaction', facts['single_use_object_provider_evidence'])
+    self.assertEqual('unavailable', facts['single_use_object_provider_configured'])
+    self.assertEqual('show_config_fields_missing', facts['keycloak_config_read_status'])
+    self.assertTrue(probe.runtime_qualification_is_verified(facts))
+    safe = probe.sanitize_live_checkpoint({'resolver_runtime': facts})['resolver_runtime']
+    self.assertEqual('request_correlated_consumed_transaction', safe['single_use_object_provider_evidence'])
+    self.assertNotIn('opaque-token', json.dumps(safe))
+    self.assertNotIn('WalletLoginTransportHandler', json.dumps(safe))
 
   def test_runtime_provenance_reads_allowlisted_config_but_does_not_infer_selected_provider(self):
     from types import SimpleNamespace
@@ -1201,13 +1729,15 @@ class IdentityLookupClassificationTest(unittest.TestCase):
             'kc.cache = local (Persisted)\n'
             'kc.spi-single-use-object--provider-default = ******* (Persisted)\n')),
         SimpleNamespace(returncode=0, stdout='Infinispan configuration:\n<local-cache name="sessions"/>')]) as mocked_run:
-      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
     self.assertEqual(3, mocked_run.call_count)
     self.assertEqual(['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}', 'a' * 64], mocked_run.call_args_list[0].args[0])
     self.assertEqual(['podman', 'exec', 'a' * 64, '/opt/keycloak/bin/kc.sh', 'show-config',
         '--db=dev-file', '--cache=local', '--spi-single-use-object--provider-default=infinispan'],
         mocked_run.call_args_list[1].args[0])
-    self.assertEqual(['podman', 'logs', 'a' * 64], mocked_run.call_args_list[2].args[0])
+    self.assertEqual(['podman', 'logs', '--tail', '300', 'a' * 64], mocked_run.call_args_list[2].args[0])
+    self.assertEqual({'timeout': 8, 'max_bytes': 262144}, mocked_run.call_args_list[2].kwargs)
     self.assertEqual('26.8.0', facts['keycloak_version'])
     self.assertEqual('one', facts['keycloak_nodes'])
     self.assertEqual('dev-file', facts['database_mode_effective'])
@@ -1241,7 +1771,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]' + chr(10)),
         SimpleNamespace(returncode=17, stdout='private show-config output'),
         SimpleNamespace(returncode=0, stdout='')]):
-      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
 
     self.assertEqual('show_config_nonzero', facts.get('keycloak_config_read_status'))
     self.assertEqual([], facts.get('keycloak_config_fields_present'))
@@ -1268,7 +1799,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         SimpleNamespace(returncode=0, stdout='a' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]' + chr(10)),
         subprocess.TimeoutExpired('show-config', 8),
         SimpleNamespace(returncode=0, stdout='')]):
-      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
 
     self.assertEqual('show_config_timeout', facts.get('keycloak_config_read_status'))
     self.assertEqual([], facts.get('keycloak_config_fields_present'))
@@ -1308,7 +1840,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
 
     with patch.object(probe, 'run', return_value=SimpleNamespace(
         returncode=0, stdout='b' * 64 + '|["start-dev","--db=dev-file","--cache=local","--spi-single-use-object--provider-default=infinispan"]\\n')) as mocked_run:
-      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', 'a' * 64)
     mocked_run.assert_called_once_with(
         ['podman', 'inspect', '--format', '{{.Id}}|{{json .Config.Cmd}}', 'a' * 64], timeout=8)
     self.assertEqual('unknown', facts['keycloak_nodes'])
@@ -1334,7 +1867,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         SimpleNamespace(returncode=0,
             stdout='kc.db = postgres (classpath application.properties)\n', stderr=''),
         SimpleNamespace(returncode=0, stdout='')]):
-      facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        facts = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
 
     self.assertEqual('postgres', facts['database_mode_configured'])
     self.assertEqual('local', facts['cache_mode_configured'])
@@ -1353,7 +1887,8 @@ class IdentityLookupClassificationTest(unittest.TestCase):
             'kc.db = mysql (classpath application.properties)\n'
             'kc.cache = local (classpath application.properties)\n'), stderr=''),
         SimpleNamespace(returncode=0, stdout='')]):
-      conflicting = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
+      with patch.object(probe, '_bounded_command_tail', side_effect=probe.run):
+        conflicting = probe.keycloak_runtime_provenance(InfoClient(), 'opaque-token', container_id)
     self.assertEqual('unavailable', conflicting['database_mode_effective'])
     self.assertEqual('local', conflicting['cache_mode_effective'])
     self.assertEqual('show_config_conflict', conflicting['keycloak_config_read_status'])
@@ -1362,7 +1897,11 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     candidate = {'resolver_runtime': {
         'identity_commit': 'a' * 40, 'registry_commit': 'b' * 40,
         'harness_sha256': 'c' * 64, 'runtime_manifest_sha256': 'd' * 64,
-        'runtime_lock_sha256': 'e' * 64, 'image_digest': 'sha256:' + 'f' * 64,
+        'runtime_lock_sha256': 'e' * 64, 'runtime_patcher_sha256': '1' * 64,
+        'pinned_lookup_outcomes_sha256': '2' * 64,
+        'rotation_registry_roundtrip_sha256': '3' * 64,
+        'issue5_adversarial_cases_sha256': '4' * 64,
+        'image_digest': 'sha256:' + 'f' * 64,
         'keycloak_version': '26.8.0', 'keycloak_nodes': 'one',
         'database_mode_configured': 'dev-file', 'database_mode_effective': 'dev-file',
         'cache_mode_configured': 'local', 'cache_mode_effective': 'local',
@@ -1390,15 +1929,39 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'single_use_object_provider_configured'],
         facts.get('runtime_command_fields_present'))
     self.assertEqual('runtime_facts_verified', facts.get('runtime_qualification_status'))
+    for field in ('runtime_patcher_sha256','pinned_lookup_outcomes_sha256',
+        'rotation_registry_roundtrip_sha256','issue5_adversarial_cases_sha256'):
+      self.assertRegex(facts[field], r'^[0-9a-f]{64}$')
     self.assertEqual('show_config_fields_complete', facts.get('keycloak_config_read_status'))
     self.assertEqual(['cache_mode_effective', 'database_mode_effective',
         'single_use_object_provider_configured'], facts.get('keycloak_config_fields_present'))
+    for field in ('runtime_patcher_sha256','pinned_lookup_outcomes_sha256',
+        'rotation_registry_roundtrip_sha256','issue5_adversarial_cases_sha256'):
+      self.assertRegex(facts[field], r'^[0-9a-f]{64}$')
     rendered = json.dumps(projected)
     self.assertNotIn('marker-raw-config', rendered)
     self.assertNotIn('marker-class', rendered)
     self.assertNotIn('marker-token', rendered)
 
-  def test_expiry_checkpoint_projects_only_bounded_allowlisted_fields(self):
+  def test_rejects_unexpected_issue5_runtime_input_hash_projection(self):
+    candidate = {'resolver_runtime': {
+        'issue5_runtime_input_hashes': {
+            'runtime_patcher': {'file': 'container/patch_resolver_runtime.py', 'sha256': 'a' * 64},
+            'pinned_lookup_outcomes': {'file': 'container/pinned_lookup_outcomes.py', 'sha256': 'b' * 64},
+            'rotation_helper': {'file': 'container/rotation_registry_roundtrip.py', 'sha256': 'c' * 64},
+            'adversarial_fixture': {'file': 'scripts/test_pinned_adversarial_identity_peer.py', 'sha256': 'd' * 64},
+            'adversarial_case_constants': {'file': 'scripts/issue5_adversarial_cases.py', 'sha256': 'e' * 64},
+        }}}
+    expected = candidate['resolver_runtime']['issue5_runtime_input_hashes']
+    self.assertEqual(expected, sanitize_live_checkpoint(candidate)['resolver_runtime']['issue5_runtime_input_hashes'])
+    for invalid in ({**expected, 'extra': {'file': '/etc/passwd', 'sha256': 'f' * 64}},
+        {**expected, 'runtime_patcher': {'file': '/etc/passwd', 'sha256': 'a' * 64}},
+        {**expected, 'runtime_patcher': {'file': 'container/patch_resolver_runtime.py', 'sha256': 'secret'}}):
+      with self.subTest(invalid=invalid):
+        candidate['resolver_runtime']['issue5_runtime_input_hashes'] = invalid
+        self.assertNotIn('issue5_runtime_input_hashes',
+            sanitize_live_checkpoint(candidate).get('resolver_runtime', {}))
+
     candidate = {'expiry_case': {
         'stage': 'complete', 'ttl_seconds': 300, 'wait_seconds': 305,
         'login_page_http': 200, 'challenge_get_http': 200,
@@ -1595,7 +2158,13 @@ class IdentityLookupClassificationTest(unittest.TestCase):
     self.assertTrue(probe._expiry_body_is_safe(b''))
     self.assertTrue(probe._expiry_body_is_safe(b'{"status":"expired"}'))
     for body in (b'{"status":"accepted"}', b'{"callback":null}',
-        b'{"authorization_code":"secret"}', b'{"receipt_id":"secret"}', b'not-json'):
+        b'{"authorization_code":"secret"}', b'{"receipt_id":"secret"}',
+        b'{"message":"code = secret"}',
+        b'{"message":"callback_url=secret"}', b'{"receipt_token":"secret"}',
+        b'{"message":"x_callback_url=secret"}', b'{"message":"x_receipt_id=secret"}',
+        b'{"message":"x_authorization_code=secret"}',
+        b'{"x_callback_url":"secret"}', b'{"x_receipt_id":"secret"}',
+        b'{"x_authorization_code":"secret"}', b'not-json'):
       with self.subTest(body=body):
         self.assertFalse(probe._expiry_body_is_safe(body))
     self.assertTrue(probe._expiry_location_is_safe(''))
@@ -1604,7 +2173,21 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         'https://rp.example/callback?receipt_id=secret',
         'https://rp.example/callback?result=accepted',
         'https://rp.example/callback#code=secret',
-        'https://rp.example/callback'):
+        'https://rp.example/callback',
+        'https://rp.example/failure?callback_url=https%3A%2F%2Frp.example%2Fcallback',
+        'https://rp.example/failure?receipt_token=secret',
+        'https://rp.example/failure?x_callback_url=opaque',
+        'https://rp.example/failure?x_receipt_id=opaque',
+        'https://rp.example/failure?callback%5Furl=opaque',
+        'https://rp.example/failure#receipt%5Fid=opaque',
+        'https://rp.example/failure?authorization%5Fcode=opaque',
+        'https://rp.example/failure?x_authorization_code=opaque',
+        'https://rp.example/failure#x_callback_url=opaque',
+        'https://rp.example/failure/x_receipt_id/opaque',
+        'https://rp.example/failure/x%5Freceipt%5Fid/opaque',
+        'https://rp.example/failure/x_authorization_code/opaque',
+        'https://rp.example/failure/code=opaque',
+        'https://rp.example/oauth/code/secret'):
       with self.subTest(location=location):
         self.assertFalse(probe._expiry_location_is_safe(location))
     self.assertTrue(probe._expiry_redirects_are_safe([]))

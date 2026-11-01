@@ -38,11 +38,11 @@
   "repo_overlays": {
     "pinned_lookup_outcomes": {
       "file": "pinned_lookup_outcomes.py",
-      "sha256": "7e38a8a2006eabd2bb392656826080c1699c4818e8de697edefc96db7d803625"
+      "sha256": "3abc9bb85482b995af8d776048384bd381eed017fd572c1a25b563b61d8b6ab1"
     },
     "runtime_patcher": {
       "file": "patch_resolver_runtime.py",
-      "sha256": "8f0c91eb639fd4a4a08f2615e41ede7fffbddebfc4860429ed25d756584f9295"
+      "sha256": "b7ab9a052a53e9a1dde91a9dc960cc2ece1cc34f9bb3a357b6f23ad0bd76a874"
     }
   },
   "sources": {

@@ -36,13 +36,15 @@ Before committing or pushing, run the complete offline acceptance lifecycle from
 python3.11 scripts/lifecycle.py run offline
 ```
 
-Read the sanitized receipt in `target/lifecycle/evidence/` and confirm each required stage passed. The lifecycle runs Maven/Surefire, the canonical Python suite, Python compilation, pinned resolver-source materialization and verification, provider SPI registration, the runtime image build and version smoke, whitespace checks, evidence retention, and bounded teardown. PR CI runs the same named lifecycle as independent verification; it is not a substitute for completing local acceptance before publishing the PR.
+Read the sanitized receipt in `target/lifecycle/evidence/` and confirm each required stage passed. The lifecycle runs Maven/Surefire, the canonical Python suite, Python compilation, pinned resolver-source materialization and verification, provider SPI registration, the runtime image build and version smoke, whitespace checks, evidence retention, and bounded teardown. The run-owned image is removed by default. `--retain-image` keeps it only by explicit opt-in, with the receipt recording its immutable ID and retention status. PR CI runs the same named lifecycle as independent verification; it is not a substitute for completing local acceptance before publishing the PR.
 
 The `issue5-live` profile is a separate networked loopback qualification. It is not a default test, and it is not authorized by a code change, successful offline run, or PR request. Run it only after the owning human explicitly approves the exact live run; the CLI additionally requires `--allow-live`:
 
 ```bash
 python3.11 scripts/lifecycle.py run issue5-live --allow-live
 ```
+
+This profile has bounded loopback fixtures and a unique run-scoped image. A failed or interrupted attempt is not silently retried; review its receipt and reassess authorization before another live attempt. By default the image is cleaned up. If you explicitly intend to retain it for a later, separately authorized promotion, add `--retain-image` to this approved run. The `promote` command is a separate publication action and requires a fully passing live receipt, explicit `docker://registry/repository:rc-tag` destination, and `--allow-publish`; it promotes the retained immutable image without rebuilding, then verifies the remote manifest readback against that image ID. A failed promotion records its status and must be assessed before retry; it never automatically deletes or rewrites remote registry state.
 
 A passing loopback test is limited to its recorded environment and case. It does not establish production Registry behavior, real TLS, browser/native-wallet compatibility, or production readiness. Keep `not_run`, failure, and unavailable states distinct; in particular, HTTP 503/unavailable is not a clean Identity miss.
 
