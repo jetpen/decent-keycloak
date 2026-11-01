@@ -50,7 +50,7 @@ The harness records bounded attempts in `registry_matrix` and checkpoints after 
 
 ### Lifecycle receipt gate mapping
 
-The `issue5-live` receipt maps each criterion to an explicit gate. Offline receipts leave every live gate `not_run`; the matrix step cannot pass unless the harness evidence is complete and each ordinary gate is mapped. An incomplete or interrupted attempt remains `inconclusive` (or `fail` when observed evidence contradicts the criterion), never an implicit pass.
+The `issue5-live` receipt maps each Registry matrix criterion below to an explicit gate. Account-denial concurrency is supplemental correlated evidence, not a Registry matrix gate. Offline receipts leave every live gate `not_run`; the matrix step cannot pass unless the harness evidence is complete and each ordinary gate is mapped. An incomplete or interrupted attempt remains `inconclusive` (or `fail` when observed evidence contradicts the criterion), never an implicit pass.
 
 | Criterion | Receipt gate | Evidence source |
 |---|---|---|
