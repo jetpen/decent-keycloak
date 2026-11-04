@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_TESTS = (
   "scripts.test_wallet_login_result",
+  "scripts.test_issue8_oidc",
   "scripts.test_wallet_login_transport_e2e",
   "scripts.test_owner_rotation_probe",
   "scripts.test_signup_intent_probe",

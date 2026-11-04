@@ -640,3 +640,27 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn("CURRENT_AUTHENTICATION_EXECUTION", body)
     self.assertNotIn("LAST_PROCESSED_EXECUTION", body)
     self.assertIn("context.getActionUrl(accessCode)", body)
+
+  def test_issue8_evidence_ledger_maps_all_criteria_and_keeps_live_gates_open(self):
+    doc = README.parent / "docs/acceptance/issue-8-tls-browser-wallet-oidc.md"
+    self.assertIn("docs/acceptance/issue-8-tls-browser-wallet-oidc.md", README.read_text())
+    text = doc.read_text()
+    gate_rows = {
+        line.split("|")[1].strip()
+        for line in text.splitlines()
+        if line.startswith("| issue8-")
+    }
+    self.assertEqual({
+        "issue8-material-and-tls",
+        "issue8-browser-and-consent",
+        "issue8-signer-and-native-transport",
+        "issue8-browser-callback-and-pkce",
+        "issue8-oidc-validation",
+        "issue8-negative-matrix",
+        "issue8-sanitized-versioned-evidence",
+    }, gate_rows)
+    self.assertIn("**Live E2E qualification:** `not_run`", text)
+    self.assertIn("Wallet #64 is closed", text)
+    self.assertIn("[Wallet PR #65]", text)
+    self.assertIn("merged at `a385ac60aa89f251b7f997f514e75e21d8eab68f`", text)
+    self.assertIn("`adb devices -l` returned no attached devices", text)
