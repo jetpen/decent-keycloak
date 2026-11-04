@@ -107,6 +107,7 @@ The extension endpoint is mounted at `/realms/{realm}/decent-wallet-login`; the 
 - [Issue #5 Registry matrix](docs/acceptance/issue-5-registry-matrix.md) records live acceptance gaps and limits.
 - [Issue #6 qualification](docs/acceptance/issue-6-qualification.md) records single-node transaction/replay evidence and remaining gates.
 - [Issue #7 qualification](docs/acceptance/issue-7-renewed-qualification.md) records the scoped signup/recovery results.
+- [Issue #8 TLS/browser/native-wallet/OIDC qualification](docs/acceptance/issue-8-tls-browser-wallet-oidc.md) records the unqualified live-client gates and offline OIDC-validation slice.
 - [Support policy](docs/support-policy.md) defines the narrow build-time target and upgrade process.
 
 Build/test evidence is not an endorsement for production use. Do not infer Registry absence, identity denial, stale-key rejection, or production support from an unavailable response or offline fixture. Keep implementation status and coordination in the owning [GitHub issues](https://github.com/jetpen/decent-keycloak/issues), not in this README.

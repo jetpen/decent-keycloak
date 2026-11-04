@@ -21,6 +21,9 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from authlib.oidc.core import CodeIDToken
+from joserfc import jwt
+from joserfc.jwk import KeySet
 import issue7_store_recovery
 import rotation_registry_roundtrip
 from issue5_adversarial_cases import (
@@ -3589,40 +3592,30 @@ def configure_realm(client, token, identifier, resolver_port, wrapper_path, boot
   }, expected=(204,))
 
 
-def der(tag, value):
-  length = len(value)
-  encoded_length = bytes([length]) if length < 128 else bytes([0x80 + (length.bit_length() + 7) // 8]) + length.to_bytes((length.bit_length() + 7) // 8, 'big')
-  return bytes([tag]) + encoded_length + value
-
-
-def verify_id_token(client, token, temp):
-  header_segment, payload_segment, signature_segment = token.split('.')
+def verify_id_token(client, token, expected_issuer, expected_audience, expected_nonce):
+  pieces = token.split('.')
+  require(len(pieces) == 3 and all(pieces), 'ID token shape')
   decode = lambda value: base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
-  header = json.loads(decode(header_segment))
+  header = json.loads(decode(pieces[0]))
   require(header.get('alg') == 'RS256', 'pinned ID token algorithm')
   status, _, raw = client.request('GET', f'/auth/realms/{REALM}/protocol/openid-connect/certs')
   require(status == 200, 'realm JWKS read')
-  keys = [key for key in json.loads(raw)['keys'] if key.get('kid') == header.get('kid')
-          and key.get('kty') == 'RSA' and key.get('alg') == 'RS256' and key.get('use') == 'sig']
+  jwks = json.loads(raw)
+  keys = [key for key in jwks.get('keys', []) if key.get('kid') == header.get('kid')
+          and key.get('kty') == 'RSA' and key.get('alg') == 'RS256' and key.get('use') == 'sig'
+          and ('key_ops' not in key or 'verify' in key['key_ops'])]
   require(len(keys) == 1, 'unique realm signing key')
-  def integer(value):
-    data = decode(value).lstrip(b'\x00')
-    if data[0] & 0x80:
-      data = b'\x00' + data
-    return der(2, data)
-  rsa = der(0x30, integer(keys[0]['n']) + integer(keys[0]['e']))
-  spki = der(0x30, bytes.fromhex('300d06092a864886f70d0101010500') + der(3, b'\x00' + rsa))
-  public = temp / 'realm-public.der'
-  public.write_bytes(spki)
-  pem = temp / 'realm-public.pem'
-  converted = run(['openssl', 'pkey', '-pubin', '-inform', 'DER', '-in', str(public), '-out', str(pem)])
-  require(converted.returncode == 0, 'realm public key conversion')
-  signature = temp / 'id-token-signature'
-  signature.write_bytes(decode(signature_segment))
-  verified = subprocess.run(['openssl', 'dgst', '-sha256', '-verify', str(pem), '-signature', str(signature)],
-      input=(header_segment + '.' + payload_segment).encode('ascii'), capture_output=True, timeout=10)
-  require(verified.returncode == 0, 'ID token signature verified against realm JWKS')
-  return json.loads(decode(payload_segment))
+  try:
+    signed_token = jwt.decode(token, KeySet.import_key_set({'keys': keys}), algorithms=['RS256'])
+    claims = CodeIDToken(signed_token.claims, signed_token.header, options={
+        'iss': {'value': expected_issuer},
+        'aud': {'values': [expected_audience]},
+        'nonce': {'value': expected_nonce}}, params={
+        'client_id': expected_audience, 'nonce': expected_nonce})
+    claims.validate()
+    return dict(claims)
+  except Exception as error:
+    raise ValueError('OIDC ID token validation failed') from error
 
 
 def wallet_transport_log_categories(container_id):
@@ -4112,7 +4105,8 @@ def auth_flow(client, key, identifier, container, image, *, prior_locator=None,
   id_token = json.loads(token_raw)['id_token']
   pieces = id_token.split('.')
   require(len(pieces) == 3, 'ID token shape')
-  claims = verify_id_token(client, id_token, key.parent)
+  claims = verify_id_token(client, id_token,
+      f'https://idp.example:{KC_PORT}/auth/realms/{REALM}', CLIENT, nonce)
   require(claims.get('exp', 0) > time.time(), 'unexpired ID token')
   require(claims.get('iss') == f'https://idp.example:{KC_PORT}/auth/realms/' + REALM, 'signed issuer claim')
   aud = claims.get('aud')
@@ -5764,7 +5758,8 @@ def signup_wallet_flow(client, key, identifier, container, admin_client, progres
       http_status=token_status, failure_stage='token', failure_gate='token_exchange')
   token_payload = signup_boundary('token', 'pkce', lambda: json.loads(token_raw))
   claims = signup_boundary('token', 'pkce',
-      lambda: verify_id_token(client, token_payload['id_token'], key.parent))
+      lambda: verify_id_token(client, token_payload['id_token'],
+          f'https://idp.example:{KC_PORT}/auth/realms/{REALM}', CLIENT, nonce))
   require(claims.get('sub') == matched[0].get('id'), 'signup returns created opaque Keycloak subject',
       failure_stage='token', failure_gate='pkce')
   require(claims.get('decent_identity_id') == identifier,

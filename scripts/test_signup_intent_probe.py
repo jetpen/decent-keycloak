@@ -146,7 +146,7 @@ class SignupIntentProbeTest(unittest.TestCase):
   def test_disposable_realm_enables_registration_before_signup_action(self):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     start = source.index("def configure_realm(")
-    end = source.index("\ndef der(", start)
+    end = source.index("\ndef wallet_transport_log_categories(", start)
     configure = source[start:end]
     self.assertIn("'verifyEmail': False", configure)
     self.assertIn("'loginWithEmailAllowed': True", configure)
@@ -784,7 +784,7 @@ class SignupIntentProbeTest(unittest.TestCase):
   def test_disposable_realm_registers_email_login_and_preserves_unique_emails(self):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     start = source.index("def configure_realm(")
-    end = source.index("\ndef der(", start)
+    end = source.index("\ndef wallet_transport_log_categories(", start)
     block = source[start:end]
     self.assertIn("'registrationAllowed': True", block)
     self.assertIn("'verifyEmail': False", block)
@@ -796,7 +796,7 @@ class SignupIntentProbeTest(unittest.TestCase):
   def test_disposable_oidc_client_exposes_the_exact_identity_attribute_as_a_signed_claim(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
     start = source.index('def configure_realm(')
-    end = source.index('\ndef der(', start)
+    end = source.index('\ndef wallet_transport_log_categories(', start)
     configure = source[start:end]
     self.assertIn("'protocolMappers': [{", configure)
     self.assertIn("'protocolMapper': 'oidc-usermodel-attribute-mapper'", configure)
@@ -809,7 +809,7 @@ class SignupIntentProbeTest(unittest.TestCase):
   def test_disposable_realm_seeds_one_existing_identity_mapping_with_a_valid_email(self):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     start = source.index("def configure_realm(")
-    end = source.index("\ndef der(", start)
+    end = source.index("\ndef wallet_transport_log_categories(", start)
     block = source[start:end]
     self.assertIn("'users': [{", block)
     self.assertIn("'email': 'wallet-owner@example.com', 'emailVerified': True", block)
