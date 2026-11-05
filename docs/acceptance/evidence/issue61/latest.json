@@ -1,0 +1,486 @@
+{
+  "cases": [
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858276,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:read"
+        ]
+      },
+      "id": "assigned_storage_read",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858276,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:create"
+        ]
+      },
+      "id": "assigned_storage_create",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858276,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:update"
+        ]
+      },
+      "id": "assigned_storage_update",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858276,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:delete"
+        ]
+      },
+      "id": "assigned_storage_delete",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858276,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:enrollment:read"
+        ]
+      },
+      "id": "assigned_storage_enrollment_read",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:enrollment:withdraw"
+        ]
+      },
+      "id": "assigned_storage_enrollment_withdraw",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:create",
+          "storage:delete",
+          "storage:enrollment:read",
+          "storage:enrollment:withdraw",
+          "storage:read",
+          "storage:update"
+        ]
+      },
+      "id": "all_six_assigned",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "no_assigned_roles",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "role_scope_excluded",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:read"
+        ]
+      },
+      "id": "role_scope_intersection",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "realm_role_only",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "different_client_role_only",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": false,
+        "expected_failure_categories": [
+          "audience_not_exact_single_storage_resource"
+        ],
+        "failure_categories": [
+          "audience_not_exact_single_storage_resource"
+        ],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "other-resource",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "wrong_audience_rejected",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": false,
+        "expected_failure_categories": [
+          "audience_not_exact_single_storage_resource"
+        ],
+        "failure_categories": [
+          "audience_not_exact_single_storage_resource"
+        ],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": [
+          "other-resource",
+          "decent-storage"
+        ],
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:read"
+        ]
+      },
+      "id": "widened_audience_rejected",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "refresh_unchanged_assignments",
+      "status": "passed"
+    },
+    {
+      "already_issued_token_roles_unchanged_until_exp": true,
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858277,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": [
+          "storage:read"
+        ]
+      },
+      "id": "refresh_after_role_change",
+      "status": "passed"
+    },
+    {
+      "checks": {
+        "claim_contract_conforms": true,
+        "expected_failure_categories": [],
+        "failure_categories": [],
+        "signature_verified": true
+      },
+      "claims": {
+        "aud": "decent-storage",
+        "exp": 1793858278,
+        "other_resource_clients": [],
+        "realm_role_names": [],
+        "storage_roles": []
+      },
+      "id": "refresh_after_scope_change",
+      "status": "passed"
+    }
+  ],
+  "cleanup": {
+    "container_name_absent": true,
+    "container_removed": true
+  },
+  "configuration": {
+    "app_client": {
+      "clientId": "issue61-app",
+      "directAccessGrantsEnabled": true,
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access",
+        "organization",
+        "other-resource-audience",
+        "microprofile-jwt",
+        "storage-role-scope"
+      ],
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false
+    },
+    "mappers": [
+      {
+        "config": {
+          "access.token.claim": "true",
+          "id.token.claim": "false",
+          "included.custom.audience": "other-resource",
+          "userinfo.token.claim": "false"
+        },
+        "consentRequired": false,
+        "name": "other-resource-audience",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-audience-mapper",
+        "scope_name": "other-resource-audience"
+      },
+      {
+        "config": {
+          "access.token.claim": "true",
+          "claim.name": "resource_access.decent-storage.roles",
+          "id.token.claim": "false",
+          "jsonType.label": "String",
+          "multivalued": "true",
+          "userinfo.token.claim": "false",
+          "usermodel.clientRoleMapping.clientId": "decent-storage"
+        },
+        "consentRequired": false,
+        "name": "storage-native-client-roles",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-usermodel-client-role-mapper",
+        "scope_name": "storage-role-scope"
+      },
+      {
+        "config": {
+          "access.token.claim": "true",
+          "id.token.claim": "false",
+          "included.client.audience": "decent-storage",
+          "userinfo.token.claim": "false"
+        },
+        "consentRequired": false,
+        "name": "storage-resource-audience",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-audience-mapper",
+        "scope_name": "storage-role-scope"
+      }
+    ],
+    "other_audience_scope": {
+      "attributes": {},
+      "name": "other-resource-audience",
+      "protocol": "openid-connect"
+    },
+    "realm": {
+      "accessTokenLifespan": 300,
+      "enabled": true,
+      "realm": "issue61",
+      "refreshTokenMaxReuse": 0
+    },
+    "role_scope": {
+      "attributes": {},
+      "name": "storage-role-scope",
+      "protocol": "openid-connect"
+    },
+    "role_scope_mappings": [
+      "storage:create",
+      "storage:delete",
+      "storage:enrollment:read",
+      "storage:enrollment:withdraw",
+      "storage:read",
+      "storage:update"
+    ],
+    "storage_client": {
+      "clientId": "decent-storage",
+      "directAccessGrantsEnabled": true,
+      "enabled": true,
+      "fullScopeAllowed": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false
+    },
+    "storage_roles": [
+      {
+        "clientRole": true,
+        "composite": false,
+        "description": "Issue #61 qualification role",
+        "name": "storage:create"
+      },
+      {
+        "clientRole": true,
+        "composite": false,
+        "description": "Issue #61 qualification role",
+        "name": "storage:delete"
+      },
+      {
+        "clientRole": true,
+        "composite": false,
+        "description": "Issue #61 qualification role",
+        "name": "storage:enrollment:read"
+      },
+      {
+        "clientRole": true,
+        "composite": false,
+        "description": "Issue #61 qualification role",
+        "name": "storage:enrollment:withdraw"
+      },
+      {
+        "clientRole": true,
+        "composite": false,
+        "description": "Issue #61 qualification role",
+        "name": "storage:read"
+      },
+      {
+        "clientRole": true,
+        "composite": false,
+        "description": "Issue #61 qualification role",
+        "name": "storage:update"
+      }
+    ]
+  },
+  "configuration_sha256": "579202e241cc70438751059631e2d3a071ba2e3017e466dfda0179e8fe7b7524",
+  "format": "issue61-native-role-qualification-v1",
+  "harness_sha256": "afb674e03eb44cd0f7c4a2653e61fd24b4f524fa7841aabf37912960ce38995a",
+  "refresh_semantics": {
+    "prior_access_token": "claims remain signed as issued until exp; no prompt revocation claim",
+    "role_change": "new refresh-issued access token reflects changed assignment",
+    "scope_change": "new refresh-issued access token reflects changed scope mapping",
+    "unchanged_assignments": "same audience and roles on refresh"
+  },
+  "result": "passed",
+  "software": {
+    "image": "quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad",
+    "image_digest": "sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad",
+    "image_id": "43ebe9d4e97c2e5483b7637edf474e6adc1bbf4832a7396686cf90259c396d42",
+    "keycloak_release": "Keycloak 26.8.0",
+    "runtime": "single local disposable node"
+  }
+}

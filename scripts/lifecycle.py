@@ -36,6 +36,7 @@ PYTHON_TESTS = (
   "scripts.test_issue6_single_node_profile",
   "scripts.test_lifecycle",
   "scripts.test_image_lifecycle",
+  "scripts.test_issue61_native_roles",
 )
 PROFILES = {
   "offline": {
