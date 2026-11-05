@@ -24,8 +24,8 @@ Recorded receipt: [`evidence/issue61/latest.json`](evidence/issue61/latest.json)
 - Keycloak release: **26.8.0**.
 - Image reference/digest: `quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad`.
 - Local immutable image ID: `43ebe9d4e97c2e5483b7637edf474e6adc1bbf4832a7396686cf90259c396d42`.
-- Realm/client config fingerprint: `302c8aee912008b79ca26e1e31d3d8b6b7980b8b57773cbda19a42d52ec651ff`.
-- Harness SHA-256: `e3ca85af835f115cff382c8dced6602a1bc3232eea9325c7fae4f77707be1dea`.
+- Realm/client configuration fingerprint (allowlisted readback from Keycloak Admin API): `1e58b933ed8d27d4ed687bcca343501393cf7a5d2a3f89a39fb927462eefa33d`.
+- Harness SHA-256: `59987894abcefc370be3a205a3321d482678e980ff6afd0cf4851a293317f99e`.
 - Test interpreter: CPython 3.11.13; `Authlib 1.9.2` from `requirements/issue8-oidc.lock` validates signed JWTs and expiration/issuer claims.
 
 Cases cover each of the six accepted Storage client roles individually and together, no assigned role, role-scope exclusion and intersection, realm-role-only and different-client-role-only assignments, wrong and widened audiences, unchanged refresh, refresh after role assignment change, and refresh after scope-mapping change. The exact-audience positive cases contain only `aud: "decent-storage"`; assigned roles appear under `resource_access.decent-storage.roles`. Wrong-audience and widened-audience tokens are signed Keycloak outputs but correctly fail the exact-single-audience contract.

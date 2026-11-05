@@ -30,23 +30,24 @@ ROLES = (
     "storage:read", "storage:create", "storage:update", "storage:delete",
     "storage:enrollment:read", "storage:enrollment:withdraw",
 )
-VALID_STATES = {"passed", "failed", "error", "not_run"}
+VALID_STATES = {"passed", "failed", "error", "not-run"}
+RUN_LABEL = "org.decent-keycloak.issue61.run-id"
 
 # Criterion ledger: fixed case names prevent omissions from appearing qualified.
 CASES = [
-    {"id": f"assigned_{role.replace(':', '_')}", "status": "not_run"} for role in ROLES
+    {"id": f"assigned_{role.replace(':', '_')}", "status": "not-run"} for role in ROLES
 ] + [
-    {"id": "all_six_assigned", "status": "not_run"},
-    {"id": "no_assigned_roles", "status": "not_run"},
-    {"id": "role_scope_excluded", "status": "not_run"},
-    {"id": "role_scope_intersection", "status": "not_run"},
-    {"id": "realm_role_only", "status": "not_run"},
-    {"id": "different_client_role_only", "status": "not_run"},
-    {"id": "wrong_audience_rejected", "status": "not_run"},
-    {"id": "widened_audience_rejected", "status": "not_run"},
-    {"id": "refresh_unchanged_assignments", "status": "not_run"},
-    {"id": "refresh_after_role_change", "status": "not_run"},
-    {"id": "refresh_after_scope_change", "status": "not_run"},
+    {"id": "all_six_assigned", "status": "not-run"},
+    {"id": "no_assigned_roles", "status": "not-run"},
+    {"id": "role_scope_excluded", "status": "not-run"},
+    {"id": "role_scope_intersection", "status": "not-run"},
+    {"id": "realm_role_only", "status": "not-run"},
+    {"id": "different_client_role_only", "status": "not-run"},
+    {"id": "wrong_audience_rejected", "status": "not-run"},
+    {"id": "widened_audience_rejected", "status": "not-run"},
+    {"id": "refresh_unchanged_assignments", "status": "not-run"},
+    {"id": "refresh_after_role_change", "status": "not-run"},
+    {"id": "refresh_after_scope_change", "status": "not-run"},
 ]
 STORAGE_ROLES = ROLES
 
@@ -59,7 +60,8 @@ def validate_case_ledger(cases: list[dict[str, Any]]) -> bool:
     )
 
 
-def _roles(claims: dict[str, Any], storage_client: str) -> list[str]:
+def storage_client_roles(claims: dict[str, Any], storage_client: str) -> list[str]:
+    """Extract roles only from the configured Storage client's resource_access entry."""
     value = claims.get("resource_access", {}).get(storage_client, {}).get("roles", [])
     return sorted(value) if isinstance(value, list) and all(isinstance(v, str) for v in value) else []
 
@@ -69,7 +71,7 @@ def evaluate_claims(claims: dict[str, Any], expected: dict[str, Any], storage_cl
     audience = claims.get("aud")
     if audience != expected.get("aud") or not isinstance(audience, str):
         failures.append("audience_not_exact_single_storage_resource")
-    actual_roles = _roles(claims, storage_client)
+    actual_roles = storage_client_roles(claims, storage_client)
     wanted_roles = sorted(expected.get("roles", []))
     if actual_roles != wanted_roles:
         failures.append("storage_client_roles_mismatch")
@@ -86,7 +88,7 @@ def claims_summary(claims: dict[str, Any], storage_client: str) -> dict[str, Any
     """Allowlisted sanitized projection; no subject, token, PII, or raw claims."""
     return {
         "aud": claims.get("aud") if isinstance(claims.get("aud"), (str, list)) else None,
-        "storage_roles": _roles(claims, storage_client),
+        "storage_roles": storage_client_roles(claims, storage_client),
         "other_resource_clients": sorted(
             key for key in claims.get("resource_access", {}) if key != storage_client
         ),
@@ -95,6 +97,80 @@ def claims_summary(claims: dict[str, Any], storage_client: str) -> dict[str, Any
         ),
         "exp": claims.get("exp") if isinstance(claims.get("exp"), int) else None,
     }
+
+
+def _allowlisted_fields(value: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+    return {name: value[name] for name in names if name in value}
+
+
+def readback_configuration_fingerprint(readback: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Fingerprint only allowlisted non-secret fields from Keycloak Admin API readbacks."""
+    mapper_fields = ("name", "protocol", "protocolMapper", "consentRequired")
+    mapper_config_fields = (
+        "usermodel.clientRoleMapping.clientId", "usermodel.clientRoleMapping.rolePrefix",
+        "multivalued", "claim.name", "jsonType.label", "access.token.claim",
+        "id.token.claim", "userinfo.token.claim", "included.client.audience",
+        "included.custom.audience",
+    )
+    projected = {
+        "realm": _allowlisted_fields(readback["realm"],
+                                     ("realm", "enabled", "accessTokenLifespan", "refreshTokenMaxReuse")),
+        "storage_client": _allowlisted_fields(readback["storage_client"],
+                                              ("clientId", "enabled", "protocol", "publicClient",
+                                               "standardFlowEnabled", "directAccessGrantsEnabled",
+                                               "fullScopeAllowed")),
+        "app_client": _allowlisted_fields(readback["app_client"],
+                                           ("clientId", "enabled", "protocol", "publicClient",
+                                            "standardFlowEnabled", "directAccessGrantsEnabled",
+                                            "fullScopeAllowed", "optionalClientScopes")),
+        "role_scope": _allowlisted_fields(readback["role_scope"], ("name", "protocol")),
+        "mappers": sorted(({
+            **_allowlisted_fields(mapper, mapper_fields),
+            "config": _allowlisted_fields(mapper.get("config", {}), mapper_config_fields),
+        } for mapper in readback["mappers"]), key=lambda mapper: mapper["name"]),
+        "role_scope_mappings": sorted(readback["role_scope_mappings"]),
+        "storage_roles": sorted(({
+            **_allowlisted_fields(role, ("name", "description", "composite", "clientRole")),
+        } for role in readback["storage_roles"]), key=lambda role: role["name"]),
+    }
+    encoded = json.dumps(projected, sort_keys=True, separators=(",", ":")).encode()
+    return projected, hashlib.sha256(encoded).hexdigest()
+
+
+def verified_owned_container(inspected: Any, name: str, run_id: str, image_id: str) -> bool:
+    """Accept ownership only when engine readback proves all unique identity fields."""
+    if not isinstance(inspected, list) or len(inspected) != 1 or not isinstance(inspected[0], dict):
+        return False
+    container = inspected[0]
+    config = container.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    container_name = container.get("Name")
+    return (
+        isinstance(container.get("Id"), str) and bool(container["Id"])
+        and isinstance(container_name, str) and container_name.lstrip("/") == name
+        and container.get("Image") == image_id
+        and isinstance(labels, dict) and labels.get(RUN_LABEL) == run_id
+    )
+
+
+def cleanup_owned_container(engine: str, name: str, run_id: str, image_id: str) -> bool:
+    """Remove only a run-owned container confirmed by inspect; verify name absence afterward."""
+    inspect = subprocess.run([engine, "container", "inspect", name], text=True, capture_output=True)
+    if inspect.returncode == 0:
+        try:
+            containers = json.loads(inspect.stdout)
+        except (TypeError, ValueError):
+            return False
+        if not verified_owned_container(containers, name, run_id, image_id):
+            return False
+        container_id = containers[0]["Id"]
+        subprocess.run([engine, "stop", "--time", "10", container_id],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([engine, "rm", "--force", container_id],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    inventory = subprocess.run([engine, "ps", "--all", "--filter", f"name=^{name}$",
+                                "--format", "{{.Names}}"], text=True, capture_output=True)
+    return inventory.returncode == 0 and name not in inventory.stdout.splitlines()
 
 
 class Http:
@@ -233,6 +309,22 @@ def _create_realm(http: Http, admin: str, password: str) -> dict[str, str]:
             "scope_id": scope_id, "other_scope_id": other_scope_id, "user_id": user["id"]}
 
 
+def _readback_configuration(http: Http, admin: str, ids: dict[str, str]) -> dict[str, Any]:
+    base = f"/admin/realms/{REALM}"
+    return {
+        "realm": http.require("GET", base, token=admin),
+        "storage_client": http.require("GET", f"{base}/clients/{ids['storage_id']}", token=admin),
+        "app_client": http.require("GET", f"{base}/clients/{ids['app_id']}", token=admin),
+        "role_scope": http.require("GET", f"{base}/client-scopes/{ids['scope_id']}", token=admin),
+        "mappers": http.require("GET", f"{base}/client-scopes/{ids['scope_id']}/protocol-mappers/models",
+                                 token=admin),
+        "role_scope_mappings": [role["name"] for role in http.require(
+            "GET", f"{base}/clients/{ids['app_id']}/scope-mappings/clients/{ids['storage_id']}",
+            token=admin)],
+        "storage_roles": http.require("GET", f"{base}/clients/{ids['storage_id']}/roles", token=admin),
+    }
+
+
 def _client_role(http: Http, admin: str, ids: dict[str, str], name: str) -> dict[str, Any]:
     return http.require("GET", f"/admin/realms/{REALM}/clients/{ids['storage_id']}/roles/{_path(name)}",
                         token=admin)
@@ -318,24 +410,24 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
     if image_inspect.returncode:
         raise RuntimeError("pinned Keycloak image is not present locally; pull it explicitly first")
     image_id = image_inspect.stdout.strip()
-    name = f"issue61-keycloak-{secrets.token_hex(5)}"
+    run_id = secrets.token_hex(16)
+    name = f"issue61-keycloak-{run_id}"
     admin = "issue61-admin"
     admin_password = secrets.token_urlsafe(24)
     user_password = secrets.token_urlsafe(24)
-    started = False
-    cases = [{**item, "status": "not_run"} for item in CASES]
+    cases = [{**item, "status": "not-run"} for item in CASES]
     http = Http(f"http://127.0.0.1:{port}")
     release = None
     cleanup_ok = True
     qualification_result: dict[str, Any] | None = None
     try:
         subprocess.run([engine, "run", "--detach", "--rm", "--name", name,
+                        "--label", f"{RUN_LABEL}={run_id}",
                         "--publish", f"127.0.0.1:{port}:8080",
                         "--env", "KC_BOOTSTRAP_ADMIN_USERNAME=" + admin,
                         "--env", "KC_BOOTSTRAP_ADMIN_PASSWORD=" + admin_password,
                         image_id, "start-dev", "--http-enabled=true"], check=True,
                         stdout=subprocess.DEVNULL)
-        started = True
         for _ in range(90):
             probe = subprocess.run([engine, "exec", name, "/opt/keycloak/bin/kc.sh", "--version"],
                                    text=True, capture_output=True)
@@ -361,6 +453,8 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
         # Explicitly make only the intended client-role subset effective for app tokens.
         for role in role_by_name.values():
             _role_scope(http, admin_token, ids, role, True)
+        config, configuration_sha256 = readback_configuration_fingerprint(
+            _readback_configuration(http, admin_token, ids))
         cases_by_id = {item["id"]: item for item in cases}
         for role_name in ROLES:
             role = role_by_name[role_name]
@@ -416,7 +510,7 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
         refreshed, refresh = _refresh(http, refresh or "")
         second = _verified_claims(refreshed, jwks, issuer)
         _record(cases_by_id["refresh_unchanged_assignments"], refreshed, jwks, issuer, [])
-        if first.get("aud") != second.get("aud") or _roles(first, STORAGE_CLIENT) != _roles(second, STORAGE_CLIENT):
+        if first.get("aud") != second.get("aud") or storage_client_roles(first, STORAGE_CLIENT) != storage_client_roles(second, STORAGE_CLIENT):
             cases_by_id["refresh_unchanged_assignments"]["status"] = "failed"
         # Role added during an existing session: old signed token unchanged; refreshed token reflects update.
         token, refresh = _issue(http, "issue61-qualification-user", user_password, "openid " + ROLE_SCOPE)
@@ -426,7 +520,7 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
         refreshed_claims = _verified_claims(refreshed, jwks, issuer)
         case = cases_by_id["refresh_after_role_change"]
         _record(case, refreshed, jwks, issuer, [ROLES[0]])
-        case["already_issued_token_roles_unchanged_until_exp"] = _roles(old_claims, STORAGE_CLIENT) == []
+        case["already_issued_token_roles_unchanged_until_exp"] = storage_client_roles(old_claims, STORAGE_CLIENT) == []
         if not case["already_issued_token_roles_unchanged_until_exp"]:
             case["status"] = "failed"
         # Remove role from an existing refresh session. New refresh reflects current role/scope mapping.
@@ -437,20 +531,10 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
         _role_scope(http, admin_token, ids, role, True)
         if not validate_case_ledger(cases) or any(item["status"] != "passed" for item in cases):
             raise RuntimeError("one or more required qualification cases did not pass")
-        config = {"realm": REALM, "storage_client": STORAGE_CLIENT, "app_client": APP_CLIENT,
-                  "role_scope": ROLE_SCOPE, "roles": list(ROLES), "direct_grant_test_user": True,
-                  "client_role_mapper": "oidc-usermodel-client-role-mapper",
-                  "client_role_claim": f"resource_access.{STORAGE_CLIENT}.roles",
-                  "role_scope_assignment": "optional client scope with operator-selected role-scope mappings",
-                  "audience_mapper": "oidc-audience-mapper", "storage_audience": STORAGE_CLIENT,
-                  "negative_audience_scope": "other-resource-audience",
-                  "client_grant_type": "standard OIDC password grant used only by disposable fixture",
-                  "access_token_lifespan_seconds": 300, "custom_mappers": False}
         qualification_result = {"format": "issue61-native-role-qualification-v1", "result": "passed",
                 "software": {"keycloak_release": release, "image": IMAGE, "image_id": image_id,
                              "image_digest": IMAGE_DIGEST, "runtime": "single local disposable node"},
-                "configuration": config,
-                "configuration_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                "configuration": config, "configuration_sha256": configuration_sha256,
                 "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "cases": cases, "refresh_semantics": {
                     "unchanged_assignments": "same audience and roles on refresh",
@@ -460,8 +544,8 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
                 }, "cleanup": {"container_removed": False}}
     except BaseException as exc:
         for item in cases:
-            if item["status"] == "not_run":
-                item["status"] = "error" if not isinstance(exc, KeyboardInterrupt) else "not_run"
+            if item["status"] == "not-run":
+                item["status"] = "error" if not isinstance(exc, KeyboardInterrupt) else "not-run"
         qualification_result = {"format": "issue61-native-role-qualification-v1", "result": "failed",
                 "software": {"keycloak_release": release, "image": IMAGE, "image_id": image_id,
                              "image_digest": IMAGE_DIGEST}, "cases": cases,
@@ -469,15 +553,10 @@ def run_qualification(port: int = 18080) -> dict[str, Any]:
                 "failure_detail": str(exc).split(": ", 1)[-1] if str(exc).startswith("ordinary OIDC token issuance failed:") else type(exc).__name__,
                 "cleanup": {"container_removed": False}}
     finally:
-        if started:
-            result = subprocess.run([engine, "stop", "--time", "10", name],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode != 0:
-                subprocess.run([engine, "rm", "--force", name], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-            inventory = subprocess.run([engine, "ps", "--all", "--filter", f"name=^{name}$",
-                                        "--format", "{{.Names}}"], text=True, capture_output=True)
-            cleanup_ok = inventory.returncode == 0 and name not in inventory.stdout.splitlines()
+        try:
+            cleanup_ok = cleanup_owned_container(engine, name, run_id, image_id)
+        except BaseException:
+            cleanup_ok = False
         if qualification_result is None:
             qualification_result = {"format": "issue61-native-role-qualification-v1", "result": "failed",
                                     "cases": cases, "failure_category": "unknown",
