@@ -32,6 +32,9 @@ class LifecycleCliTest(unittest.TestCase):
         check=False,
     )
 
+  def test_issue61_native_role_contract_is_in_canonical_python_suite(self):
+    self.assertIn("scripts.test_issue61_native_roles", lifecycle.PYTHON_TESTS)
+
   def test_podman_and_docker_image_ids_are_normalized(self):
     raw_id = "a" * 64
     self.assertEqual(f"sha256:{raw_id}", normalize_image_id(raw_id))
