@@ -9,7 +9,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858276,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -28,7 +28,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858276,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -47,7 +47,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858276,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -66,7 +66,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858276,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -85,7 +85,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858276,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -104,7 +104,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -123,7 +123,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857701,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -147,7 +147,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -164,7 +164,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -181,7 +181,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -200,7 +200,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -217,7 +217,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -238,7 +238,7 @@
       },
       "claims": {
         "aud": "other-resource",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -259,10 +259,10 @@
       },
       "claims": {
         "aud": [
-          "decent-storage",
-          "other-resource"
+          "other-resource",
+          "decent-storage"
         ],
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -281,7 +281,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -299,7 +299,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858277,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": [
@@ -318,7 +318,7 @@
       },
       "claims": {
         "aud": "decent-storage",
-        "exp": 1793857702,
+        "exp": 1793858278,
         "other_resource_clients": [],
         "realm_role_names": [],
         "storage_roles": []
@@ -354,6 +354,19 @@
       {
         "config": {
           "access.token.claim": "true",
+          "id.token.claim": "false",
+          "included.custom.audience": "other-resource",
+          "userinfo.token.claim": "false"
+        },
+        "consentRequired": false,
+        "name": "other-resource-audience",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-audience-mapper",
+        "scope_name": "other-resource-audience"
+      },
+      {
+        "config": {
+          "access.token.claim": "true",
           "claim.name": "resource_access.decent-storage.roles",
           "id.token.claim": "false",
           "jsonType.label": "String",
@@ -364,7 +377,8 @@
         "consentRequired": false,
         "name": "storage-native-client-roles",
         "protocol": "openid-connect",
-        "protocolMapper": "oidc-usermodel-client-role-mapper"
+        "protocolMapper": "oidc-usermodel-client-role-mapper",
+        "scope_name": "storage-role-scope"
       },
       {
         "config": {
@@ -376,9 +390,15 @@
         "consentRequired": false,
         "name": "storage-resource-audience",
         "protocol": "openid-connect",
-        "protocolMapper": "oidc-audience-mapper"
+        "protocolMapper": "oidc-audience-mapper",
+        "scope_name": "storage-role-scope"
       }
     ],
+    "other_audience_scope": {
+      "attributes": {},
+      "name": "other-resource-audience",
+      "protocol": "openid-connect"
+    },
     "realm": {
       "accessTokenLifespan": 300,
       "enabled": true,
@@ -386,6 +406,7 @@
       "refreshTokenMaxReuse": 0
     },
     "role_scope": {
+      "attributes": {},
       "name": "storage-role-scope",
       "protocol": "openid-connect"
     },
@@ -445,9 +466,9 @@
       }
     ]
   },
-  "configuration_sha256": "1e58b933ed8d27d4ed687bcca343501393cf7a5d2a3f89a39fb927462eefa33d",
+  "configuration_sha256": "579202e241cc70438751059631e2d3a071ba2e3017e466dfda0179e8fe7b7524",
   "format": "issue61-native-role-qualification-v1",
-  "harness_sha256": "59987894abcefc370be3a205a3321d482678e980ff6afd0cf4851a293317f99e",
+  "harness_sha256": "afb674e03eb44cd0f7c4a2653e61fd24b4f524fa7841aabf37912960ce38995a",
   "refresh_semantics": {
     "prior_access_token": "claims remain signed as issued until exp; no prompt revocation claim",
     "role_change": "new refresh-issued access token reflects changed assignment",

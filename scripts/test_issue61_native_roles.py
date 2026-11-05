@@ -38,7 +38,14 @@ class NativeRoleTokenContractTest(unittest.TestCase):
                             "publicClient": True, "fullScopeAllowed": False},
             "role_scope": {"name": "storage-role-scope", "protocol": "openid-connect",
                            "attributes": {"sensitive.custom.attribute": "attribute-secret"}},
+            "other_audience_scope": {"name": "other-resource-audience", "protocol": "openid-connect",
+                                     "attributes": {"sensitive.custom.attribute": "scope-secret"}},
             "mappers": [
+                {"name": "other-resource-audience", "protocol": "openid-connect",
+                 "protocolMapper": "oidc-audience-mapper",
+                 "config": {"included.custom.audience": "other-resource",
+                            "access.token.claim": "true", "id.token.claim": "false",
+                            "password": "negative-mapper-secret"}},
                 {"name": "storage-native-client-roles", "protocolMapper": "oidc-usermodel-client-role-mapper",
                  "config": {"claim.name": "resource_access.decent-storage.roles",
                             "access.token.claim": "true", "id.token.claim": "false",
@@ -52,16 +59,25 @@ class NativeRoleTokenContractTest(unittest.TestCase):
                                "clientRole": True, "id": "ephemeral", "secret": "never-retain"}],
         }
         projected, digest = readback_configuration_fingerprint(readback)
-        self.assertEqual("resource_access.decent-storage.roles",
-                         projected["mappers"][0]["config"]["claim.name"])
+        role_mapper = next(mapper for mapper in projected["mappers"]
+                           if mapper["name"] == "storage-native-client-roles")
+        self.assertEqual("resource_access.decent-storage.roles", role_mapper["config"]["claim.name"])
         self.assertEqual(["storage:create", "storage:read"], projected["role_scope_mappings"])
+        self.assertEqual("other-resource-audience", projected["other_audience_scope"]["name"])
+        negative_mapper = next(mapper for mapper in projected["mappers"]
+                               if mapper["name"] == "other-resource-audience")
+        self.assertEqual("other-resource", negative_mapper["config"]["included.custom.audience"])
         self.assertEqual(64, len(digest))
         encoded = json.dumps(projected)
-        for secret in ("realm-secret", "client-secret", "mapper-secret", "never-retain", "ephemeral", "attribute-secret"):
+        for secret in ("realm-secret", "client-secret", "mapper-secret", "negative-mapper-secret",
+                       "never-retain", "ephemeral", "attribute-secret", "scope-secret"):
             self.assertNotIn(secret, encoded)
         changed = json.loads(json.dumps(readback))
         changed["role_scope_mappings"].remove("storage:create")
         self.assertNotEqual(digest, readback_configuration_fingerprint(changed)[1])
+        changed_negative_audience = json.loads(json.dumps(readback))
+        changed_negative_audience["mappers"][0]["config"]["included.custom.audience"] = "widened-resource"
+        self.assertNotEqual(digest, readback_configuration_fingerprint(changed_negative_audience)[1])
 
     def test_partial_startup_container_requires_exact_readback_ownership(self):
         inspected = [{

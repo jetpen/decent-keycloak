@@ -105,7 +105,11 @@ def _allowlisted_fields(value: dict[str, Any], names: tuple[str, ...]) -> dict[s
 
 def readback_configuration_fingerprint(readback: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Fingerprint only allowlisted non-secret fields from Keycloak Admin API readbacks."""
-    mapper_fields = ("name", "protocol", "protocolMapper", "consentRequired")
+    scope_fields = ("name", "protocol")
+    scope_attribute_fields = (
+        "include.in.token.scope", "display.on.consent.screen", "consent.screen.text", "gui.order",
+    )
+    mapper_fields = ("scope_name", "name", "protocol", "protocolMapper", "consentRequired")
     mapper_config_fields = (
         "usermodel.clientRoleMapping.clientId", "usermodel.clientRoleMapping.rolePrefix",
         "multivalued", "claim.name", "jsonType.label", "access.token.claim",
@@ -123,7 +127,16 @@ def readback_configuration_fingerprint(readback: dict[str, Any]) -> tuple[dict[s
                                            ("clientId", "enabled", "protocol", "publicClient",
                                             "standardFlowEnabled", "directAccessGrantsEnabled",
                                             "fullScopeAllowed", "optionalClientScopes")),
-        "role_scope": _allowlisted_fields(readback["role_scope"], ("name", "protocol")),
+        "role_scope": {
+            **_allowlisted_fields(readback["role_scope"], scope_fields),
+            "attributes": _allowlisted_fields(readback["role_scope"].get("attributes", {}),
+                                              scope_attribute_fields),
+        },
+        "other_audience_scope": {
+            **_allowlisted_fields(readback["other_audience_scope"], scope_fields),
+            "attributes": _allowlisted_fields(readback["other_audience_scope"].get("attributes", {}),
+                                              scope_attribute_fields),
+        },
         "mappers": sorted(({
             **_allowlisted_fields(mapper, mapper_fields),
             "config": _allowlisted_fields(mapper.get("config", {}), mapper_config_fields),
@@ -311,13 +324,21 @@ def _create_realm(http: Http, admin: str, password: str) -> dict[str, str]:
 
 def _readback_configuration(http: Http, admin: str, ids: dict[str, str]) -> dict[str, Any]:
     base = f"/admin/realms/{REALM}"
+    role_scope = http.require("GET", f"{base}/client-scopes/{ids['scope_id']}", token=admin)
+    other_scope = http.require("GET", f"{base}/client-scopes/{ids['other_scope_id']}", token=admin)
+    mappers = []
+    for scope_id, scope_name in ((ids["scope_id"], ROLE_SCOPE),
+                                 (ids["other_scope_id"], "other-resource-audience")):
+        scope_mappers = http.require("GET", f"{base}/client-scopes/{scope_id}/protocol-mappers/models",
+                                     token=admin)
+        mappers.extend({**mapper, "scope_name": scope_name} for mapper in scope_mappers)
     return {
         "realm": http.require("GET", base, token=admin),
         "storage_client": http.require("GET", f"{base}/clients/{ids['storage_id']}", token=admin),
         "app_client": http.require("GET", f"{base}/clients/{ids['app_id']}", token=admin),
-        "role_scope": http.require("GET", f"{base}/client-scopes/{ids['scope_id']}", token=admin),
-        "mappers": http.require("GET", f"{base}/client-scopes/{ids['scope_id']}/protocol-mappers/models",
-                                 token=admin),
+        "role_scope": role_scope,
+        "other_audience_scope": other_scope,
+        "mappers": mappers,
         "role_scope_mappings": [role["name"] for role in http.require(
             "GET", f"{base}/clients/{ids['app_id']}/scope-mappings/clients/{ids['storage_id']}",
             token=admin)],
