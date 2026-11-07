@@ -11,7 +11,7 @@ class AcceptanceWorkflowTest(unittest.TestCase):
   def test_checkout_does_not_persist_github_token_into_build_steps(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     checkout = workflow.split("      - name: Check out source\n", 1)[1].split(
-        "      - name: Set up the supported JDK\n", 1)[0]
+        "      - name: Set up Java 21\n", 1)[0]
 
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
@@ -63,6 +63,12 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn('"scripts.test_lifecycle"', lifecycle)
     self.assertIn("python-tests", lifecycle)
     self.assertIn("python-compile", lifecycle)
+
+  def test_acceptance_workflow_requests_java_21_without_a_patch_pin(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+
+    self.assertIn("java-version: '21'", workflow)
+    self.assertNotIn("21.0.12.1+1", workflow)
 
 
 if __name__ == "__main__":

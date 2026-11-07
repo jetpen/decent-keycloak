@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -18,7 +19,15 @@ import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 
+try:
+  from scripts import remote_test_host
+except ModuleNotFoundError:
+  import remote_test_host
+
 ROOT = Path(__file__).resolve().parents[1]
+REMOTE_TEST_HOST = os.environ.get("REMOTE_TEST_HOST", "ben-x260.tailca8b51.ts.net").strip()
+REMOTE_TEST_USER = os.environ.get("REMOTE_TEST_USER", "ben").strip()
+REMOTE_TEST_TARGET = f"{REMOTE_TEST_USER}@{REMOTE_TEST_HOST}"
 PYTHON_TESTS = (
   "scripts.test_wallet_login_result",
   "scripts.test_issue8_oidc",
@@ -37,6 +46,7 @@ PYTHON_TESTS = (
   "scripts.test_lifecycle",
   "scripts.test_image_lifecycle",
   "scripts.test_issue61_native_roles",
+  "scripts.test_remote_test_host",
 )
 PROFILES = {
   "offline": {
@@ -47,12 +57,16 @@ PROFILES = {
     "description": "The same deterministic offline lifecycle used locally, run by CI.",
     "live": False,
   },
-  "issue5-live": {
-    "description": "Offline lifecycle followed by explicitly authorized Issue #5 loopback qualification.",
+  "wallet-login-qualification": {
+    "description": "Offline lifecycle followed by explicitly authorized wallet-login qualification.",
+    "live": True,
+  },
+  "remote-test-host": {
+    "description": "Offline build/test lifecycle followed by an explicitly authorized tailnet-only remote Keycloak OIDC discovery smoke.",
     "live": True,
   },
 }
-ISSUE5_GATES = {
+WALLET_LOGIN_GATES = {
   "current_identity": "not_run",
   "exact_missing_identity": "not_run",
   "registry_unavailable": "not_run",
@@ -67,30 +81,30 @@ ISSUE5_GATES = {
   "account_denial_concurrency": "not_run",
   "runtime_provider": "not_run",
 }
-ISSUE5_ADVERSARIAL_CASES = {
+WALLET_LOGIN_ADVERSARIAL_CASES = {
   "malformed_result": "hostile-peer-malformed",
   "history_incomplete": "hostile-peer-history-incomplete",
   "ambiguous_registry_result": "hostile-peer-ambiguous",
   "mixed_legacy_rotated_head": "hostile-peer-mixed-head",
 }
-ISSUE5_LIVE_MATRIX_PROFILE = "default"
+WALLET_LOGIN_MATRIX_PROFILE = "default"
 
 
-def issue5_acceptance_gate_set_complete(gates: object) -> bool:
+def wallet_login_acceptance_gate_set_complete(gates: object) -> bool:
   if not isinstance(gates, dict):
     return False
   expected = {
-      name: ("unavailable" if name in ISSUE5_ADVERSARIAL_CASES else "pass")
-      for name in ISSUE5_GATES
+      name: ("unavailable" if name in WALLET_LOGIN_ADVERSARIAL_CASES else "pass")
+      for name in WALLET_LOGIN_GATES
   }
   return gates == expected
 
 
-def issue5_adversarial_gate_statuses(evidence: object) -> dict[str, str]:
+def wallet_login_adversarial_gate_statuses(evidence: object) -> dict[str, str]:
   """Map only two complete fail-closed attempts per hostile fixture to unavailable."""
   matrix = evidence.get("registry_matrix") if isinstance(evidence, dict) else None
   statuses: dict[str, str] = {}
-  for case_name, fixture_label in ISSUE5_ADVERSARIAL_CASES.items():
+  for case_name, fixture_label in WALLET_LOGIN_ADVERSARIAL_CASES.items():
     case = matrix.get(case_name) if isinstance(matrix, dict) else None
     attempts = case.get("attempts") if isinstance(case, dict) else None
     attempt_items = attempts if isinstance(attempts, list) and len(attempts) == 2 else []
@@ -123,7 +137,7 @@ def issue5_adversarial_gate_statuses(evidence: object) -> dict[str, str]:
   return statuses
 
 
-def _issue5_two_attempt_status(evidence: object, case_name: str,
+def _wallet_login_two_attempt_status(evidence: object, case_name: str,
     required_fields: set[str], predicate) -> str:
   matrix = evidence.get("registry_matrix") if isinstance(evidence, dict) else None
   case = matrix.get(case_name) if isinstance(matrix, dict) else None
@@ -135,7 +149,7 @@ def _issue5_two_attempt_status(evidence: object, case_name: str,
   return "pass" if all(predicate(attempt) for attempt in attempts) else "fail"
 
 
-def issue5_account_denial_gate_status(evidence: object) -> str:
+def wallet_login_account_denial_gate_status(evidence: object) -> str:
   concurrency = evidence.get('account_denial_concurrency') if isinstance(evidence, dict) else None
   if not isinstance(concurrency, dict):
     return 'inconclusive'
@@ -175,7 +189,7 @@ def issue5_account_denial_gate_status(evidence: object) -> str:
   return 'pass'
 
 
-def issue5_runtime_provider_gate_status(evidence: object) -> str:
+def wallet_login_runtime_provider_gate_status(evidence: object) -> str:
   runtime = evidence.get('resolver_runtime') if isinstance(evidence, dict) else None
   if not isinstance(runtime, dict):
     return 'inconclusive'
@@ -193,7 +207,7 @@ def issue5_runtime_provider_gate_status(evidence: object) -> str:
   return 'pass'
 
 
-def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
+def wallet_login_matrix_gate_statuses(evidence: object) -> dict[str, str]:
   """Map the ordinary two-attempt Registry matrix to explicit receipt gates."""
   matrix = evidence.get("registry_matrix") if isinstance(evidence, dict) else None
   current_fields = {"direct_resolution", "exact_readback", "provider_http",
@@ -206,12 +220,12 @@ def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
   rotation_fields = {"direct_resolution", "exact_readback", "provider_http", "rotation_publish",
       "current_sequence", "stale_key_proof_http", "current_key_proof_http",
       "stale_transaction_remains_pending", "current_transaction_accepted", "outcome"}
-  current = _issue5_two_attempt_status(evidence, "current_identity", current_fields,
+  current = _wallet_login_two_attempt_status(evidence, "current_identity", current_fields,
       lambda attempt: attempt["direct_resolution"] == "resolved"
           and attempt["exact_readback"] is True and attempt["provider_http"] == 202
           and attempt["status_http"] == 200 and attempt["status_pending"] is False
           and attempt["outcome"] == "current_accepted")
-  missing = _issue5_two_attempt_status(evidence, "missing_identity", missing_fields,
+  missing = _wallet_login_two_attempt_status(evidence, "missing_identity", missing_fields,
       lambda attempt: attempt["direct_resolution"] == "not_found"
           and attempt["provider_http"] == 401 and attempt["status_http"] == 200
           and attempt["status_pending"] is True
@@ -221,7 +235,7 @@ def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
           and attempt["provider_identity_not_found_observed"] is True
           and attempt["provider_identity_not_found_marker_count"] == 1
           and attempt["outcome"] == "provider_not_found")
-  unavailable = _issue5_two_attempt_status(evidence, "unavailable_registry", unavailable_fields,
+  unavailable = _wallet_login_two_attempt_status(evidence, "unavailable_registry", unavailable_fields,
       lambda attempt: attempt["direct_resolution"] == "unavailable"
           and attempt["provider_http"] == 503 and attempt["status_http"] == 200
           and attempt["status_pending"] is True
@@ -237,7 +251,7 @@ def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
     elif any(unavailable_case[field] is not True for field in
         ("bootstrap_override_readback", "bootstrap_restore_readback")):
       unavailable = "fail"
-  rotation = _issue5_two_attempt_status(evidence, "rotation", rotation_fields,
+  rotation = _wallet_login_two_attempt_status(evidence, "rotation", rotation_fields,
       lambda attempt: attempt["direct_resolution"] == "resolved"
           and attempt["exact_readback"] is True and attempt["provider_http"] == 202
           and attempt["rotation_publish"] == "passed"
@@ -251,7 +265,7 @@ def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
   rotation_attempts = rotation_attempts if isinstance(rotation_attempts, list) else []
   sequences = [attempt.get("current_sequence") if isinstance(attempt, dict) else None
       for attempt in rotation_attempts]
-  independent_readback = _issue5_two_attempt_status(evidence, "rotation",
+  independent_readback = _wallet_login_two_attempt_status(evidence, "rotation",
       {"rotation_publish", "current_sequence", "independent_rotation_readback"},
       lambda attempt: attempt["rotation_publish"] == "passed"
           and type(attempt["current_sequence"]) is int
@@ -267,8 +281,8 @@ def issue5_live_matrix_gate_statuses(evidence: object) -> dict[str, str]:
       owner_rotation = "inconclusive"
     elif rotated_identity["local_mapping_persisted"] is not True:
       owner_rotation = "fail"
-  runtime_provider = issue5_runtime_provider_gate_status(evidence)
-  account_denial = issue5_account_denial_gate_status(evidence)
+  runtime_provider = wallet_login_runtime_provider_gate_status(evidence)
+  account_denial = wallet_login_account_denial_gate_status(evidence)
   return {
       "current_identity": current,
       "exact_missing_identity": missing,
@@ -312,6 +326,11 @@ def plan(profile: str, *, retain_image: bool = False) -> dict:
   steps: list[dict] = [
     {"name": "preflight", "command": [sys.executable, "scripts/lifecycle.py", "preflight"]},
   ]
+  if profile == "remote-test-host":
+    steps.extend([
+      {"name": "remote-setup", "action": "follow docs/acceptance/remote-test-host.md for one-time target Tailscale SSH/operator setup and HTTPS-certificate consent; Serve stays tailnet-only, Funnel stays disabled, and Serve config stays unused"},
+      {"name": "remote-preflight", "action": "verify configured remote test-host identity, Tailscale SSH, rootless Podman, free port 8080, and no existing Serve configuration before local build/tests"},
+    ])
   steps.extend({"name": name, "command": command} for name, command in core_test_stages())
   steps.extend([
     {"name": "resolver-sources", "action": "materialize and verify pinned Identity/Registry commits in a run-owned temporary directory"},
@@ -321,13 +340,20 @@ def plan(profile: str, *, retain_image: bool = False) -> dict:
     {"name": "image-smoke", "action": "run pinned Keycloak/JVM version smoke against the immutable built image"},
     {"name": "diff-check", "command": [sys.executable, "scripts/lifecycle.py", "diff-check"]},
   ])
-  if profile == "issue5-live":
-    steps.append({"name": "issue5-live-matrix", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
-                  "env": {"WALLET_IT_PROFILE": ISSUE5_LIVE_MATRIX_PROFILE, "WALLET_IT_IMAGE": "<run-built immutable ID>"},
+  if profile == "wallet-login-qualification":
+    steps.append({"name": "wallet-login-qualification-matrix", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
+                  "env": {"WALLET_IT_PROFILE": WALLET_LOGIN_MATRIX_PROFILE, "WALLET_IT_IMAGE": "<run-built immutable ID>"},
                   "requires": ["--allow-live"]})
-    steps.append({"name": "issue5-adversarial", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
-                  "env": {"WALLET_IT_PROFILE": "issue5-adversarial", "WALLET_IT_IMAGE": "<run-built immutable ID>"},
+    steps.append({"name": "wallet-login-adversarial", "command": [sys.executable, "scripts/wallet_login_live_e2e.py"],
+                  "env": {"WALLET_IT_PROFILE": "wallet-login-adversarial", "WALLET_IT_IMAGE": "<run-built immutable ID>"},
                   "requires": ["--allow-live"]})
+  if profile == "remote-test-host":
+    steps.extend([
+      {"name": "remote-image-transfer", "action": "stream the exact immutable lifecycle image over Tailscale SSH and store it under run-scoped aliases without changing decent-keycloak:latest"},
+      {"name": "remote-deploy", "action": "start the run-owned Keycloak instance on loopback port 8080 and attach tailnet-only Tailscale Serve", "requires": ["--allow-live"]},
+      {"name": "remote-oidc-discovery", "action": "verify HTTPS OIDC discovery and exact issuer through the tailnet Serve hostname"},
+      {"name": "remote-teardown", "action": "remove the owned container, single tailnet-only Serve route, and run-scoped image aliases; verify absence"},
+    ])
   teardown_action = (
       "remove run-owned immutable image and temporary source/dependency inputs unless explicitly retained"
       if not retain_image else
@@ -392,6 +418,33 @@ def check_tool(name: str, command: list[str], expected: str) -> bool:
   return True
 
 
+def java_21_runtime(output: str) -> bool:
+  """Accept any Java 21 patch/build from either the JDK or Keycloak smoke output."""
+  for line in output.splitlines():
+    candidate = line.split(":", 1)[1].strip() if line.startswith("JVM:") else line
+    match = re.search(r'(?:version\s+)?"?(\d+)(?:[.+_-]|\s|"|$)', candidate)
+    if match and int(match.group(1)) == 21:
+      return True
+  return False
+
+
+def check_java_21() -> bool:
+  try:
+    result = capture_command(["java", "-version"])
+  except FileNotFoundError:
+    print("preflight: missing required tool: Java", file=sys.stderr)
+    return False
+  if result.returncode:
+    print("preflight: missing or failed required tool: Java", file=sys.stderr)
+    return False
+  output = result.stdout + result.stderr
+  print(f"preflight: Java: {output.splitlines()[0] if output.splitlines() else 'no version output'}")
+  if not java_21_runtime(output):
+    print("preflight: expected Java major version 21", file=sys.stderr)
+    return False
+  return True
+
+
 def container_engine() -> str:
   selected = os.environ.get("CONTAINER_ENGINE")
   if selected:
@@ -403,14 +456,17 @@ def container_engine() -> str:
   return ""
 
 
-def preflight(*, live: bool = False) -> int:
+def preflight(*, live: bool = False, remote_test_host: bool = False) -> int:
   checks = [
     check_tool("Python", [sys.executable, "--version"], "3.11.13"),
-    check_tool("Java", ["java", "-version"], "21."),
+    check_java_21(),
     check_tool("Maven", ["mvn", "--version"], "Apache Maven"),
     check_tool("Git", ["git", "--version"], "git version"),
   ]
   engine = container_engine()
+  if remote_test_host and engine != "podman":
+    print("preflight: remote-test-host requires local Podman", file=sys.stderr)
+    checks.append(False)
   if engine not in {"podman", "docker"}:
     print("preflight: missing supported container engine (Podman or Docker Buildx)", file=sys.stderr)
     checks.append(False)
@@ -437,11 +493,44 @@ def preflight(*, live: bool = False) -> int:
     else:
       print("preflight: container engine daemon is ready")
       checks.append(True)
+      if remote_test_host:
+        try:
+          engine_info = json.loads(info.stdout)
+          host_info = engine_info.get("host", engine_info.get("Host", {}))
+          security = host_info.get("security", host_info.get("Security", {}))
+          rootless = security.get("rootless", security.get("Rootless")) is True
+        except (json.JSONDecodeError, AttributeError):
+          rootless = False
+        print(f"preflight: local Podman rootless={str(rootless).lower()}")
+        checks.append(rootless)
     if engine == "docker":
       checks.append(check_tool("Docker Buildx", ["docker", "buildx", "version"], "github.com/docker/buildx"))
   if live:
     checks.append(check_tool("OpenSSL", ["openssl", "version"], "OpenSSL"))
   return 0 if all(checks) else 2
+
+
+def remote_test_host_preflight(run_id: str | None = None) -> tuple[int, Mapping[str, bool | str]]:
+  """Run the reusable target-side read-only readiness checks over Tailscale SSH."""
+  safe_run_id = run_id if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) else "0" * 32
+  image_id = "sha256:" + "0" * 64
+  try:
+    checks = remote_test_host.run_target(REMOTE_TEST_TARGET, "preflight", safe_run_id,
+        image_id, host=REMOTE_TEST_HOST)
+  except remote_test_host.TargetOperationRejected as error:
+    return 2, {"ssh_available": True, "target_ready": False,
+        "failure_category": error.category}
+  except ValueError:
+    return 2, {"ssh_available": False, "target_configured": False}
+  except (OSError, RuntimeError, subprocess.SubprocessError):
+    return 2, {"ssh_available": False}
+  required = {"host_matches", "rootless_podman", "port_free", "serve_unused",
+      "run_image_tags_available"}
+  facts = {key: checks.get(key) is True for key in required}
+  facts["ssh_available"] = True
+  if checks.get("ok") is not True or not all(facts[key] for key in required):
+    return 2, facts
+  return 0, facts
 
 
 def verify_surefire() -> int:
@@ -955,7 +1044,8 @@ def _run_capture(command: list[str], *, env: dict[str, str] | None = None) -> tu
 
 def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = False) -> int:
   run_id = uuid.uuid4().hex
-  preflight_status = preflight(live=profile == "issue5-live")
+  preflight_status = (preflight(live=True, remote_test_host=True)
+      if profile == "remote-test-host" else preflight(live=profile == "wallet-login-qualification"))
   receipt_path = ROOT / "target/lifecycle/evidence" / f"{run_id}.json"
   profile_steps = [step["name"] for step in plan(profile, retain_image=retain_image)["steps"]]
   receipt = {
@@ -965,7 +1055,7 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
     "started_at": datetime.now(timezone.utc).isoformat(),
     "source": fingerprint_source(),
     "steps": {name: {"status": "not_run"} for name in profile_steps},
-    "issue5_acceptance_gates": dict(ISSUE5_GATES),
+    "wallet_login_acceptance_gates": dict(WALLET_LOGIN_GATES),
     "image": {"status": "not_built", "retention_requested": retain_image, "retained": False},
     "cleanup": {"status": "not_run", "image_retained": False,
         "baseline_image_count": 0, "baseline_image_ids": [],
@@ -990,6 +1080,19 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       _record_step(receipt, receipt_path, "preflight", "fail", detail="tool_or_version_mismatch")
       return failure_code
     _record_step(receipt, receipt_path, "preflight", "pass")
+
+    if profile == "remote-test-host":
+      current_step = "remote-preflight"
+      remote_status, remote_facts = remote_test_host_preflight(run_id)
+      receipt["remote_test_host"] = {"host": REMOTE_TEST_HOST, "preflight": remote_facts}
+      if remote_status:
+        _record_step(receipt, receipt_path, "remote-setup", "fail", detail="one_time_setup_or_readiness_missing")
+        _record_step(receipt, receipt_path, "remote-preflight", "fail", detail="remote_host_not_ready")
+        failure_code = remote_status
+        return failure_code
+      _record_step(receipt, receipt_path, "remote-setup", "pass")
+      _record_step(receipt, receipt_path, "remote-preflight", "pass")
+      current_step = None
 
     for name, command in core_test_stages():
       current_step = name
@@ -1114,7 +1217,7 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
     current_step = "image-smoke"
     smoke_command = image_smoke_command(engine, built_image_id)
     smoke_status, smoke_output = _run_capture(smoke_command)
-    if smoke_status or "Keycloak 26.8.0" not in smoke_output or "JVM: 21.0.12.1" not in smoke_output:
+    if smoke_status or "Keycloak 26.8.0" not in smoke_output or not java_21_runtime(smoke_output):
       _record_step(receipt, receipt_path, "image-smoke", "fail", detail="runtime_version_mismatch")
       return smoke_status or 1
     _record_step(receipt, receipt_path, "image-smoke", "pass")
@@ -1126,36 +1229,56 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
     _record_step(receipt, receipt_path, "diff-check", "pass")
     current_step = None
 
-    if profile == "issue5-live":
-      current_step = "issue5-live-matrix"
+    if profile == "remote-test-host":
+      def record_remote_step(name: str, status: str, detail: str | None) -> None:
+        receipt["remote_test_host"]["steps"][name] = status
+        _record_step(receipt, receipt_path, name, status, detail=detail)
+
+      current_step = "remote-image-transfer"
+      receipt["remote_test_host"]["steps"] = {}
+      try:
+        remote_facts = remote_test_host.remote_lifecycle(
+            REMOTE_TEST_TARGET, REMOTE_TEST_HOST, run_id, built_image_id,
+            on_step=record_remote_step)
+        receipt["remote_test_host"]["evidence"] = remote_facts
+      except Exception as error:
+        failure_code = 2
+        if current_step and receipt["steps"][current_step]["status"] == "not_run":
+          _record_step(receipt, receipt_path, current_step, "fail",
+              detail=f"remote_operation_{type(error).__name__}")
+        raise
+      current_step = None
+
+    if profile == "wallet-login-qualification":
+      current_step = "wallet-login-qualification-matrix"
       assert built_image_id is not None
       live_env = dict(os.environ)
       live_env["WALLET_IT_IMAGE"] = built_image_id
-      live_env["WALLET_IT_PROFILE"] = ISSUE5_LIVE_MATRIX_PROFILE
+      live_env["WALLET_IT_PROFILE"] = WALLET_LOGIN_MATRIX_PROFILE
       live_status, live_output = _run_capture(
           [sys.executable, "scripts/wallet_login_live_e2e.py"], env=live_env)
       evidence_prefix = "evidence="
       evidence_lines = [line[len(evidence_prefix):]
                         for line in live_output.splitlines() if line.startswith(evidence_prefix)]
       if live_status:
-        receipt["issue5_acceptance_gates"].update(
-            {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
+        receipt["wallet_login_acceptance_gates"].update(
+            {name: "inconclusive" for name in wallet_login_matrix_gate_statuses({})})
         if len(evidence_lines) == 1:
           try:
             partial_evidence = json.loads(evidence_lines[0])
           except json.JSONDecodeError:
             partial_evidence = None
           if isinstance(partial_evidence, dict):
-            receipt["issue5_live_evidence"] = partial_evidence
-            receipt["issue5_acceptance_gates"].update(
-                issue5_live_matrix_gate_statuses(partial_evidence))
-        _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
+            receipt["wallet_login_live_evidence"] = partial_evidence
+            receipt["wallet_login_acceptance_gates"].update(
+                wallet_login_matrix_gate_statuses(partial_evidence))
+        _record_step(receipt, receipt_path, "wallet-login-qualification-matrix", "fail",
                      detail=f"exit_{live_status}")
         return live_status
       if len(evidence_lines) != 1:
-        receipt["issue5_acceptance_gates"].update(
-            {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
-        _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
+        receipt["wallet_login_acceptance_gates"].update(
+            {name: "inconclusive" for name in wallet_login_matrix_gate_statuses({})})
+        _record_step(receipt, receipt_path, "wallet-login-qualification-matrix", "fail",
                      detail="sanitized_evidence_missing_or_ambiguous")
         return 2
       try:
@@ -1163,46 +1286,46 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       except json.JSONDecodeError:
         live_evidence = None
       if not isinstance(live_evidence, dict):
-        receipt["issue5_acceptance_gates"].update(
-            {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
-        _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
+        receipt["wallet_login_acceptance_gates"].update(
+            {name: "inconclusive" for name in wallet_login_matrix_gate_statuses({})})
+        _record_step(receipt, receipt_path, "wallet-login-qualification-matrix", "fail",
                      detail="sanitized_evidence_invalid")
         return 2
-      receipt["issue5_live_evidence"] = live_evidence
-      matrix_gate_statuses = issue5_live_matrix_gate_statuses(live_evidence)
-      receipt["issue5_acceptance_gates"].update(matrix_gate_statuses)
+      receipt["wallet_login_live_evidence"] = live_evidence
+      matrix_gate_statuses = wallet_login_matrix_gate_statuses(live_evidence)
+      receipt["wallet_login_acceptance_gates"].update(matrix_gate_statuses)
       if any(status != "pass" for status in matrix_gate_statuses.values()):
-        _record_step(receipt, receipt_path, "issue5-live-matrix", "fail",
+        _record_step(receipt, receipt_path, "wallet-login-qualification-matrix", "fail",
                      detail="acceptance_gate_evidence_inconclusive_or_failed")
         return 2
-      _record_step(receipt, receipt_path, "issue5-live-matrix", "pass",
+      _record_step(receipt, receipt_path, "wallet-login-qualification-matrix", "pass",
                    detail="all_mapped_live_matrix_gates_passed")
       current_step = None
 
-      current_step = "issue5-adversarial"
+      current_step = "wallet-login-adversarial"
       adversarial_env = dict(os.environ)
       adversarial_env["WALLET_IT_IMAGE"] = built_image_id
-      adversarial_env["WALLET_IT_PROFILE"] = "issue5-adversarial"
+      adversarial_env["WALLET_IT_PROFILE"] = "wallet-login-adversarial"
       adversarial_status, adversarial_output = _run_capture(
           [sys.executable, "scripts/wallet_login_live_e2e.py"], env=adversarial_env)
-      evidence_prefix = "issue5-adversarial-evidence="
+      evidence_prefix = "wallet-login-adversarial-evidence="
       evidence_lines = [line.split("=", 1)[1].strip()
                         for line in adversarial_output.splitlines()
                         if line.startswith(evidence_prefix)]
       if adversarial_status:
-        receipt["issue5_acceptance_gates"].update(
-            {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+        receipt["wallet_login_acceptance_gates"].update(
+            {name: "inconclusive" for name in WALLET_LOGIN_ADVERSARIAL_CASES})
         if len(evidence_lines) == 1:
           try:
-            receipt["issue5_adversarial_evidence"] = json.loads(evidence_lines[0])
+            receipt["wallet_login_adversarial_evidence"] = json.loads(evidence_lines[0])
           except json.JSONDecodeError:
             pass
         _record_step(receipt, receipt_path, current_step, "fail",
                      detail=f"exit_{adversarial_status}")
         return adversarial_status
       if len(evidence_lines) != 1:
-        receipt["issue5_acceptance_gates"].update(
-            {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+        receipt["wallet_login_acceptance_gates"].update(
+            {name: "inconclusive" for name in WALLET_LOGIN_ADVERSARIAL_CASES})
         _record_step(receipt, receipt_path, current_step, "fail",
                      detail="sanitized_evidence_missing_or_ambiguous")
         return 2
@@ -1211,23 +1334,23 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       except json.JSONDecodeError:
         adversarial_evidence = None
       if not isinstance(adversarial_evidence, dict):
-        receipt["issue5_acceptance_gates"].update(
-            {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+        receipt["wallet_login_acceptance_gates"].update(
+            {name: "inconclusive" for name in WALLET_LOGIN_ADVERSARIAL_CASES})
         _record_step(receipt, receipt_path, current_step, "fail",
                      detail="sanitized_evidence_invalid")
         return 2
-      receipt["issue5_adversarial_evidence"] = adversarial_evidence
-      adversarial_gate_statuses = issue5_adversarial_gate_statuses(adversarial_evidence)
-      receipt["issue5_acceptance_gates"].update(adversarial_gate_statuses)
-      receipt["issue5_acceptance_gates"]["account_denial_concurrency"] = (
-          issue5_account_denial_gate_status(live_evidence))
-      receipt["issue5_acceptance_gates"]["runtime_provider"] = (
-          issue5_runtime_provider_gate_status(live_evidence))
+      receipt["wallet_login_adversarial_evidence"] = adversarial_evidence
+      adversarial_gate_statuses = wallet_login_adversarial_gate_statuses(adversarial_evidence)
+      receipt["wallet_login_acceptance_gates"].update(adversarial_gate_statuses)
+      receipt["wallet_login_acceptance_gates"]["account_denial_concurrency"] = (
+          wallet_login_account_denial_gate_status(live_evidence))
+      receipt["wallet_login_acceptance_gates"]["runtime_provider"] = (
+          wallet_login_runtime_provider_gate_status(live_evidence))
       if any(status != "unavailable" for status in adversarial_gate_statuses.values()):
         _record_step(receipt, receipt_path, current_step, "fail",
                      detail="adversarial_gate_evidence_inconclusive")
         return 2
-      if not issue5_acceptance_gate_set_complete(receipt["issue5_acceptance_gates"]):
+      if not wallet_login_acceptance_gate_set_complete(receipt["wallet_login_acceptance_gates"]):
         _record_step(receipt, receipt_path, current_step, "fail",
                      detail="required_acceptance_gate_set_incomplete")
         return 2
@@ -1243,12 +1366,12 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
         known_owned_image_ids = _owned_image_snapshot(engine, baseline_image_ids, run_id)
       except Exception:
         known_owned_image_ids = set()
-    if current_step == "issue5-live-matrix":
-      receipt["issue5_acceptance_gates"].update(
-          {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
-    if current_step == "issue5-adversarial":
-      receipt["issue5_acceptance_gates"].update(
-          {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+    if current_step == "wallet-login-qualification-matrix":
+      receipt["wallet_login_acceptance_gates"].update(
+          {name: "inconclusive" for name in wallet_login_matrix_gate_statuses({})})
+    if current_step == "wallet-login-adversarial":
+      receipt["wallet_login_acceptance_gates"].update(
+          {name: "inconclusive" for name in WALLET_LOGIN_ADVERSARIAL_CASES})
     if current_step and receipt["steps"][current_step]["status"] == "not_run":
       _record_step(receipt, receipt_path, current_step, "interrupted", detail="keyboard_interrupt")
     return failure_code
@@ -1260,12 +1383,12 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
         known_owned_image_ids = _owned_image_snapshot(engine, baseline_image_ids, run_id)
       except Exception:
         known_owned_image_ids = set()
-    if current_step == "issue5-live-matrix":
-      receipt["issue5_acceptance_gates"].update(
-          {name: "inconclusive" for name in issue5_live_matrix_gate_statuses({})})
-    if current_step == "issue5-adversarial":
-      receipt["issue5_acceptance_gates"].update(
-          {name: "inconclusive" for name in ISSUE5_ADVERSARIAL_CASES})
+    if current_step == "wallet-login-qualification-matrix":
+      receipt["wallet_login_acceptance_gates"].update(
+          {name: "inconclusive" for name in wallet_login_matrix_gate_statuses({})})
+    if current_step == "wallet-login-adversarial":
+      receipt["wallet_login_acceptance_gates"].update(
+          {name: "inconclusive" for name in WALLET_LOGIN_ADVERSARIAL_CASES})
     if current_step and receipt["steps"][current_step]["status"] == "not_run":
       _record_step(receipt, receipt_path, current_step, "fail", detail=f"exception_{type(error).__name__}")
     print(f"lifecycle failed: {type(error).__name__}", file=sys.stderr)
@@ -1322,18 +1445,18 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
 
 
 def promotion_source_from_receipt(receipt: object) -> tuple[str, str, str, str]:
-  """Require a complete successful Issue #5 live receipt and its retained immutable image."""
-  if not isinstance(receipt, dict) or receipt.get("profile") != "issue5-live" or receipt.get("exit_code") != 0:
-    raise ValueError("promotion requires a successful issue5-live receipt")
-  gates = receipt.get("issue5_acceptance_gates")
-  if not isinstance(gates, dict) or set(gates) != set(ISSUE5_GATES):
+  """Require a complete successful wallet-login qualification receipt and its retained immutable image."""
+  if not isinstance(receipt, dict) or receipt.get("profile") != "wallet-login-qualification" or receipt.get("exit_code") != 0:
+    raise ValueError("promotion requires a successful wallet-login-qualification receipt")
+  gates = receipt.get("wallet_login_acceptance_gates")
+  if not isinstance(gates, dict) or set(gates) != set(WALLET_LOGIN_GATES):
     raise ValueError("promotion receipt has incomplete acceptance gates")
   expected_gates = {
-      name: ("unavailable" if name in ISSUE5_ADVERSARIAL_CASES else "pass")
-      for name in ISSUE5_GATES
+      name: ("unavailable" if name in WALLET_LOGIN_ADVERSARIAL_CASES else "pass")
+      for name in WALLET_LOGIN_GATES
   }
   if gates != expected_gates:
-    raise ValueError("promotion requires all Issue #5 acceptance gates to pass")
+    raise ValueError("promotion requires all wallet-login acceptance gates to pass")
   cleanup = receipt.get("cleanup")
   if not isinstance(cleanup, dict) or cleanup.get("status") != "pass":
     raise ValueError("promotion receipt cleanup is not verified")
@@ -1610,7 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
   run_parser.add_argument("--retain-image", action="store_true",
                           help="explicitly retain this run's immutable local image after receipt finalization")
   promote_parser = subparsers.add_parser("promote", help="promote an accepted image built from a commit merged into origin/main")
-  promote_parser.add_argument("--receipt", required=True, help="successful issue5-live lifecycle receipt")
+  promote_parser.add_argument("--receipt", required=True, help="successful wallet-login-qualification lifecycle receipt")
   promote_parser.add_argument("--destination", required=True, help="explicit docker:// registry/repository:rc-tag")
   promote_parser.add_argument("--allow-publish", action="store_true", required=True,
                               help="authorize publishing this exact accepted image digest")
@@ -1642,8 +1765,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
   if args.action == "promote":
     return run_promotion(args.receipt, args.destination, allow_publish=args.allow_publish)
-  if args.profile == "issue5-live" and not args.allow_live:
-    parser.error("issue5-live requires explicit --allow-live authorization")
+  if args.profile in {"wallet-login-qualification", "remote-test-host"} and not args.allow_live:
+    parser.error(f"{args.profile} requires explicit --allow-live authorization")
   execution_plan = plan(args.profile, retain_image=args.retain_image)
   if args.plan:
     print(json.dumps(execution_plan, sort_keys=True) if args.json else "\n".join(

@@ -1,20 +1,20 @@
 # Supported build boundary and upgrade policy
 
-**Status: experimental, build-time support boundary only. This is not a production support statement.** The provider is compiled against Keycloak internals and is qualified only for the exact tuple below after its required gates pass. A passing package or image build does not imply compatibility with other releases or a production deployment.
+**Status: experimental, build-time support boundary only. This is not a production support statement.** The provider is compiled against Keycloak internals and is qualified only for the Keycloak version and Java major version below after its required gates pass. A passing package or image build does not imply compatibility with other releases or a production deployment.
 
 ## Candidate supported tuple
 
-| Component | Exact target | Evidence source / limitation |
+| Component | Target | Evidence source / limitation |
 |---|---|---|
 | Keycloak API and runtime | **26.8.0** | `pom.xml` sets `keycloak.version` to `26.8.0`. `container/Dockerfile` uses `quay.io/keycloak/keycloak@sha256:d79bc4bf1c54e802735ef91926b5c003de1fbb50b1a93382611972277219c9ad`; CI builds the provider into that image and checks the runtime-reported version. No other Keycloak release is claimed. |
-| JDK used for build and tests | **Eclipse Temurin JDK 21.0.12.1+1** | CI pins this exact Temurin release and checks `java -version`. The project compiler release is 21. No other compiler JDK major, distribution or patch build is declared supported by this policy. |
-| JDK bundled in the Keycloak runtime | **Red Hat OpenJDK 21.0.12.1+1-LTS**, as reported by the pinned Keycloak image | CI checks the exact runtime JVM line from `kc.sh --version`; this is distinct from the Temurin build JDK. No externally supplied JVM or other runtime build is claimed. |
+| Java used for build and tests | **Java major version 21** | The Maven compiler release is 21. The lifecycle accepts any Java 21-compatible JDK/runtime; vendor, patch and build are not pinned. CI requests Java 21 from its setup action. |
+| Java bundled in the Keycloak runtime | **Java major version 21** | The Keycloak base image remains pinned by digest; lifecycle smoke verifies Keycloak 26.8.0 and Java major version 21, not a specific JRE vendor or patch build. |
 | Provider runtime container | **Linux/amd64**, based on the Keycloak digest above | The resulting provider image is built from the exact immutable Keycloak base in `container/Dockerfile`. This repository does not publish that image. No ARM or other platform claim is made. |
 | Resolver builder/runtime | **UBI 9**, `registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c`, Python **3.11.13**, UBI 9 / glibc 2.34 | Version and source/dependency identities are recorded in `container/resolver-runtime.lock.json` and `container/resolver-binary-dependencies.lock.json`; the lifecycle fetches the pinned artifacts into a run-scoped temporary build context and verifies each recorded hash before use. Dependency binaries are not tracked in the repository. This is a build/runtime component, not a supported host-Python matrix. |
 | CI host | **GitHub-hosted `ubuntu-24.04`** | This is the currently configured acceptance runner, not a claim that all Ubuntu 24.04 installations are equivalent. The runner image itself is maintained by GitHub and is not pinned by digest. |
 | Python acceptance interpreter | **CPython 3.11.13** | CI selects this interpreter for the repository's Python harness and compilation checks. Other Python versions are not acceptance-tested by this workflow. |
 
-The Keycloak digest is authoritative for the runtime base identity; its version label is checked in CI rather than inferred from a mutable tag. The workflow's Java/Python tool versions are explicit, and all `uses:` actions are pinned to immutable full commit SHAs. These controls improve repeatability but do not make the Maven build hermetic: Maven dependencies still resolve from repositories by coordinates, and the hosted runner/tool-download services remain external inputs.
+The Keycloak digest is authoritative for the runtime base identity; its version label is checked in CI rather than inferred from a mutable tag. The workflow's Java major/Python tool versions are explicit, and all `uses:` actions are pinned to immutable full commit SHAs. These controls improve repeatability but do not make the Maven build hermetic: Maven dependencies still resolve from repositories by coordinates, and the hosted runner/tool-download services remain external inputs.
 
 ## Administrative CI setting
 

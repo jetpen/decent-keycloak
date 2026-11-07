@@ -587,7 +587,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
 
   def test_disposable_probe_uses_the_explicit_lifecycle_live_profile(self):
     text = HISTORY.read_text()
-    self.assertIn("python3.11 scripts/lifecycle.py run issue5-live --allow-live", text)
+    self.assertIn("python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live", text)
     self.assertIn("WALLET_IT_IMAGE", (README.parent / "scripts/lifecycle.py").read_text())
 
   def test_runtime_configuration_documents_bundled_executable_default(self):
