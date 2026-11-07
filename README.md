@@ -26,13 +26,19 @@ To inspect the steps without running them:
 python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-CI invokes the same lifecycle with `ci` on pull requests. `issue5-live` is a separate, opt-in loopback profile and requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
+CI invokes the same lifecycle with `ci` on pull requests. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
 
 ```bash
-python3.11 scripts/lifecycle.py run issue5-live --allow-live
+python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live
 ```
 
-Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry. Retaining a local image is a separate opt-in (`--retain-image`) and does not publish it. Registry promotion is a separate command that requires a successful, fully gated `issue5-live` receipt, the retained image's exact immutable ID, an explicit release-candidate destination, and `--allow-publish`; it pushes and reads back the registry manifest before reporting success. No destination or publication is configured by default.
+`remote-test-host` runs the offline build/test lifecycle, transfers the exact built image, then performs a tailnet-only Keycloak/OIDC discovery smoke on the configured test host (defaults to `ben-x260`). Override the target with `REMOTE_TEST_HOST` and `REMOTE_TEST_USER`. It requires `--allow-live`; follow [`docs/acceptance/remote-test-host.md`](docs/acceptance/remote-test-host.md) for the one-time Tailscale SSH/operator setup and target preflight requirements. The lifecycle never enables Funnel and cleans its run-scoped image aliases without changing `decent-keycloak:latest`. That document also covers the ownership and teardown contract:
+
+```bash
+python3.11 scripts/lifecycle.py run remote-test-host --allow-live
+```
+
+Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry. Retaining a local image is a separate opt-in (`--retain-image`) and does not publish it. Registry promotion is a separate command that requires a successful, fully gated `wallet-login-qualification` receipt, the retained image's exact immutable ID, an explicit release-candidate destination, and `--allow-publish`; it pushes and reads back the registry manifest before reporting success. No destination or publication is configured by default.
 
 Repository-built image inventory:
 

@@ -47,7 +47,7 @@ ISSUE7_USER_READBACK_FAULT_MODES = {
 }
 SUPPORTED_LIVE_PROFILES = {
     'default', 'expiry', 'provider-not-found-diagnostic',
-    'issue6-single-node', 'issue6-auth-flow', 'issue5-adversarial', 'runtime-provenance', 'issue7-signup-success',
+    'issue6-single-node', 'issue6-auth-flow', 'wallet-login-adversarial', 'runtime-provenance', 'issue7-signup-success',
     'issue6-postconsume-receipt-failure', 'issue6-postconsume-callback-gate-failure',
     *ISSUE7_USER_READBACK_FAULT_MODES,
     *issue7_store_recovery.PROFILES,
@@ -1072,7 +1072,7 @@ def sanitize_live_checkpoint(candidate):
       'issue6_postconsume_receipt_recovery',
       'issue6_postconsume_callback_gate_failure_case',
       'issue6_postconsume_callback_gate_recovery', 'issue6_single_node_case', 'registry_matrix',
-      'issue5_profile',
+      'wallet_login_qualification',
       'issue7_single_node_signup_recovery', 'issue7_store_recovery',
       'account_denial_concurrency', 'account_denial_cases',
   }
@@ -1398,7 +1398,7 @@ def sanitize_live_checkpoint(candidate):
             'all_request_correlated': value['all_request_correlated'],
         }
       continue
-    if key == 'issue5_profile':
+    if key == 'wallet_login_qualification':
       stage = value.get('stage')
       if isinstance(stage, str) and stage in ISSUE5_MATRIX_STAGES:
         safe_stage = {'stage': stage}
@@ -7560,13 +7560,13 @@ def main():
           return
         if stage not in ISSUE5_MATRIX_STAGES:
           raise ValueError('unsupported Issue #5 matrix stage')
-        issue5_profile = {'stage': stage}
+        wallet_login_qualification = {'stage': stage}
         if failure_category in {'runtime_error', 'timeout', 'value_error', 'auth_flow_gate', 'other'}:
-          issue5_profile['failure_category'] = failure_category
-        result['issue5_profile'] = issue5_profile
+          wallet_login_qualification['failure_category'] = failure_category
+        result['wallet_login_qualification'] = wallet_login_qualification
         checkpoint()
       if profile == 'default':
-        result['issue5_profile'] = {'stage': 'resolver_tools_starting'}
+        result['wallet_login_qualification'] = {'stage': 'resolver_tools_starting'}
       if store_fault_mode is not None:
         result['issue7_store_recovery'] = {'stage': 'setup', 'scope': 'one-keycloak-node',
             'store_fault_mode': store_fault_mode,
@@ -7598,7 +7598,7 @@ def main():
       with report_partial_evidence_on_failure(evidence_path, latest_resolver_diagnostics):
         container_lifetime = (
             EXPIRY_CONTAINER_LIFETIME_SECONDS if profile == 'expiry' else
-            ISSUE5_ADVERSARIAL_CONTAINER_LIFETIME_SECONDS if profile == 'issue5-adversarial' else
+            ISSUE5_ADVERSARIAL_CONTAINER_LIFETIME_SECONDS if profile == 'wallet-login-adversarial' else
             300)
         mark_issue5_matrix_stage('resolver_tools_starting')
         issue7_setup_stage('resolver_tools_starting')
@@ -7682,7 +7682,7 @@ def main():
         mark_issue5_matrix_stage('login_events_configuring')
         enable_keycloak_login_events(client, token)
         issue7_setup_stage('events_configured')
-        if profile == 'issue5-adversarial':
+        if profile == 'wallet-login-adversarial':
           result['registry_matrix'] = {
               case_name: {'attempts': []}
               for case_name, _fixture_label in ISSUE5_ADVERSARIAL_CASES
@@ -7701,7 +7701,7 @@ def main():
           result['registry_matrix'] = run_issue5_adversarial_profile(
               adversarial_attempt_runner, checkpoint_adversarial_attempt)
           checkpoint()
-          print('issue5-adversarial-evidence=',
+          print('wallet-login-adversarial-evidence=',
               json.dumps(sanitize_live_checkpoint(result), sort_keys=True))
           finish_owned_cleanup(registry, resolver_tools)
           registry = None

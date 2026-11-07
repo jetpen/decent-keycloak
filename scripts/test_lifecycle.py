@@ -35,6 +35,14 @@ class LifecycleCliTest(unittest.TestCase):
   def test_issue61_native_role_contract_is_in_canonical_python_suite(self):
     self.assertIn("scripts.test_issue61_native_roles", lifecycle.PYTHON_TESTS)
 
+  def test_java_21_detection_accepts_any_java_21_patch_and_rejects_other_majors(self):
+    self.assertTrue(lifecycle.java_21_runtime("openjdk version \"21.0.13\" 2026-10-20\n"))
+    self.assertTrue(lifecycle.java_21_runtime("openjdk version \"21\" 2026-10-20\n"))
+    self.assertTrue(lifecycle.java_21_runtime("Keycloak 26.8.0\nJVM: 21.0.13+9-LTS\n"))
+    self.assertFalse(lifecycle.java_21_runtime("openjdk version \"17.0.13\" 2026-10-20\n"))
+    self.assertFalse(lifecycle.java_21_runtime("openjdk version \"27.0.1\" 2026-10-21\n"))
+    self.assertFalse(lifecycle.java_21_runtime("Keycloak 26.8.0\nJVM: 17.0.13\n"))
+
   def test_podman_and_docker_image_ids_are_normalized(self):
     raw_id = "a" * 64
     self.assertEqual(f"sha256:{raw_id}", normalize_image_id(raw_id))
@@ -270,7 +278,7 @@ class LifecycleCliTest(unittest.TestCase):
           mock.patch.object(lifecycle, "run", side_effect=fake_run), \
           mock.patch.object(lifecycle, "verify_provider", return_value=0), \
           mock.patch.object(lifecycle, "_run_capture",
-              return_value=(0, "Keycloak 26.8.0\\nJVM: 21.0.12.1")), \
+              return_value=(0, "Keycloak 26.8.0\nJVM: 21.0.13+9")), \
           mock.patch.object(lifecycle, "diff_check", return_value=0), \
           mock.patch.object(lifecycle, "capture_command", side_effect=fake_capture), \
           mock.patch.object(lifecycle, "_cleanup_owned_images", return_value={
@@ -394,7 +402,7 @@ class LifecycleCliTest(unittest.TestCase):
           mock.patch.object(lifecycle, "run", side_effect=engine_run), \
           mock.patch.object(lifecycle, "verify_provider", return_value=0), \
           mock.patch.object(lifecycle, "_run_capture",
-              return_value=(0, "Keycloak 26.8.0\nJVM: 21.0.12.1")), \
+              return_value=(0, "Keycloak 26.8.0\nJVM: 21.0.13+9")), \
           mock.patch.object(lifecycle, "diff_check", return_value=0), \
           mock.patch.object(lifecycle, "capture_command", side_effect=capture):
         try:
@@ -591,15 +599,15 @@ class LifecycleCliTest(unittest.TestCase):
   def test_promotion_requires_complete_live_receipt_and_explicit_image_retention(self):
     image_id = "sha256:" + "a" * 64
     gates = {
-        name: ("unavailable" if name in lifecycle.ISSUE5_ADVERSARIAL_CASES else "pass")
-        for name in lifecycle.ISSUE5_GATES
+        name: ("unavailable" if name in lifecycle.WALLET_LOGIN_ADVERSARIAL_CASES else "pass")
+        for name in lifecycle.WALLET_LOGIN_GATES
     }
     receipt = {
-        "profile": "issue5-live", "exit_code": 0, "run_id": "abc",
+        "profile": "wallet-login-qualification", "exit_code": 0, "run_id": "abc",
         "source": {"source_revision": "f" * 40, "image_source_sha256": "d" * 64,
             "image_source_file_count": 11, "image_artifacts_sha256": "e" * 64,
             "image_artifact_file_count": 3},
-        "issue5_acceptance_gates": gates,
+        "wallet_login_acceptance_gates": gates,
         "image": {"status": "built", "engine": "podman",
             "run_owned_tag": f"{lifecycle.IMAGE_NAME}:lifecycle-abc",
             "immutable_id": image_id, "retention_requested": True, "retained": True},
@@ -641,7 +649,7 @@ class LifecycleCliTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "tag does not match"):
       lifecycle.promotion_source_from_receipt(receipt)
     receipt["image"]["run_owned_tag"] = f"{lifecycle.IMAGE_NAME}:lifecycle-abc"
-    receipt["issue5_acceptance_gates"]["exact_missing_identity"] = "not_run"
+    receipt["wallet_login_acceptance_gates"]["exact_missing_identity"] = "not_run"
     with self.assertRaisesRegex(ValueError, "acceptance gates"):
       lifecycle.promotion_source_from_receipt(receipt)
 
@@ -734,12 +742,13 @@ class LifecycleCliTest(unittest.TestCase):
 
     self.assertEqual(0, result.returncode, result.stderr)
     profiles = json.loads(result.stdout)
-    self.assertEqual({"offline", "ci", "issue5-live"}, set(profiles))
+    self.assertEqual({"offline", "ci", "wallet-login-qualification", "remote-test-host"}, set(profiles))
     self.assertFalse(profiles["offline"]["live"])
-    self.assertTrue(profiles["issue5-live"]["live"])
+    self.assertTrue(profiles["wallet-login-qualification"]["live"])
+    self.assertTrue(profiles["remote-test-host"]["live"])
 
   def test_live_profile_refuses_to_start_without_explicit_opt_in(self):
-    result = self.run_cli("run", "issue5-live", "--plan")
+    result = self.run_cli("run", "wallet-login-qualification", "--plan")
 
     self.assertNotEqual(0, result.returncode)
     self.assertIn("--allow-live", result.stderr)
@@ -769,34 +778,121 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertEqual(0, ci.returncode, ci.stderr)
     self.assertEqual(json.loads(local.stdout)["steps"], json.loads(ci.stdout)["steps"])
 
+  def test_remote_test_host_profile_requires_explicit_live_opt_in(self):
+    result = self.run_cli("run", "remote-test-host", "--plan")
+
+    self.assertNotEqual(0, result.returncode)
+    self.assertIn("--allow-live", result.stderr)
+
+  def test_remote_test_host_uses_strict_local_container_prerequisites(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      observed = {}
+      def fail_preflight(**kwargs):
+        observed.update(kwargs)
+        return 2
+      with mock.patch.object(lifecycle, "ROOT", Path(temporary)), \
+          mock.patch.object(lifecycle, "preflight", side_effect=fail_preflight), \
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "core_test_stages", return_value=[]):
+        result = lifecycle.run_profile("remote-test-host")
+      self.assertEqual(2, result)
+      self.assertEqual({"live": True, "remote_test_host": True}, observed)
+
+  def test_remote_preflight_requires_a_complete_sanitized_readiness_record(self):
+    complete = {"ok": True, "host_matches": True, "rootless_podman": True,
+        "port_free": True, "serve_unused": True,
+        "run_image_tags_available": True}
+    with mock.patch.object(lifecycle.remote_test_host, "run_target", return_value=complete) as run:
+      status, facts = lifecycle.remote_test_host_preflight("a" * 32)
+    self.assertEqual(0, status)
+    self.assertTrue(facts["ssh_available"])
+    self.assertEqual(set(complete) - {"ok"} | {"ssh_available"}, set(facts))
+    self.assertEqual("preflight", run.call_args.args[1])
+    self.assertEqual("a" * 32, run.call_args.args[2])
+    self.assertEqual(lifecycle.REMOTE_TEST_HOST, run.call_args.kwargs["host"])
+
+  def test_remote_preflight_records_sanitized_target_rejection_without_claiming_ssh_failed(self):
+    with mock.patch.object(lifecycle.remote_test_host, "run_target",
+        side_effect=lifecycle.remote_test_host.TargetOperationRejected("target_serve_in_use")):
+      status, facts = lifecycle.remote_test_host_preflight("a" * 32)
+    self.assertEqual(2, status)
+    self.assertEqual({"ssh_available": True, "target_ready": False,
+        "failure_category": "target_serve_in_use"}, facts)
+
+  def test_remote_preflight_redacts_target_failures_from_receipt_facts(self):
+    with mock.patch.object(lifecycle.remote_test_host, "run_target",
+        side_effect=RuntimeError("private diagnostic text")):
+      status, facts = lifecycle.remote_test_host_preflight("a" * 32)
+    self.assertEqual(2, status)
+    self.assertEqual({"ssh_available": False}, facts)
+    self.assertNotIn("private diagnostic text", json.dumps(facts))
+
+  def test_remote_test_host_preflight_failure_stops_before_build_stages(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      with mock.patch.object(lifecycle, "ROOT", root), \
+          mock.patch.object(lifecycle, "preflight", return_value=0), \
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
+          mock.patch.object(lifecycle, "remote_test_host_preflight", create=True,
+              return_value=(2, {"reason": "ssh_unavailable"})) as remote_preflight, \
+          mock.patch.object(lifecycle, "core_test_stages", side_effect=[[],
+              AssertionError("local build/test stages must not start")]):
+        result = lifecycle.run_profile("remote-test-host")
+
+      receipt = json.loads(next((root / "target/lifecycle/evidence").glob("*.json")).read_text())
+      self.assertEqual(2, result)
+      remote_preflight.assert_called_once()
+      self.assertEqual("fail", receipt["steps"]["remote-preflight"]["status"])
+      self.assertEqual("not_built", receipt["image"]["status"])
+
+  def test_remote_test_host_plan_contains_tailnet_only_remote_lifecycle_steps(self):
+    result = self.run_cli("run", "remote-test-host", "--plan", "--json", "--allow-live")
+
+    self.assertEqual(0, result.returncode, result.stderr)
+    plan = json.loads(result.stdout)
+    steps = {step["name"]: step for step in plan["steps"]}
+    for name in ("remote-setup", "remote-preflight", "remote-image-transfer",
+        "remote-deploy", "remote-oidc-discovery", "remote-teardown"):
+      self.assertIn(name, steps)
+    self.assertIn("tailnet-only", steps["remote-setup"]["action"])
+    self.assertIn("configured remote test-host identity", steps["remote-preflight"]["action"])
+    self.assertIn("--allow-live", steps["remote-deploy"]["requires"])
+    self.assertIn("run-scoped", steps["remote-image-transfer"]["action"])
+    self.assertIn("without changing decent-keycloak:latest", steps["remote-image-transfer"]["action"])
+    plan_json = json.dumps(plan).lower()
+    self.assertNotIn("tailscale funnel", plan_json)
+    self.assertNotIn("--funnel", plan_json)
+    self.assertNotIn("ben-x260", plan_json)
+
   def test_live_profile_plan_uses_the_immutable_image_built_by_the_lifecycle(self):
-    result = self.run_cli("run", "issue5-live", "--plan", "--json", "--allow-live")
+    result = self.run_cli("run", "wallet-login-qualification", "--plan", "--json", "--allow-live")
 
     self.assertEqual(0, result.returncode, result.stderr)
     plan = json.loads(result.stdout)
     steps = {step["name"]: step for step in plan["steps"]}
     self.assertIn("provider-image", steps)
-    self.assertIn("issue5-live-matrix", steps)
-    self.assertEqual(lifecycle.ISSUE5_LIVE_MATRIX_PROFILE,
-        steps["issue5-live-matrix"]["env"]["WALLET_IT_PROFILE"])
-    self.assertIn("--allow-live", steps["issue5-live-matrix"]["requires"])
-    self.assertIn("issue5-adversarial", steps)
-    self.assertEqual("issue5-adversarial", steps["issue5-adversarial"]["env"]["WALLET_IT_PROFILE"])
-    self.assertEqual("<run-built immutable ID>", steps["issue5-adversarial"]["env"]["WALLET_IT_IMAGE"])
-    self.assertIn("--allow-live", steps["issue5-adversarial"]["requires"])
+    self.assertIn("wallet-login-qualification-matrix", steps)
+    self.assertEqual(lifecycle.WALLET_LOGIN_MATRIX_PROFILE,
+        steps["wallet-login-qualification-matrix"]["env"]["WALLET_IT_PROFILE"])
+    self.assertIn("--allow-live", steps["wallet-login-qualification-matrix"]["requires"])
+    self.assertIn("wallet-login-adversarial", steps)
+    self.assertEqual("wallet-login-adversarial", steps["wallet-login-adversarial"]["env"]["WALLET_IT_PROFILE"])
+    self.assertEqual("<run-built immutable ID>", steps["wallet-login-adversarial"]["env"]["WALLET_IT_IMAGE"])
+    self.assertIn("--allow-live", steps["wallet-login-adversarial"]["requires"])
 
 
-  def test_issue5_success_requires_exact_complete_gate_set(self):
+  def test_wallet_login_qualification_requires_exact_complete_gate_set(self):
     expected = {
-        name: ("unavailable" if name in lifecycle.ISSUE5_ADVERSARIAL_CASES else "pass")
-        for name in lifecycle.ISSUE5_GATES
+        name: ("unavailable" if name in lifecycle.WALLET_LOGIN_ADVERSARIAL_CASES else "pass")
+        for name in lifecycle.WALLET_LOGIN_GATES
     }
-    self.assertTrue(lifecycle.issue5_acceptance_gate_set_complete(expected))
-    self.assertFalse(lifecycle.issue5_acceptance_gate_set_complete({
+    self.assertTrue(lifecycle.wallet_login_acceptance_gate_set_complete(expected))
+    self.assertFalse(lifecycle.wallet_login_acceptance_gate_set_complete({
         key: value for key, value in expected.items() if key != "runtime_provider"}))
     inconclusive = dict(expected)
     inconclusive["account_denial_concurrency"] = "inconclusive"
-    self.assertFalse(lifecycle.issue5_acceptance_gate_set_complete(inconclusive))
+    self.assertFalse(lifecycle.wallet_login_acceptance_gate_set_complete(inconclusive))
 
   def test_adversarial_gates_only_record_unavailable_for_two_complete_failed_closed_attempts(self):
     cases = {
@@ -826,17 +922,17 @@ class LifecycleCliTest(unittest.TestCase):
         for name, label in cases.items()
     }}
 
-    statuses = lifecycle.issue5_adversarial_gate_statuses(evidence)
+    statuses = lifecycle.wallet_login_adversarial_gate_statuses(evidence)
     self.assertEqual({name: "unavailable" for name in cases}, statuses)
 
     evidence["registry_matrix"]["malformed_result"]["attempts"][0]["direct_resolution"] = "not_found"
     evidence["registry_matrix"]["history_incomplete"]["attempts"][1]["provider_http"] = 200
-    statuses = lifecycle.issue5_adversarial_gate_statuses(evidence)
+    statuses = lifecycle.wallet_login_adversarial_gate_statuses(evidence)
     self.assertEqual("inconclusive", statuses["malformed_result"])
     self.assertEqual("inconclusive", statuses["history_incomplete"])
     self.assertEqual("unavailable", statuses["ambiguous_registry_result"])
 
-    self.assertEqual('pass', lifecycle.issue5_account_denial_gate_status({
+    self.assertEqual('pass', lifecycle.wallet_login_account_denial_gate_status({
         'account_denial_concurrency': {
             'case_count': 3, 'max_concurrent_flows': 3,
             'overlap_observed': True, 'all_policy_denied': True,
@@ -853,18 +949,18 @@ class LifecycleCliTest(unittest.TestCase):
             }
             for name in ('unmapped-account', 'disabled-account', 'ambiguous-account')
         }}))
-    self.assertEqual('inconclusive', lifecycle.issue5_account_denial_gate_status({
+    self.assertEqual('inconclusive', lifecycle.wallet_login_account_denial_gate_status({
         'account_denial_concurrency': {
             'case_count': 3, 'max_concurrent_flows': 3,
             'overlap_observed': True, 'all_policy_denied': True,
         }}))
-    self.assertEqual('fail', lifecycle.issue5_account_denial_gate_status({
+    self.assertEqual('fail', lifecycle.wallet_login_account_denial_gate_status({
         'account_denial_concurrency': {
             'case_count': 3, 'max_concurrent_flows': 2,
             'overlap_observed': True, 'all_policy_denied': True,
             'all_request_correlated': False,
         }}))
-    self.assertEqual('inconclusive', lifecycle.issue5_account_denial_gate_status({
+    self.assertEqual('inconclusive', lifecycle.wallet_login_account_denial_gate_status({
         'account_denial_concurrency': {
             'case_count': 3, 'max_concurrent_flows': 3,
             'overlap_observed': True, 'all_policy_denied': True,
@@ -918,7 +1014,7 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertEqual("request_correlated_consumed_transaction",
         runtime["single_use_object_provider_evidence"])
     self.assertEqual(2, runtime["transaction_consume_witness_count"])
-    self.assertEqual("pass", lifecycle.issue5_runtime_provider_gate_status(projected))
+    self.assertEqual("pass", lifecycle.wallet_login_runtime_provider_gate_status(projected))
     self.assertNotIn(request_id, json.dumps(projected))
     self.assertNotIn("transaction_consume_marker", json.dumps(projected))
     incomplete = json.loads(json.dumps(evidence))
@@ -926,12 +1022,12 @@ class LifecycleCliTest(unittest.TestCase):
     incomplete_projection = probe.sanitize_live_checkpoint(incomplete)
     self.assertNotIn("transaction_consume_witness_count",
         incomplete_projection["resolver_runtime"])
-    self.assertEqual("inconclusive", lifecycle.issue5_runtime_provider_gate_status(
+    self.assertEqual("inconclusive", lifecycle.wallet_login_runtime_provider_gate_status(
         incomplete_projection))
 
   def test_runtime_provider_gate_requires_effective_selected_provider_facts(self):
-    self.assertEqual('inconclusive', lifecycle.issue5_runtime_provider_gate_status({}))
-    self.assertEqual('pass', lifecycle.issue5_runtime_provider_gate_status({
+    self.assertEqual('inconclusive', lifecycle.wallet_login_runtime_provider_gate_status({}))
+    self.assertEqual('pass', lifecycle.wallet_login_runtime_provider_gate_status({
         'resolver_runtime': {
             'runtime_qualification_status': 'runtime_facts_verified',
             'single_use_object_provider_path': 'infinispan',
@@ -939,7 +1035,7 @@ class LifecycleCliTest(unittest.TestCase):
             'transaction_consume_witness_count': 1,
             'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
         }}))
-    self.assertEqual('pass', lifecycle.issue5_runtime_provider_gate_status({
+    self.assertEqual('pass', lifecycle.wallet_login_runtime_provider_gate_status({
         'resolver_runtime': {
             'runtime_qualification_status': 'runtime_facts_verified',
             'single_use_object_provider_path': 'infinispan',
@@ -947,11 +1043,11 @@ class LifecycleCliTest(unittest.TestCase):
             'transaction_consume_witness_count': 2,
             'database_mode_effective': 'dev-file', 'cache_mode_effective': 'local',
         }}))
-    self.assertEqual('inconclusive', lifecycle.issue5_runtime_provider_gate_status({
+    self.assertEqual('inconclusive', lifecycle.wallet_login_runtime_provider_gate_status({
         'resolver_runtime': {'runtime_qualification_status': 'open_runtime_facts_unavailable',
             'single_use_object_provider_path': 'unavailable',
             'database_mode_effective': 'unavailable', 'cache_mode_effective': 'unavailable'}}))
-    self.assertEqual('inconclusive', lifecycle.issue5_runtime_provider_gate_status({
+    self.assertEqual('inconclusive', lifecycle.wallet_login_runtime_provider_gate_status({
         'resolver_runtime': {
             'runtime_qualification_status': 'runtime_facts_verified',
             'single_use_object_provider_path': 'infinispan',
@@ -975,7 +1071,7 @@ class LifecycleCliTest(unittest.TestCase):
             "bootstrap_restore_readback": True,
         },
     }})
-    self.assertEqual("pass", lifecycle.issue5_live_matrix_gate_statuses(evidence)["registry_unavailable"])
+    self.assertEqual("pass", lifecycle.wallet_login_matrix_gate_statuses(evidence)["registry_unavailable"])
 
   def test_live_matrix_gates_require_complete_two_attempt_receipts(self):
     current = lambda: {
@@ -1010,7 +1106,7 @@ class LifecycleCliTest(unittest.TestCase):
         "outcome": "current_accepted",
     }
     evidence = {
-        "issue5_profile": {"stage": "complete"},
+        "wallet_login_qualification": {"stage": "complete"},
         "registry_matrix": {
             "current_identity": {"attempts": [current(), current()]},
             "missing_identity": {"attempts": [missing(), missing()]},
@@ -1021,7 +1117,7 @@ class LifecycleCliTest(unittest.TestCase):
         "rotated_identity_case": {"local_mapping_persisted": True},
     }
 
-    statuses = lifecycle.issue5_live_matrix_gate_statuses(evidence)
+    statuses = lifecycle.wallet_login_matrix_gate_statuses(evidence)
     self.assertEqual({
         "current_identity": "pass",
         "exact_missing_identity": "pass",
@@ -1034,13 +1130,13 @@ class LifecycleCliTest(unittest.TestCase):
         "runtime_provider": "inconclusive",
     }, statuses)
 
-    self.assertEqual('inconclusive', lifecycle.issue5_live_matrix_gate_statuses({
+    self.assertEqual('inconclusive', lifecycle.wallet_login_matrix_gate_statuses({
         'registry_matrix': {'unavailable_registry': {'attempts': [
             {key: value for key, value in unavailable().items() if key != 'bootstrap_restore_readback'},
             unavailable(),
         ]}}
     })['registry_unavailable'])
-    self.assertEqual('fail', lifecycle.issue5_live_matrix_gate_statuses({
+    self.assertEqual('fail', lifecycle.wallet_login_matrix_gate_statuses({
         'registry_matrix': {'unavailable_registry': {
             'attempts': [unavailable(), unavailable()],
             'bootstrap_override_readback': True, 'bootstrap_restore_readback': False,
@@ -1048,9 +1144,9 @@ class LifecycleCliTest(unittest.TestCase):
     })['registry_unavailable'])
 
     evidence["registry_matrix"]["missing_identity"]["attempts"][1]["direct_resolution"] = "unavailable"
-    self.assertEqual("fail", lifecycle.issue5_live_matrix_gate_statuses(evidence)["exact_missing_identity"])
+    self.assertEqual("fail", lifecycle.wallet_login_matrix_gate_statuses(evidence)["exact_missing_identity"])
     evidence["registry_matrix"]["rotation"]["attempts"][0].pop("independent_rotation_readback")
-    self.assertEqual("inconclusive", lifecycle.issue5_live_matrix_gate_statuses(evidence)["independent_rotation_readback"])
+    self.assertEqual("inconclusive", lifecycle.wallet_login_matrix_gate_statuses(evidence)["independent_rotation_readback"])
 
 
 if __name__ == "__main__":

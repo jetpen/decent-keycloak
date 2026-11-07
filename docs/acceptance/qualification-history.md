@@ -237,7 +237,7 @@ CI invokes the same profile on the pull request as an independent verification l
 A successful offline lifecycle is not live wallet-login qualification. To run the full loopback matrix, request separate authorization first; the command requires `--allow-live`:
 
 ```bash
-python3.11 scripts/lifecycle.py run issue5-live --allow-live
+python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live
 ```
 
 This profile uses the immutable ID of the image it just built and retains sanitized harness evidence in its receipt. It does not qualify production Registry behavior or real TLS/browser-wallet interoperability.

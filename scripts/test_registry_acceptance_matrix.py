@@ -26,11 +26,11 @@ from wallet_login_live_e2e import (  # noqa: E402
 
 
 class RegistryAcceptanceMatrixTest(unittest.TestCase):
-  def test_issue5_adversarial_profile_is_allowlisted(self):
+  def test_wallet_login_adversarial_profile_is_allowlisted(self):
     previous = os.environ.get('WALLET_IT_PROFILE')
-    os.environ['WALLET_IT_PROFILE'] = 'issue5-adversarial'
+    os.environ['WALLET_IT_PROFILE'] = 'wallet-login-adversarial'
     try:
-      self.assertEqual('issue5-adversarial', probe.selected_live_profile())
+      self.assertEqual('wallet-login-adversarial', probe.selected_live_profile())
     finally:
       if previous is None:
         os.environ.pop('WALLET_IT_PROFILE', None)
@@ -378,7 +378,7 @@ class RegistryAcceptanceMatrixTest(unittest.TestCase):
         probe.unavailable_bootstrap(bootstrap, 4200))
     self.assertIsNone(probe.unavailable_bootstrap(bootstrap, 4100))
 
-  def test_issue5_profile_checkpoint_keeps_substep_and_allowlisted_failure_category(self):
+  def test_wallet_login_qualification_checkpoint_keeps_substep_and_allowlisted_failure_category(self):
     stages = (
         'current_identity_direct_lookup_start',
         'current_identity_direct_lookup_complete',
@@ -393,17 +393,17 @@ class RegistryAcceptanceMatrixTest(unittest.TestCase):
     )
     for stage in stages:
       with self.subTest(stage=stage):
-        projected = sanitize_live_checkpoint({'issue5_profile': {
+        projected = sanitize_live_checkpoint({'wallet_login_qualification': {
             'stage': stage, 'failure_category': 'runtime_error',
             'exception_text': 'secret raw details'}})
         self.assertEqual({'stage': stage, 'failure_category': 'runtime_error'},
-            projected.get('issue5_profile'))
-        invalid_category = sanitize_live_checkpoint({'issue5_profile': {
+            projected.get('wallet_login_qualification'))
+        invalid_category = sanitize_live_checkpoint({'wallet_login_qualification': {
             'stage': stage, 'failure_category': 'secret raw details'}})
-        self.assertEqual({'stage': stage}, invalid_category.get('issue5_profile'))
-    invalid_stage = sanitize_live_checkpoint({'issue5_profile': {
+        self.assertEqual({'stage': stage}, invalid_category.get('wallet_login_qualification'))
+    invalid_stage = sanitize_live_checkpoint({'wallet_login_qualification': {
         'stage': 'secret raw details', 'failure_category': 'runtime_error'}})
-    self.assertNotIn('issue5_profile', invalid_stage)
+    self.assertNotIn('wallet_login_qualification', invalid_stage)
 
   def test_checkpoint_sanitizer_preserves_matrix_outcomes_but_discards_private_values(self):
     projected = sanitize_live_checkpoint({'registry_matrix': {

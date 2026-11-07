@@ -234,12 +234,12 @@ class IdentityLookupClassificationTest(unittest.TestCase):
         ('current_identity_direct_lookup_start', None),
         ('current_identity_direct_lookup_start', 'runtime_error'),
     ], checkpoints)
-    projected = sanitize_live_checkpoint({'issue5_profile': {
+    projected = sanitize_live_checkpoint({'wallet_login_qualification': {
         'stage': checkpoints[-1][0], 'failure_category': checkpoints[-1][1],
         'exception_text': 'raw resolver failure must not be copied'}})
     self.assertEqual({
         'stage': 'current_identity_direct_lookup_start', 'failure_category': 'runtime_error'},
-        projected['issue5_profile'])
+        projected['wallet_login_qualification'])
 
   def test_live_probe_rotates_registry_identity_and_checks_old_and_new_keys(self):
     source = Path(__file__).with_name('wallet_login_live_e2e.py').read_text()
