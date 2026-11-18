@@ -4551,8 +4551,7 @@ def new_account_mapping_log_categories(previous_lines, current_lines, expected_r
   markers = (
       ('Wallet account policy rejected proof', 'account-policy-rejected',
           re.compile(r'Wallet account policy rejected proof '
-              r'\(request=([0-9a-f]{32}), signup=(?:true|false), '
-              r'registered=(?:true|false), occupied=(?:true|false)\)')),
+              r'\(request=([0-9a-f]{32}), signup=(?:true|false), registered=(?:true|false), occupied=(?:true|false)\)')),
       ('Wallet Identity resolver unavailable', 'identity-resolver-unavailable',
           re.compile(r'Wallet Identity resolver unavailable '
               r'\(request=([0-9a-f]{32}), [A-Za-z0-9_$.-]{1,96}\)')),

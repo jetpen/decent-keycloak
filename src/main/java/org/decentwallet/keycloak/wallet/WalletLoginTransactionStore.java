@@ -15,7 +15,7 @@ import org.keycloak.models.SingleUseObjectProvider;
 /** Stores the pending state for one provider-hosted wallet proof transaction. */
 public final class WalletLoginTransactionStore {
   public static final long TRANSACTION_LIFESPAN_SECONDS = 300;
-  public enum Intent { LOGIN, SIGNUP }
+  public enum Intent { LOGIN, SIGNUP, ACCOUNT_SIGNUP, SIGNUP_RECOVERY }
   private static final String NOTE_REALM = "realm_id";
   private static final String NOTE_CLIENT = "client_id";
   private static final String NOTE_ROOT_SESSION = "root_session_id";
@@ -26,6 +26,10 @@ public final class WalletLoginTransactionStore {
   private static final String NOTE_CHALLENGE = "challenge";
   private static final String NOTE_CSRF = "csrf_token";
   private static final String NOTE_EXPIRES_AT = "expires_at_epoch_second";
+  private static final String NOTE_ACCOUNT_ACTION = "account_action";
+  private static final String NOTE_ACCOUNT_REQUEST_ID = "account_request_id";
+  private static final String NOTE_ACCOUNT_REQUEST_JTI = "account_request_jti";
+  private static final String NOTE_ACCOUNT_REQUEST_EXPIRES = "account_request_expires_at";
   private static final String ACCEPTED_PREFIX = "decent-wallet-login-v1:accepted:";
   private static final String CALLBACK_PREFIX = "decent-wallet-login-v1:callback:";
   private static final String INVALID_ATTEMPT_PREFIX = "decent-wallet-login-v1:invalid-attempt:";
@@ -83,8 +87,21 @@ public final class WalletLoginTransactionStore {
   }
 
   public IssuedTransaction issue(Binding binding, Intent intent) {
+    return issue(binding, intent, null, null, null, null);
+  }
+
+  public IssuedTransaction issue(Binding binding, Intent intent, String accountAction,
+      String accountRequestId, String accountRequestJti, java.time.Instant accountRequestExpiresAt) {
     validateBinding(binding);
     Objects.requireNonNull(intent, "wallet transaction intent is required");
+    boolean accountIntent = intent == Intent.ACCOUNT_SIGNUP || intent == Intent.SIGNUP_RECOVERY;
+    if (accountIntent && (accountAction == null || accountRequestId == null || accountRequestJti == null
+        || accountRequestExpiresAt == null || !intent.equals(WalletAccountRequestExecutor.intentForAction(accountAction)))) {
+      throw new IllegalArgumentException("signed account action bindings are required");
+    }
+    if (!accountIntent && accountAction != null) {
+      throw new IllegalArgumentException("account action cannot bind to a legacy wallet transaction");
+    }
     if (singleUseObjects.contains(browserClientLockKey(binding))) {
       throw new IllegalStateException("wallet browser/client admission is temporarily locked");
     }
@@ -102,6 +119,12 @@ public final class WalletLoginTransactionStore {
     notes.put(NOTE_REDIRECT, binding.redirectUri());
     notes.put(NOTE_ORIGIN, binding.canonicalOrigin());
     notes.put(NOTE_INTENT, intent.name());
+    if (accountIntent) {
+      notes.put(NOTE_ACCOUNT_ACTION, accountAction);
+      notes.put(NOTE_ACCOUNT_REQUEST_ID, accountRequestId);
+      notes.put(NOTE_ACCOUNT_REQUEST_JTI, accountRequestJti);
+      notes.put(NOTE_ACCOUNT_REQUEST_EXPIRES, Long.toString(accountRequestExpiresAt.getEpochSecond()));
+    }
     notes.put(NOTE_CHALLENGE, challenge);
     notes.put(NOTE_CSRF, csrf);
     java.time.Instant expiresAt = clock.instant().plusSeconds(TRANSACTION_LIFESPAN_SECONDS);
@@ -135,10 +158,25 @@ public final class WalletLoginTransactionStore {
           notes.get(NOTE_ROOT_SESSION), notes.get(NOTE_TAB), notes.get(NOTE_REDIRECT), notes.get(NOTE_ORIGIN));
       validateBinding(binding);
       Intent intent = parseIntent(notes.get(NOTE_INTENT));
+      String accountAction = notes.get(NOTE_ACCOUNT_ACTION);
+      String accountRequestId = notes.get(NOTE_ACCOUNT_REQUEST_ID);
+      String accountRequestJti = notes.get(NOTE_ACCOUNT_REQUEST_JTI);
+      String accountRequestExpires = notes.get(NOTE_ACCOUNT_REQUEST_EXPIRES);
+      if (intent == Intent.ACCOUNT_SIGNUP || intent == Intent.SIGNUP_RECOVERY) {
+        if (accountAction == null || accountRequestId == null || accountRequestJti == null
+            || accountRequestExpires == null
+            || intent != WalletAccountRequestExecutor.intentForAction(accountAction)
+            || !validRequestId(accountRequestId) || accountRequestJti.isBlank()
+            || clock.instant().getEpochSecond() >= Long.parseLong(accountRequestExpires)) return Optional.empty();
+      } else if (accountAction != null || accountRequestId != null || accountRequestJti != null
+          || accountRequestExpires != null) {
+        return Optional.empty();
+      }
       String challenge = notes.get(NOTE_CHALLENGE);
       String csrfToken = notes.get(NOTE_CSRF);
       if (!validToken(challenge) || !validToken(csrfToken)) return Optional.empty();
-      return Optional.of(new PendingTransaction(binding, challenge, csrfToken, intent));
+      return Optional.of(new PendingTransaction(binding, challenge, csrfToken, intent,
+          accountAction, accountRequestId, accountRequestJti, accountRequestExpires));
     } catch (IllegalArgumentException ex) {
       return Optional.empty();
     }
@@ -176,6 +214,19 @@ public final class WalletLoginTransactionStore {
 
   public void markAccepted(String handle, Binding binding, String proofDigest,
       String identityId, String publicKey, String csrfToken, Intent intent) {
+    markAccepted(handle, binding, proofDigest, identityId, publicKey, csrfToken, intent, null);
+  }
+
+  public void markAccepted(String handle, Binding binding, String proofDigest,
+      String identityId, String publicKey, PendingTransaction consumed) {
+    if (consumed == null) throw new IllegalArgumentException("consumed wallet transaction is required");
+    markAccepted(handle, binding, proofDigest, identityId, publicKey, consumed.csrfToken(),
+        consumed.intent(), consumed);
+  }
+
+  private void markAccepted(String handle, Binding binding, String proofDigest,
+      String identityId, String publicKey, String csrfToken, Intent intent,
+      PendingTransaction consumed) {
     if (!validHandle(handle) || binding == null || blank(proofDigest) || blank(identityId)
         || blank(publicKey) || !validToken(csrfToken) || intent == null) {
       throw new IllegalArgumentException("accepted wallet transaction fields are required");
@@ -191,6 +242,18 @@ public final class WalletLoginTransactionStore {
     receipt.put(NOTE_REDIRECT, binding.redirectUri());
     receipt.put(NOTE_ORIGIN, binding.canonicalOrigin());
     receipt.put(NOTE_INTENT, intent.name());
+    if (intent == Intent.ACCOUNT_SIGNUP || intent == Intent.SIGNUP_RECOVERY) {
+      if (consumed == null || consumed.intent() != intent || !binding.equals(consumed.binding())
+          || !constantTimeEquals(csrfToken, consumed.csrfToken())
+          || consumed.accountAction() == null || consumed.accountRequestId() == null
+          || consumed.accountRequestJti() == null || consumed.accountRequestExpires() == null) {
+        throw new IllegalStateException("signed account request transaction unavailable");
+      }
+      receipt.put(NOTE_ACCOUNT_ACTION, consumed.accountAction());
+      receipt.put(NOTE_ACCOUNT_REQUEST_ID, consumed.accountRequestId());
+      receipt.put(NOTE_ACCOUNT_REQUEST_JTI, consumed.accountRequestJti());
+      receipt.put(NOTE_ACCOUNT_REQUEST_EXPIRES, consumed.accountRequestExpires());
+    }
     receipt.put(NOTE_PROOF_DIGEST, proofDigest);
     receipt.put(NOTE_IDENTITY, identityId);
     receipt.put(NOTE_PUBLIC_KEY, publicKey);
@@ -288,7 +351,9 @@ public final class WalletLoginTransactionStore {
     if (!validAcceptedReceipt(retainedReceipt, expectedBinding)) return Optional.empty();
     return Optional.of(new AcceptedTransaction(retainedReceipt.get(NOTE_IDENTITY),
         retainedReceipt.get(NOTE_PUBLIC_KEY), retainedReceipt.get(NOTE_PROOF_DIGEST),
-        decodeBinding(retainedReceipt), parseIntent(retainedReceipt.get(NOTE_INTENT))));
+        decodeBinding(retainedReceipt), parseIntent(retainedReceipt.get(NOTE_INTENT)),
+        retainedReceipt.get(NOTE_ACCOUNT_ACTION), retainedReceipt.get(NOTE_ACCOUNT_REQUEST_ID),
+        retainedReceipt.get(NOTE_ACCOUNT_REQUEST_JTI), retainedReceipt.get(NOTE_ACCOUNT_REQUEST_EXPIRES)));
   }
 
   public Optional<AcceptedTransaction> peekAccepted(String handle) {
@@ -296,7 +361,9 @@ public final class WalletLoginTransactionStore {
     Map<String, String> receipt = readAcceptedReceipt(handle);
     if (receipt == null || !validAcceptedReceipt(receipt, null)) return Optional.empty();
     return Optional.of(new AcceptedTransaction(receipt.get(NOTE_IDENTITY), receipt.get(NOTE_PUBLIC_KEY),
-        receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT))));
+        receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT)),
+        receipt.get(NOTE_ACCOUNT_ACTION), receipt.get(NOTE_ACCOUNT_REQUEST_ID),
+        receipt.get(NOTE_ACCOUNT_REQUEST_JTI), receipt.get(NOTE_ACCOUNT_REQUEST_EXPIRES)));
   }
 
   public boolean callbackGateAvailable(String handle, Binding expectedBinding) {
@@ -320,7 +387,9 @@ public final class WalletLoginTransactionStore {
     if (!validAcceptedReceipt(receipt, expectedBinding)) return Optional.empty();
     try {
       return Optional.of(new AcceptedTransaction(receipt.get(NOTE_IDENTITY), receipt.get(NOTE_PUBLIC_KEY),
-          receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT))));
+          receipt.get(NOTE_PROOF_DIGEST), decodeBinding(receipt), parseIntent(receipt.get(NOTE_INTENT)),
+          receipt.get(NOTE_ACCOUNT_ACTION), receipt.get(NOTE_ACCOUNT_REQUEST_ID),
+          receipt.get(NOTE_ACCOUNT_REQUEST_JTI), receipt.get(NOTE_ACCOUNT_REQUEST_EXPIRES)));
     } catch (RuntimeException ex) {
       return Optional.empty();
     }
@@ -453,21 +522,47 @@ public final class WalletLoginTransactionStore {
           notes.get(NOTE_ROOT_SESSION), notes.get(NOTE_TAB), notes.get(NOTE_REDIRECT), notes.get(NOTE_ORIGIN));
       validateBinding(binding);
       Intent intent = parseIntent(notes.get(NOTE_INTENT));
+      String action = notes.get(NOTE_ACCOUNT_ACTION);
+      String requestId = notes.get(NOTE_ACCOUNT_REQUEST_ID);
+      String requestJti = notes.get(NOTE_ACCOUNT_REQUEST_JTI);
+      String requestExpires = notes.get(NOTE_ACCOUNT_REQUEST_EXPIRES);
+      if (intent == Intent.ACCOUNT_SIGNUP || intent == Intent.SIGNUP_RECOVERY) {
+        long requestExpiresAt = Long.parseLong(requestExpires);
+        if (intent != WalletAccountRequestExecutor.intentForAction(action) || !validRequestId(requestId)
+            || requestJti.isBlank() || clock.instant().getEpochSecond() >= requestExpiresAt) return Optional.empty();
+      } else if (action != null || requestId != null || requestJti != null || requestExpires != null) {
+        return Optional.empty();
+      }
       String challenge = notes.get(NOTE_CHALLENGE);
       String csrf = notes.get(NOTE_CSRF);
       if (!validToken(challenge) || !validToken(csrf)) return Optional.empty();
-      return Optional.of(new PendingTransaction(binding, challenge, csrf, intent));
+      return Optional.of(new PendingTransaction(binding, challenge, csrf, intent,
+          notes.get(NOTE_ACCOUNT_ACTION), notes.get(NOTE_ACCOUNT_REQUEST_ID),
+          notes.get(NOTE_ACCOUNT_REQUEST_JTI), notes.get(NOTE_ACCOUNT_REQUEST_EXPIRES)));
     } catch (IllegalArgumentException ex) {
       return Optional.empty();
     }
   }
 
   private static boolean complete(Map<String, String> notes) {
-    return notes.containsKey(NOTE_REALM) && notes.containsKey(NOTE_CLIENT)
+    if (!(notes.containsKey(NOTE_REALM) && notes.containsKey(NOTE_CLIENT)
         && notes.containsKey(NOTE_ROOT_SESSION) && notes.containsKey(NOTE_TAB)
         && notes.containsKey(NOTE_REDIRECT) && notes.containsKey(NOTE_ORIGIN)
         && notes.containsKey(NOTE_INTENT) && notes.containsKey(NOTE_CHALLENGE) && notes.containsKey(NOTE_CSRF)
-        && notes.containsKey(NOTE_EXPIRES_AT);
+        && notes.containsKey(NOTE_EXPIRES_AT))) return false;
+    try {
+      Intent intent = parseIntent(notes.get(NOTE_INTENT));
+      boolean accountIntent = intent == Intent.ACCOUNT_SIGNUP || intent == Intent.SIGNUP_RECOVERY;
+      boolean allAccountFields = notes.containsKey(NOTE_ACCOUNT_ACTION)
+          && notes.containsKey(NOTE_ACCOUNT_REQUEST_ID) && notes.containsKey(NOTE_ACCOUNT_REQUEST_JTI)
+          && notes.containsKey(NOTE_ACCOUNT_REQUEST_EXPIRES);
+      boolean anyAccountField = notes.containsKey(NOTE_ACCOUNT_ACTION)
+          || notes.containsKey(NOTE_ACCOUNT_REQUEST_ID) || notes.containsKey(NOTE_ACCOUNT_REQUEST_JTI)
+          || notes.containsKey(NOTE_ACCOUNT_REQUEST_EXPIRES);
+      return accountIntent ? allAccountFields : !anyAccountField;
+    } catch (RuntimeException invalidIntent) {
+      return false;
+    }
   }
 
   private boolean expired(Map<String, String> notes) {
@@ -507,6 +602,9 @@ public final class WalletLoginTransactionStore {
   }
 
   private static boolean blank(String value) { return value == null || value.isBlank(); }
+  private static boolean validRequestId(String value) {
+    return WalletAccountRequestExecutor.isCanonicalRequestId(value);
+  }
   private static boolean validHandle(String value) { return validToken(value); }
   private static boolean validToken(String value) {
     if (value == null || value.length() != 43 || !value.matches("[A-Za-z0-9_-]{43}")) return false;
@@ -526,15 +624,24 @@ public final class WalletLoginTransactionStore {
   public record Binding(String realmId, String clientId, String rootSessionId, String tabId,
       String redirectUri, String canonicalOrigin) {}
   public record IssuedTransaction(String handle, String challenge, String csrfToken, java.time.Instant expiresAt) {}
-  public record PendingTransaction(Binding binding, String challenge, String csrfToken, Intent intent) {
+  public record PendingTransaction(Binding binding, String challenge, String csrfToken, Intent intent,
+      String accountAction, String accountRequestId, String accountRequestJti, String accountRequestExpires) {
+    public PendingTransaction(Binding binding, String challenge, String csrfToken, Intent intent) {
+      this(binding, challenge, csrfToken, intent, null, null, null, null);
+    }
     public PendingTransaction(Binding binding, String challenge, String csrfToken) {
-      this(binding, challenge, csrfToken, Intent.LOGIN);
+      this(binding, challenge, csrfToken, Intent.LOGIN, null, null, null, null);
     }
   }
   public record AcceptedTransaction(String identityId, String publicKey, String proofDigest,
-      Binding binding, Intent intent) {
+      Binding binding, Intent intent, String accountAction, String accountRequestId,
+      String accountRequestJti, String accountRequestExpires) {
+    public AcceptedTransaction(String identityId, String publicKey, String proofDigest,
+        Binding binding, Intent intent) {
+      this(identityId, publicKey, proofDigest, binding, intent, null, null, null, null);
+    }
     public AcceptedTransaction(String identityId, String publicKey, String proofDigest, Binding binding) {
-      this(identityId, publicKey, proofDigest, binding, Intent.LOGIN);
+      this(identityId, publicKey, proofDigest, binding, Intent.LOGIN, null, null, null, null);
     }
   }
 }

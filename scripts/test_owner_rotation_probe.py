@@ -237,15 +237,16 @@ class OwnerRotationProbeTest(unittest.TestCase):
         'src/main/java/org/decentwallet/keycloak/wallet/WalletChallengeAuthenticator.java').read_text()
     java_action = source[source.index('public void action('):source.index('static boolean isSingleExactHttpsRedirect')]
     self.assertIn('initialAuthSession.setClientNote', java_action)
-    self.assertIn('authSession.setAuthNote(SIGNUP_AUTH_NOTE', source)
+    self.assertIn('authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION)', source)
+    self.assertIn('authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED)', source)
     self.assertIn('context.resetFlow(() -> initialAuthSession.setClientNote', java_action)
     self.assertNotIn("'prompt': 'create'", helper)
 
   def test_authenticate_uses_signup_intent_from_authentication_session_client_note(self):
     java = Path(__file__).parents[1].joinpath(
         'src/main/java/org/decentwallet/keycloak/wallet/WalletChallengeAuthenticator.java').read_text()
-    self.assertIn('"signup".equals(authSession.getClientNote(SIGNUP_AUTH_NOTE))', java)
-    self.assertIn('authSession.setAuthNote(SIGNUP_AUTH_NOTE, "signup")', java)
+    self.assertIn('"signup".equals(legacySignupNote)', java)
+    self.assertIn('authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED)', java)
     self.assertIn('store.issue(binding, signupIntent', java)
 
   def test_live_entry_point_runs_rotation_with_separate_mapped_identity(self):

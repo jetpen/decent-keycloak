@@ -117,8 +117,10 @@ def test_live_account_denial_checks_proof_and_status_response_disclosures():
 
 def test_account_policy_request_id_is_derived_from_opaque_handle():
   source = PROBE.read_text()
+  handler = (ROOT / "src/main/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandler.java").read_text()
   assert "hashlib.sha256(handle.encode('ascii')).hexdigest()[:32]" in source
-  assert "Wallet account policy rejected proof (request=%s, signup=%s" in (ROOT / "src/main/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandler.java").read_text()
+  assert "} else if (intent == WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP)" in handler
+  assert "Wallet account policy rejected proof (request=%s, signup=true" in handler
 
 
 def test_latest_e2e_summary_does_not_claim_unqualified_scenarios_passed():

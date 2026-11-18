@@ -108,8 +108,31 @@ public final class WalletLoginTransportResource implements RealmResourceProvider
     WalletLoginTransactionStore.Binding binding = new WalletLoginTransactionStore.Binding(
         realm.getId(), client.getId(), auth.getParentSession().getId(), auth.getTabId(),
         redirect, auth.getAuthNote("decent.wallet.origin"));
-    var pending = handler.pendingTransaction(handle, binding);
-    if (pending == null || pending.intent() != WalletLoginTransactionStore.Intent.SIGNUP
+    String action = auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION);
+    String requestId = auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID);
+    String requestJti = auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI);
+    String expiresAt = auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES);
+    if (action != null) {
+      if (!"true".equals(auth.getAuthNote("decent.wallet.account.signed"))
+          || !action.equals(auth.getClientNote(
+              org.keycloak.protocol.oidc.endpoints.AuthorizationEndpoint.LOGIN_SESSION_NOTE_ADDITIONAL_REQ_PARAMS_PREFIX
+                  + WalletAccountRequestExecutor.ACTION_PARAM))
+          || !action.equals(auth.getAuthNote("decent.wallet.intent"))
+          || auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID) == null
+          || auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI) == null
+          || auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES) == null) return null;
+      var pending = handler.pendingTransaction(handle, binding);
+      WalletLoginTransactionStore.Intent expectedIntent = WalletAccountRequestExecutor.intentForAction(action);
+      if (pending == null || pending.intent() != expectedIntent
+          || !action.equals(pending.accountAction())
+          || !requestId.equals(pending.accountRequestId())
+          || !requestJti.equals(pending.accountRequestJti())
+          || !expiresAt.equals(pending.accountRequestExpires())
+          || !realm.isRegistrationAllowed()) return null;
+      return expectedIntent;
+    }
+    var legacyPending = handler.pendingTransaction(handle, binding);
+    if (legacyPending == null || legacyPending.intent() != WalletLoginTransactionStore.Intent.SIGNUP
         || !realm.isRegistrationAllowed()) return null;
     return WalletLoginTransactionStore.Intent.SIGNUP;
   }

@@ -182,22 +182,32 @@ public final class WalletLoginTransportHandler {
     if (accounts == null) return HttpResult.empty(503);
     WalletLoginTransactionStore.Intent intent = pending.get().intent();
     try {
-      boolean mapped = accounts.hasUniqueEnabledUser(proof.identityId());
-      if (!mapped) {
-        LOG.debugf("Wallet account policy lookup started (signup=%s, registration-enabled=%s)",
-            intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup);
+      WalletLoginAccountResolver.Lookup mapping = accounts.lookupExact(proof.identityId());
+      if (mapping == WalletLoginAccountResolver.Lookup.UNAVAILABLE
+          || mapping == WalletLoginAccountResolver.Lookup.AMBIGUOUS) {
+        return HttpResult.empty(503);
+      }
+      if (mapping == WalletLoginAccountResolver.Lookup.DISABLED) return HttpResult.empty(403);
+      if (mapping == WalletLoginAccountResolver.Lookup.ABSENT) {
         boolean occupied = accounts.hasUniqueMappedUserIncludingDisabled(proof.identityId());
-        LOG.debugf("Wallet account policy occupancy observed (occupied=%s)", occupied);
-        if (intent != WalletLoginTransactionStore.Intent.SIGNUP || !acceptSignup || occupied) {
-          LOG.debugf("Wallet account policy rejected proof (request=%s, signup=%s, registered=%s, occupied=%s)",
-              requestId, intent == WalletLoginTransactionStore.Intent.SIGNUP, acceptSignup, occupied);
+        if (intent != WalletLoginTransactionStore.Intent.SIGNUP
+            && intent != WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP) {
           return HttpResult.empty(403);
         }
+        if (!acceptSignup || occupied) return HttpResult.empty(403);
         try (WalletRequestCorrelation.Scope ignored = WalletRequestCorrelation.open(requestId)) {
           org.keycloak.models.UserModel provisioned = accounts.ensureEnabledUser(proof.identityId());
           if (provisioned == null || !provisioned.isEnabled()) return HttpResult.empty(503);
-          if (!accounts.hasUniqueEnabledUser(proof.identityId())) return HttpResult.empty(503);
+          if (accounts.lookupExact(proof.identityId()) != WalletLoginAccountResolver.Lookup.ENABLED) {
+            return HttpResult.empty(503);
+          }
         }
+      } else if (intent == WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP) {
+        LOG.debugf("Wallet account policy rejected proof (request=%s, signup=true, registered=%s, occupied=true)",
+            requestId, acceptSignup);
+        return HttpResult.empty(403);
+      } else if (intent == WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY) {
+        LOG.debugf("Wallet account recovery policy accepted existing enabled identity (request=%s)", requestId);
       }
     } catch (Exception unavailable) {
       LOG.warnf("Wallet account mapping lookup unavailable (request=%s, %s)", requestId, unavailable.getClass().getSimpleName());
@@ -219,8 +229,7 @@ public final class WalletLoginTransportHandler {
     String digest = hex(sha256(body));
     try {
       transactions.markAccepted(handle, binding, digest, proof.identityId(),
-          Base64.getUrlEncoder().withoutPadding().encodeToString(identity.publicKey()), consumed.get().csrfToken(),
-          consumed.get().intent());
+          Base64.getUrlEncoder().withoutPadding().encodeToString(identity.publicKey()), consumed.get());
     } catch (RuntimeException ex) {
       // Nonce is consumed; no OIDC result unless its separate accepted receipt persists.
       LOG.warnf("Wallet proof acceptance unavailable (request=%s, outcome=not_accepted)", requestId);

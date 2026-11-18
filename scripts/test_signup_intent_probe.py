@@ -631,7 +631,7 @@ class SignupIntentProbeTest(unittest.TestCase):
     prior = ['baseline log']
     current = prior + [
         'DEBUG Wallet account policy lookup started (signup=false, registration-enabled=false)',
-        f'DEBUG Wallet account policy rejected proof (request={first_request}, signup=false, registered=false, occupied=false)',
+        f'DEBUG Wallet account policy rejected proof (request={first_request}, signup=true, registered=false, occupied=true)',
         'DEBUG Wallet account policy occupancy observed (occupied=true)',
         f'DEBUG Wallet account policy rejected proof (request={second_request}, signup=false, registered=false, occupied=true)',
     ]
@@ -720,9 +720,7 @@ class SignupIntentProbeTest(unittest.TestCase):
 
   def test_signup_template_starts_status_polling_for_signup_as_well_as_login(self):
     source = (Path(__file__).parents[1] / 'src/main/resources/theme-resources/templates/wallet-login.ftl').read_text()
-    self.assertIn('if (walletIntent === "login" || walletIntent === "signup") {', source)
-
-
+    assert "if (walletIntent === \"login\" || walletIntent === \"signup\" || walletIntent === \"signup_recovery\") {" in source
   def test_signup_requires_exact_mapping_readback_and_pkce_oidc_completion(self):
     source = Path(__file__).with_name("wallet_login_live_e2e.py").read_text()
     start = source.index("def signup_wallet_flow(")

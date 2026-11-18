@@ -1,0 +1,2 @@
+org.decentwallet.keycloak.wallet.WalletAccountRequestExecutorFactory
+org.keycloak.services.clientpolicy.executor.SecureRequestObjectExecutorFactory
