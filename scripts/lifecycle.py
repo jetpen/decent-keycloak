@@ -694,6 +694,7 @@ def run_python_tests() -> int:
   with tempfile.TemporaryDirectory(prefix="decent-keycloak-tests-") as temporary:
     run_dir = Path(temporary)
     install_dir = run_dir / "site-packages"
+    oidc_install_dir = run_dir / "oidc-site-packages"
     sources = run_dir / "resolver-sources"
     env = dict(os.environ)
     env["PIP_CACHE_DIR"] = str(run_dir / "pip-cache")
@@ -703,6 +704,8 @@ def run_python_tests() -> int:
       [sys.executable, "container/verify_resolver_runtime_inputs.py", "--sources", str(sources)],
       [sys.executable, "-m", "pip", "install", "--require-hashes", "--no-compile",
        "--target", str(install_dir), "-r", "container/resolver-requirements.lock.txt"],
+      [sys.executable, "-m", "pip", "install", "--require-hashes", "--no-compile",
+       "--target", str(oidc_install_dir), "-r", "requirements/issue8-oidc.lock"],
     )
     for command in commands:
       result = run(command, env=env)
@@ -716,7 +719,7 @@ def run_python_tests() -> int:
     if result:
       return result
     env = dict(os.environ)
-    source_paths = [str(install_dir), str(sources / "identity/src"), str(sources / "registry/src")]
+    source_paths = [str(oidc_install_dir), str(install_dir), str(sources / "identity/src"), str(sources / "registry/src")]
     env["PYTHONPATH"] = os.pathsep.join(source_paths + [env.get("PYTHONPATH", "")])
     suite = [sys.executable, "-m", "unittest", *PYTHON_TESTS, "-q"]
     return run(suite, env=env)

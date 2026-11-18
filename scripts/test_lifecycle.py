@@ -35,6 +35,27 @@ class LifecycleCliTest(unittest.TestCase):
   def test_issue61_native_role_contract_is_in_canonical_python_suite(self):
     self.assertIn("scripts.test_issue61_native_roles", lifecycle.PYTHON_TESTS)
 
+  def test_issue8_oidc_lock_is_installed_in_isolated_suite_environment(self):
+    with mock.patch.object(lifecycle, "run", return_value=0) as run:
+      self.assertEqual(0, lifecycle.run_python_tests())
+
+    calls = run.call_args_list
+    commands = [call.args[0] for call in calls]
+    oidc_install_index = next(
+        index for index, command in enumerate(commands)
+        if command[-1:] == ["requirements/issue8-oidc.lock"]
+    )
+    oidc_install = commands[oidc_install_index]
+    self.assertIn("--require-hashes", oidc_install)
+    self.assertIn("--no-compile", oidc_install)
+    self.assertLess(oidc_install_index, len(commands) - 1)
+
+    suite_call = calls[-1]
+    self.assertIn("scripts.test_issue8_oidc", suite_call.args[0])
+    oidc_site_packages = oidc_install[oidc_install.index("--target") + 1]
+    suite_pythonpath = suite_call.kwargs["env"]["PYTHONPATH"].split(lifecycle.os.pathsep)
+    self.assertEqual(oidc_site_packages, suite_pythonpath[0])
+
   def test_java_21_detection_accepts_any_java_21_patch_and_rejects_other_majors(self):
     self.assertTrue(lifecycle.java_21_runtime("openjdk version \"21.0.13\" 2026-10-20\n"))
     self.assertTrue(lifecycle.java_21_runtime("openjdk version \"21\" 2026-10-20\n"))

@@ -641,26 +641,32 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertNotIn("LAST_PROCESSED_EXECUTION", body)
     self.assertIn("context.getActionUrl(accessCode)", body)
 
-  def test_issue8_evidence_ledger_maps_all_criteria_and_keeps_live_gates_open(self):
+  def test_issue8_ledger_matches_the_narrow_offline_scope_and_hands_live_gates_to_child(self):
     doc = README.parent / "docs/acceptance/issue-8-tls-browser-wallet-oidc.md"
     self.assertIn("docs/acceptance/issue-8-tls-browser-wallet-oidc.md", README.read_text())
     text = doc.read_text()
-    gate_rows = {
-        line.split("|")[1].strip()
-        for line in text.splitlines()
-        if line.startswith("| issue8-")
-    }
-    self.assertEqual({
-        "issue8-material-and-tls",
-        "issue8-browser-and-consent",
-        "issue8-signer-and-native-transport",
-        "issue8-browser-callback-and-pkce",
-        "issue8-oidc-validation",
-        "issue8-negative-matrix",
-        "issue8-sanitized-versioned-evidence",
-    }, gate_rows)
-    self.assertIn("**Live E2E qualification:** `not_run`", text)
-    self.assertIn("Wallet #64 is closed", text)
-    self.assertIn("[Wallet PR #65]", text)
-    self.assertIn("merged at `a385ac60aa89f251b7f997f514e75e21d8eab68f`", text)
-    self.assertIn("`adb devices -l` returned no attached devices", text)
+    self.assertIn("Keycloak #8: Implement and offline-verify Keycloak wallet login", text)
+    self.assertIn("**Scope:** provider implementation and deterministic offline/loopback verification only.", text)
+    self.assertIn("https://github.com/jetpen/decent-keycloak/issues/66", text)
+    self.assertIn("https://github.com/jetpen/decent-wallet/issues/80", text)
+    self.assertIn("closed, narrowed [Wallet #66 foundation]", text)
+    self.assertIn("Keycloak #66 owns residual live TLS/browser/native-wallet/OIDC qualification", text)
+
+    criteria_rows = [line for line in text.splitlines() if line.startswith("| [")]
+    self.assertEqual(4, len(criteria_rows))
+    self.assertEqual(["| [x] |"] * 4, [
+        "| " + line.split("|", 2)[1].strip() + " |" for line in criteria_rows
+    ])
+    self.assertIn("`requirements/issue8-oidc.lock`", text)
+    self.assertIn("--require-hashes", text)
+    self.assertIn("isolated suite environment", text)
+    self.assertIn("synthetic", text)
+    self.assertIn("or qualify a real issuer, client, device, browser, or relying party", text)
+    self.assertIn("No live gate is promoted from APK configuration, synthetic tests, or offline receipts.", text)
+    self.assertIn("canonical offline lifecycle", text)
+    self.assertIn("not commit-bound", text)
+    self.assertNotIn("| issue8-material-and-tls |", text)
+    self.assertNotIn("| issue8-browser-and-consent |", text)
+    self.assertNotIn("| issue8-signer-and-native-transport |", text)
+    self.assertNotIn("| issue8-negative-matrix |", text)
+    self.assertNotIn("already-authorized disposable run window", text)
