@@ -865,7 +865,50 @@ final class WalletLoginTransportHandlerTest {
     }
   }
 
-  private static org.keycloak.protocol.oidc.endpoints.request.AuthorizationEndpointRequest
+  static void configureSignedRequestParser(org.keycloak.models.KeycloakSession session, KeyPair keyPair) {
+    var sessionAttributes = new java.util.concurrent.ConcurrentHashMap<String, Object>();
+    org.mockito.Mockito.doAnswer(invocation -> {
+      sessionAttributes.put(invocation.getArgument(0), invocation.getArgument(1));
+      return null;
+    }).when(session).setAttribute(org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.any());
+    when(session.getAttribute(org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.eq(JsonNode.class))).thenAnswer(invocation ->
+            JsonNode.class.cast(sessionAttributes.get(invocation.getArgument(0))));
+    when(session.tokens()).thenReturn(new org.keycloak.jose.jws.DefaultTokenManager(session));
+    when(session.getProvider(org.keycloak.keys.PublicKeyStorageProvider.class)).thenReturn(
+        new TestClientPublicKeyStorage(keyWrapper(keyPair, "registered-rp-key")));
+    when(session.getProvider(org.keycloak.crypto.ClientSignatureVerifierProvider.class, "ES256"))
+        .thenReturn(new TestClientSignatureVerifierProvider(
+            keyWrapper(keyPair, "registered-rp-key")));
+    var oidcScope = mock(org.keycloak.Config.Scope.class);
+    var oidcCache = new org.keycloak.cache.LocalCache<String, Integer>() {
+      @Override public Integer get(String key) {
+        return 4000;
+      }
+      @Override public void put(String key, Integer value) { }
+      @Override public void invalidate(String key) { }
+      @Override public void close() { }
+    };
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_NUMBER, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_NUMBER)).thenReturn(20);
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_REQ_PARAMS_DEFAULT_MAX_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_REQ_PARAMS_DEFAULT_MAX_SIZE)).thenReturn(4000);
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_SIZE)).thenReturn(4096);
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_OVERALL_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_OVERALL_SIZE)).thenReturn(8192);
+    var oidcConfig = new org.keycloak.protocol.oidc.OIDCProviderConfig(oidcScope, oidcCache, oidcCache);
+    var oidcProtocol = new org.keycloak.protocol.oidc.OIDCLoginProtocol(oidcConfig);
+    when(session.getProvider(org.keycloak.protocol.LoginProtocol.class, "openid-connect"))
+        .thenReturn(oidcProtocol);
+  }
+
+  static org.keycloak.protocol.oidc.endpoints.request.AuthorizationEndpointRequest
       parseAuthorizationRequest(org.keycloak.models.KeycloakSession session,
           org.keycloak.models.ClientModel client,
           jakarta.ws.rs.core.MultivaluedMap<String, String> parameters) {
@@ -920,46 +963,7 @@ final class WalletLoginTransportHandlerTest {
     String compact = signedRequestObject(payload, keyPair, "registered-rp-key");
     var store = new MemoryStore();
     when(session.singleUseObjects()).thenReturn(store);
-    var sessionAttributes = new java.util.concurrent.ConcurrentHashMap<String, Object>();
-    org.mockito.Mockito.doAnswer(invocation -> {
-      sessionAttributes.put(invocation.getArgument(0), invocation.getArgument(1));
-      return null;
-    }).when(session).setAttribute(org.mockito.ArgumentMatchers.anyString(),
-        org.mockito.ArgumentMatchers.any());
-    when(session.getAttribute(org.mockito.ArgumentMatchers.anyString(),
-        org.mockito.ArgumentMatchers.eq(JsonNode.class))).thenAnswer(invocation ->
-            JsonNode.class.cast(sessionAttributes.get(invocation.getArgument(0))));
-    when(session.tokens()).thenReturn(new org.keycloak.jose.jws.DefaultTokenManager(session));
-    when(session.getProvider(org.keycloak.keys.PublicKeyStorageProvider.class)).thenReturn(
-        new TestClientPublicKeyStorage(keyWrapper(keyPair, "registered-rp-key")));
-    when(session.getProvider(org.keycloak.crypto.ClientSignatureVerifierProvider.class, "ES256"))
-        .thenReturn(new TestClientSignatureVerifierProvider(
-            keyWrapper(keyPair, "registered-rp-key")));
-    var oidcScope = mock(org.keycloak.Config.Scope.class);
-    var oidcCache = new org.keycloak.cache.LocalCache<String, Integer>() {
-      @Override public Integer get(String key) {
-        return 4000;
-      }
-      @Override public void put(String key, Integer value) { }
-      @Override public void invalidate(String key) { }
-      @Override public void close() { }
-    };
-    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
-        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_NUMBER, org.keycloak.protocol.oidc.OIDCProviderConfig
-            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_NUMBER)).thenReturn(20);
-    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
-        .CONFIG_OIDC_REQ_PARAMS_DEFAULT_MAX_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
-            .DEFAULT_REQ_PARAMS_DEFAULT_MAX_SIZE)).thenReturn(4000);
-    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
-        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
-            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_SIZE)).thenReturn(4096);
-    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
-        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_OVERALL_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
-            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_OVERALL_SIZE)).thenReturn(8192);
-    var oidcConfig = new org.keycloak.protocol.oidc.OIDCProviderConfig(oidcScope, oidcCache, oidcCache);
-    var oidcProtocol = new org.keycloak.protocol.oidc.OIDCLoginProtocol(oidcConfig);
-    when(session.getProvider(org.keycloak.protocol.LoginProtocol.class, "openid-connect"))
-        .thenReturn(oidcProtocol);
+    configureSignedRequestParser(session, keyPair);
     var keycloakContext = mock(org.keycloak.models.KeycloakContext.class);
     when(session.getContext()).thenReturn(keycloakContext);
     when(keycloakContext.getUri()).thenReturn(uriInfo);
@@ -2973,7 +2977,7 @@ final class WalletLoginTransportHandlerTest {
     assertTrue(store.takeAccepted(issued.handle(), BINDING).isEmpty());
   }
 
-  private static byte[] signedProof(String challenge, String identity, KeyPair keyPair) throws Exception {
+  static byte[] signedProof(String challenge, String identity, KeyPair keyPair) throws Exception {
     Map<String, Object> signed = new LinkedHashMap<>();
     signed.put("profile", WalletLoginProof.PROFILE);
     signed.put("challenge", challenge);
@@ -2988,7 +2992,7 @@ final class WalletLoginTransportHandlerTest {
         .getBytes(StandardCharsets.UTF_8);
   }
 
-  private static String signedRequestObject(JsonNode payload, KeyPair keyPair, String kid) throws Exception {
+  static String signedRequestObject(JsonNode payload, KeyPair keyPair, String kid) throws Exception {
     var signer = new org.keycloak.crypto.SignatureSignerContext() {
       @Override public String getKid() { return kid; }
       @Override public String getAlgorithm() { return "ES256"; }
@@ -3159,7 +3163,7 @@ final class WalletLoginTransportHandlerTest {
     }
   }
 
-  private static byte[] rawKey(KeyPair pair) {
+  static byte[] rawKey(KeyPair pair) {
     byte[] encoded = pair.getPublic().getEncoded();
     return java.util.Arrays.copyOfRange(encoded, encoded.length - 32, encoded.length);
   }
@@ -3304,8 +3308,9 @@ final class WalletLoginTransportHandlerTest {
     }
   }
 
-  private static class MemoryStore implements SingleUseObjectProvider {
+  static class MemoryStore implements SingleUseObjectProvider {
     private final Map<String, Map<String, String>> entries = new java.util.concurrent.ConcurrentHashMap<>();
+    java.util.Set<String> storedKeys() { return java.util.Set.copyOf(entries.keySet()); }
     private boolean failClaimAfterFirst;
     private int claims;
     @Override public void put(String key, long lifespanSeconds, Map<String, String> notes) { entries.put(key, Map.copyOf(notes)); }
