@@ -834,6 +834,249 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void signupRecoveryNeverProvisionsWhenExactMappingIsNotEnabled() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    String identity = "mailto:recovery-policy@example.org";
+    var cases = Map.of(
+        WalletLoginAccountResolver.Lookup.ABSENT, 403,
+        WalletLoginAccountResolver.Lookup.DISABLED, 403,
+        WalletLoginAccountResolver.Lookup.AMBIGUOUS, 503);
+    for (var scenario : cases.entrySet()) {
+      var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(),
+          Clock.systemUTC());
+      var recovery = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY,
+          "signup_recovery", "AbCdEfGhIjKlMnOpQrStVw", "recovery-policy-jti",
+          Clock.systemUTC().instant().plusSeconds(240));
+      var accounts = mock(WalletLoginAccountResolver.class);
+      when(accounts.lookupExact(identity)).thenReturn(scenario.getKey());
+      var handler = new WalletLoginTransportHandler(store, exact ->
+          new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+          IDP_ORIGIN, accounts, true);
+
+      var result = handler.submitProof(recovery.handle(), null, null, null, null, "application/json", null,
+          signedProof(recovery.challenge(), identity, keyPair), IDP_ORIGIN);
+
+      verify(accounts).lookupExact(identity);
+      verify(accounts, org.mockito.Mockito.never()).ensureEnabledUser(org.mockito.ArgumentMatchers.anyString());
+      assertEquals(scenario.getValue().intValue(), result.status(), scenario.getKey().name());
+      assertTrue(store.load(recovery.handle()).isPresent());
+      assertTrue(store.getAccepted(recovery.handle(), BINDING).isEmpty());
+      assertFalse(store.callbackGateAvailable(recovery.handle(), BINDING));
+    }
+  }
+
+  private static org.keycloak.protocol.oidc.endpoints.request.AuthorizationEndpointRequest
+      parseAuthorizationRequest(org.keycloak.models.KeycloakSession session,
+          org.keycloak.models.ClientModel client,
+          jakarta.ws.rs.core.MultivaluedMap<String, String> parameters) {
+    // This fixture does not use Keycloak's preview parameterized-scopes feature.
+    // Stub the feature check on this thread instead of resetting the JVM-wide profile.
+    try (var profile = org.mockito.Mockito.mockStatic(org.keycloak.common.Profile.class)) {
+      profile.when(() -> org.keycloak.common.Profile.isFeatureEnabled(
+          org.keycloak.common.Profile.Feature.PARAMETERIZED_SCOPES)).thenReturn(false);
+      return org.keycloak.protocol.oidc.endpoints.request.AuthorizationEndpointRequestParserProcessor
+          .parseRequest(mock(org.keycloak.events.EventBuilder.class), session, client, parameters,
+              org.keycloak.protocol.oidc.endpoints.request.AuthorizationEndpointRequestParserProcessor
+                  .EndpointType.OIDC_AUTH_ENDPOINT);
+    }
+  }
+
+  @Test
+  void keycloakAuthorizationParserBindsSignedActionsFromDirectRequestAndStoredPar() throws Exception {
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var uriInfo = mock(org.keycloak.models.KeycloakUriInfo.class);
+    var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var mapper = new ObjectMapper();
+    long now = java.time.Instant.now().getEpochSecond();
+    var requestId = "AbCdEfGhIjKlMnOpQrStVw";
+    var payload = mapper.createObjectNode();
+    payload.put("iss", "rp-client");
+    payload.put("client_id", "rp-client");
+    payload.put("aud", "https://idp.example/realms/demo");
+    payload.put("response_type", "code");
+    payload.put("response_mode", "query");
+    payload.put("redirect_uri", "https://site.example/callback");
+    payload.put("scope", "openid");
+    payload.put("state", "state-direct-12345678901234567890");
+    payload.put("nonce", "nonce-direct-12345678901234567890");
+    payload.put("code_challenge", "abcdefghijklmnopqrstuvwxyz0123456789-ABCDEFG");
+    payload.put("code_challenge_method", "S256");
+    payload.put("iat", now);
+    payload.put("exp", now + 180);
+    payload.put("jti", "request-jti-direct-parser-1");
+    payload.put(WalletAccountRequestExecutor.ACTION_PARAM, "signup");
+    var extension = payload.putObject(WalletAccountRequestExecutor.REQUEST_PARAM);
+    extension.put("profile", "decent-account-disclosure-v1");
+    extension.put("request_id", requestId);
+    extension.put("purpose", "Create a site account");
+    extension.putArray("claims").addObject().put("id", "urn:decent:account:v1:email")
+        .put("required", false);
+
+    var signingKey = KeyPairGenerator.getInstance("EC");
+    signingKey.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"));
+    var keyPair = signingKey.generateKeyPair();
+    String compact = signedRequestObject(payload, keyPair, "registered-rp-key");
+    var store = new MemoryStore();
+    when(session.singleUseObjects()).thenReturn(store);
+    var sessionAttributes = new java.util.concurrent.ConcurrentHashMap<String, Object>();
+    org.mockito.Mockito.doAnswer(invocation -> {
+      sessionAttributes.put(invocation.getArgument(0), invocation.getArgument(1));
+      return null;
+    }).when(session).setAttribute(org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.any());
+    when(session.getAttribute(org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.eq(JsonNode.class))).thenAnswer(invocation ->
+            JsonNode.class.cast(sessionAttributes.get(invocation.getArgument(0))));
+    when(session.tokens()).thenReturn(new org.keycloak.jose.jws.DefaultTokenManager(session));
+    when(session.getProvider(org.keycloak.keys.PublicKeyStorageProvider.class)).thenReturn(
+        new TestClientPublicKeyStorage(keyWrapper(keyPair, "registered-rp-key")));
+    when(session.getProvider(org.keycloak.crypto.ClientSignatureVerifierProvider.class, "ES256"))
+        .thenReturn(new TestClientSignatureVerifierProvider(
+            keyWrapper(keyPair, "registered-rp-key")));
+    var oidcScope = mock(org.keycloak.Config.Scope.class);
+    var oidcCache = new org.keycloak.cache.LocalCache<String, Integer>() {
+      @Override public Integer get(String key) {
+        return 4000;
+      }
+      @Override public void put(String key, Integer value) { }
+      @Override public void invalidate(String key) { }
+      @Override public void close() { }
+    };
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_NUMBER, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_NUMBER)).thenReturn(20);
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_REQ_PARAMS_DEFAULT_MAX_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_REQ_PARAMS_DEFAULT_MAX_SIZE)).thenReturn(4000);
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_SIZE)).thenReturn(4096);
+    when(oidcScope.getInt(org.keycloak.protocol.oidc.OIDCLoginProtocolFactory
+        .CONFIG_OIDC_ADD_REQ_PARAMS_MAX_OVERALL_SIZE, org.keycloak.protocol.oidc.OIDCProviderConfig
+            .DEFAULT_ADDITIONAL_REQ_PARAMS_MAX_OVERALL_SIZE)).thenReturn(8192);
+    var oidcConfig = new org.keycloak.protocol.oidc.OIDCProviderConfig(oidcScope, oidcCache, oidcCache);
+    var oidcProtocol = new org.keycloak.protocol.oidc.OIDCLoginProtocol(oidcConfig);
+    when(session.getProvider(org.keycloak.protocol.LoginProtocol.class, "openid-connect"))
+        .thenReturn(oidcProtocol);
+    var keycloakContext = mock(org.keycloak.models.KeycloakContext.class);
+    when(session.getContext()).thenReturn(keycloakContext);
+    when(keycloakContext.getUri()).thenReturn(uriInfo);
+    when(keycloakContext.getRealm()).thenReturn(realm);
+    when(uriInfo.getBaseUri()).thenReturn(java.net.URI.create("https://idp.example/"));
+    when(realm.getName()).thenReturn("demo");
+    when(realm.getId()).thenReturn("realm-id");
+    var parPolicy = mock(org.keycloak.models.ParConfig.class);
+    when(realm.getParPolicy()).thenReturn(parPolicy);
+    when(parPolicy.getRequestUriLifespan()).thenReturn(600);
+    when(client.getClientId()).thenReturn("rp-client");
+    when(client.getId()).thenReturn("client-id");
+    when(client.getRealm()).thenReturn(realm);
+    when(client.isEnabled()).thenReturn(true);
+    when(client.getRedirectUris()).thenReturn(java.util.Set.of("https://site.example/callback"));
+    when(client.getAttribute(org.keycloak.protocol.oidc.OIDCConfigAttributes.REQUEST_OBJECT_SIGNATURE_ALG))
+        .thenReturn("ES256");
+    when(client.getAttribute(org.keycloak.protocol.oidc.OIDCConfigAttributes.REQUEST_OBJECT_REQUIRED))
+        .thenReturn(org.keycloak.protocol.oidc.OIDCConfigAttributes
+            .REQUEST_OBJECT_REQUIRED_REQUEST_OR_REQUEST_URI);
+    when(auth.getClient()).thenReturn(client);
+
+    var testTransactionManager = mock(org.keycloak.models.KeycloakTransactionManager.class);
+    when(session.getTransactionManager()).thenReturn(testTransactionManager);
+    var testLoginForms = mock(org.keycloak.forms.login.LoginFormsProvider.class);
+    when(session.getProvider(org.keycloak.forms.login.LoginFormsProvider.class)).thenReturn(testLoginForms);
+    when(testLoginForms.setAuthenticationSession(org.mockito.ArgumentMatchers.any())).thenReturn(testLoginForms);
+    org.mockito.Mockito.doReturn(testLoginForms).when(testLoginForms).setError(
+        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.<Object[]>any());
+    when(testLoginForms.createErrorPage(org.mockito.ArgumentMatchers.any())).thenReturn(Response.status(400).build());
+    var unsignedActionParameters = new jakarta.ws.rs.core.MultivaluedHashMap<String, String>();
+    unsignedActionParameters.add("client_id", "rp-client");
+    unsignedActionParameters.add("request", compact);
+    unsignedActionParameters.add(WalletAccountRequestExecutor.ACTION_PARAM, "signup_recovery");
+    var parsedWithOuterAction = parseAuthorizationRequest(session, client, unsignedActionParameters);
+    assertEquals("signup",
+        parsedWithOuterAction.getAdditionalReqParams().get(WalletAccountRequestExecutor.ACTION_PARAM),
+        "the Request Object value, not the unsigned query value, must control the parsed action");
+    var unsignedContext = new org.keycloak.services.clientpolicy.context.AuthorizationRequestContext(
+        mock(org.keycloak.protocol.oidc.utils.OIDCResponseType.class), parsedWithOuterAction,
+        "https://site.example/callback", unsignedActionParameters, auth);
+    var executor = new WalletAccountRequestExecutor(session);
+    var policy = new WalletAccountRequestExecutor.Configuration();
+    policy.setEnabled(true);
+    executor.setupConfiguration(policy);
+    var rejection = assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class,
+        () -> executor.executeOnEvent(unsignedContext),
+        "an outer unsigned account-action selector must be rejected");
+    assertEquals("Account request fields are allowed only inside the signed Request Object",
+        rejection.getErrorDetail());
+    verify(auth, org.mockito.Mockito.never()).setAuthNote(
+        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString());
+
+    var directParameters = new jakarta.ws.rs.core.MultivaluedHashMap<String, String>();
+    directParameters.add("client_id", "rp-client");
+    directParameters.add("request", compact);
+    directParameters.add("state", "unsigned-outer-state-must-not-win");
+    var direct = parseAuthorizationRequest(session, client, directParameters);
+    assertEquals("rp-client", direct.getClientId());
+    assertEquals("state-direct-12345678901234567890", direct.getState());
+    assertEquals("nonce-direct-12345678901234567890", direct.getNonce());
+    assertEquals("https://site.example/callback", direct.getRedirectUri());
+    assertEquals("code", direct.getResponseType());
+    assertEquals("signup", direct.getAdditionalReqParams().get(WalletAccountRequestExecutor.ACTION_PARAM));
+    assertEquals(payload.get(WalletAccountRequestExecutor.REQUEST_PARAM).toString(),
+        direct.getAdditionalReqParams().get(WalletAccountRequestExecutor.REQUEST_PARAM),
+        "Keycloak flattens nested signed claims into the additional-parameter map");
+    var directContext = new org.keycloak.services.clientpolicy.context.AuthorizationRequestContext(
+        mock(org.keycloak.protocol.oidc.utils.OIDCResponseType.class), direct,
+        "https://site.example/callback", directParameters, auth);
+    executor.executeOnEvent(directContext);
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION, "signup");
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_INTENT, "ACCOUNT_SIGNUP");
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED, "true");
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES, Long.toString(now + 180));
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID, requestId);
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI, "request-jti-direct-parser-1");
+
+    var parUri = org.keycloak.protocol.oidc.par.endpoints.ParEndpoint.REQUEST_URI_PREFIX + "parser-par-once";
+    var parValues = new java.util.HashMap<String, String>();
+    var parRequestClaims = payload.deepCopy();
+    parRequestClaims.put(WalletAccountRequestExecutor.ACTION_PARAM, "signup_recovery");
+    parRequestClaims.put("state", "state-par-12345678901234567890");
+    parRequestClaims.put("nonce", "nonce-par-12345678901234567890");
+    parRequestClaims.put("code_challenge", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-abcdefg");
+    parRequestClaims.put("jti", "request-jti-par-parser-2");
+    ((com.fasterxml.jackson.databind.node.ObjectNode) parRequestClaims
+        .get(WalletAccountRequestExecutor.REQUEST_PARAM)).put("request_id", "AbCdEfGhIjKlMnOpQrStXw");
+    String parCompact = signedRequestObject(parRequestClaims, keyPair, "registered-rp-key");
+    parValues.put("request", parCompact);
+    parValues.put(org.keycloak.protocol.oidc.par.endpoints.ParEndpoint.PAR_CLIENT_ID, "rp-client");
+    parValues.put(org.keycloak.protocol.oidc.par.endpoints.ParEndpoint.PAR_CREATED_TIME,
+        Long.toString(System.currentTimeMillis()));
+    String parKey = org.keycloak.protocol.oidc.par.endpoints.ParEndpoint.buildCacheKey("realm-id", "parser-par-once");
+    store.put(parKey, 600, parValues);
+    var parParameters = new jakarta.ws.rs.core.MultivaluedHashMap<String, String>();
+    parParameters.add("client_id", "rp-client");
+    parParameters.add("request_uri", parUri);
+    var pushed = parseAuthorizationRequest(session, client, parParameters);
+    assertEquals("signup_recovery", pushed.getAdditionalReqParams().get(WalletAccountRequestExecutor.ACTION_PARAM));
+    assertEquals("state-par-12345678901234567890", pushed.getState());
+    assertEquals("nonce-par-12345678901234567890", pushed.getNonce());
+    var recoveryAuth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    when(recoveryAuth.getClient()).thenReturn(client);
+    var parContext = new org.keycloak.services.clientpolicy.context.AuthorizationRequestContext(
+        mock(org.keycloak.protocol.oidc.utils.OIDCResponseType.class), pushed,
+        "https://site.example/callback", parParameters, recoveryAuth);
+    executor.executeOnEvent(parContext);
+    verify(recoveryAuth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION, "signup_recovery");
+    verify(recoveryAuth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_INTENT, "SIGNUP_RECOVERY");
+    verify(recoveryAuth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED, "true");
+    verify(recoveryAuth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES, Long.toString(now + 180));
+    verify(recoveryAuth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID, "AbCdEfGhIjKlMnOpQrStXw");
+    verify(recoveryAuth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI, "request-jti-par-parser-2");
+  }
+
+  @Test
   void signedAccountRequestExecutorRequiresStrictRequestObjectAndBindsOneUseAction() throws Exception {
     var session = mock(org.keycloak.models.KeycloakSession.class);
     var client = mock(org.keycloak.models.ClientModel.class);
