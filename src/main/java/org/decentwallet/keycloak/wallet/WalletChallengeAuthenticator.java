@@ -60,9 +60,28 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
         return;
       }
       var authSession = auth;
-      boolean signupIntent = "signup".equals(authSession.getClientNote(SIGNUP_AUTH_NOTE));
-      if (signupIntent) authSession.removeClientNote(SIGNUP_AUTH_NOTE);
-      if (signupIntent) authSession.setAuthNote(SIGNUP_AUTH_NOTE, "signup");
+      String accountAction = authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION);
+      if (accountAction != null && !"signup".equals(accountAction)
+          && !"signup_recovery".equals(accountAction)) {
+        failClosed(context);
+        return;
+      }
+      String legacySignupNote = authSession.getClientNote(SIGNUP_AUTH_NOTE);
+      boolean signupIntent = accountAction != null || "signup".equals(legacySignupNote);
+      if (accountAction == null && "signup".equals(legacySignupNote)) {
+        authSession.removeClientNote(SIGNUP_AUTH_NOTE);
+        authSession.setAuthNote(SIGNUP_AUTH_NOTE, "signup");
+      }
+      if (accountAction != null) {
+        String requestId = authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID);
+        String requestJti = authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI);
+        String expiresAt = authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES);
+        if (!"true".equals(authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED))
+            || requestId == null || requestJti == null || expiresAt == null) {
+          failClosed(context);
+          return;
+        }
+      }
       if (signupIntent && !context.getRealm().isRegistrationAllowed()) {
         failClosed(context);
         return;
@@ -101,8 +120,14 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
       var binding = new WalletLoginTransactionStore.Binding(
           realm.getId(), client.getId(), rootSessionId, tabId, redirectUri, origin);
       WalletTerminalAuthenticationSession.pruneOnFreshAuthenticate(realm, authSession);
-      var issued = store.issue(binding, signupIntent
-          ? WalletLoginTransactionStore.Intent.SIGNUP : WalletLoginTransactionStore.Intent.LOGIN);
+      var issued = accountAction == null
+          ? store.issue(binding, signupIntent
+              ? WalletLoginTransactionStore.Intent.SIGNUP : WalletLoginTransactionStore.Intent.LOGIN)
+          : store.issue(binding, WalletAccountRequestExecutor.intentForAction(accountAction), accountAction,
+              authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID),
+              authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI),
+              java.time.Instant.ofEpochSecond(Long.parseLong(
+                  authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES))));
       auth.setAuthNote("decent.wallet.handle", issued.handle());
       auth.setAuthNote("decent.wallet.client-id", client.getClientId());
       auth.setAuthNote("decent.wallet.origin", origin);
@@ -137,7 +162,8 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
           .setAttribute("walletOriginLabel", origin)
           .setAttribute("walletSiteLabel", siteName.trim())
           .setAttribute("walletExpiresAt", issued.expiresAt().toString())
-          .setAttribute("walletIntent", signupIntent ? "signup" : "login")
+          .setAttribute("walletIntent", accountAction != null ? accountAction
+              : signupIntent ? "signup" : "login")
           .setResponseHeader("Cache-Control", "no-store")
           .setResponseHeader("Referrer-Policy", "no-referrer")
           .createForm("wallet-login.ftl");
@@ -150,11 +176,19 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
 
   @Override
   public void action(AuthenticationFlowContext context) {
-    var initialAuthSession = context.getAuthenticationSession();
-    if (initialAuthSession != null && context.getHttpRequest() != null
-        && "POST".equals(context.getHttpRequest().getHttpMethod())
-        && context.getHttpRequest().getDecodedFormParameters().containsKey("wallet_intent")) {
-      var values = context.getHttpRequest().getDecodedFormParameters().get("wallet_intent");
+    var auth = context.getAuthenticationSession();
+    String adoptedAction = auth == null ? null
+        : auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION);
+    var httpRequest = context.getHttpRequest();
+    if (httpRequest != null && "POST".equals(httpRequest.getHttpMethod())
+        && httpRequest.getDecodedFormParameters() != null
+        && httpRequest.getDecodedFormParameters().containsKey("wallet_intent")) {
+      if (adoptedAction != null) {
+        failClosed(context);
+        return;
+      }
+      var initialAuthSession = auth;
+      var values = httpRequest.getDecodedFormParameters().get("wallet_intent");
       if (values != null && values.size() == 1 && "signup".equals(values.getFirst())) {
         initialAuthSession.setClientNote(SIGNUP_AUTH_NOTE, "signup");
         context.resetFlow(() -> initialAuthSession.setClientNote(SIGNUP_AUTH_NOTE, "signup"));
@@ -171,46 +205,89 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
     // The wallet POST resolved the current Identity key before nonce consumption.
     // This callback consumes the accepted receipt and re-checks the local mapping.
     try {
-      var auth = context.getAuthenticationSession();
-      if (auth == null || auth.getClient() == null || auth.getParentSession() == null) {
+      var callbackAuth = context.getAuthenticationSession();
+      if (callbackAuth == null || callbackAuth.getClient() == null || callbackAuth.getParentSession() == null) {
         failClosed(context); return;
       }
-      String handle = auth.getAuthNote("decent.wallet.handle");
+      String handle = callbackAuth.getAuthNote("decent.wallet.handle");
       if (handle == null) { failClosed(context); return; }
       WalletLoginTransactionStore store = transactionStores.get();
       if (store == null) { failClosed(context); return; }
       var binding = new WalletLoginTransactionStore.Binding(context.getRealm().getId(),
-          auth.getClient().getId(), auth.getParentSession().getId(), auth.getTabId(),
-          auth.getRedirectUri(), auth.getAuthNote("decent.wallet.origin"));
-      var visibleReceipt = store.getAccepted(handle, binding);
-      if (visibleReceipt.isEmpty()) { failClosed(context); return; }
+          callbackAuth.getClient().getId(), callbackAuth.getParentSession().getId(), callbackAuth.getTabId(),
+          callbackAuth.getRedirectUri(), callbackAuth.getAuthNote("decent.wallet.origin"));
+      var accepted = store.getAccepted(handle, binding);
+      if (accepted.isPresent() && accepted.get().intent() == WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP) {
+        String boundAction = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION);
+        String boundRequestId = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID);
+        String boundJti = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI);
+        String boundExpiry = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES);
+        String additionalAction = callbackAuth.getClientNote(
+            org.keycloak.protocol.oidc.endpoints.AuthorizationEndpoint.LOGIN_SESSION_NOTE_ADDITIONAL_REQ_PARAMS_PREFIX
+                + WalletAccountRequestExecutor.ACTION_PARAM);
+        if (!"true".equals(callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED))
+            || !"signup".equals(boundAction) || !boundAction.equals(additionalAction)
+            || boundRequestId == null || !boundRequestId.equals(accepted.get().accountRequestId())
+            || boundJti == null || !boundJti.equals(accepted.get().accountRequestJti())
+            || boundExpiry == null || !boundExpiry.equals(accepted.get().accountRequestExpires())
+            || !canonicalLong(boundExpiry)
+            || !WalletAccountRequestExecutor.intentForAction(boundAction).equals(accepted.get().intent())) {
+          failClosed(context);
+          return;
+        }
+      }
+      if (accepted.isPresent() && accepted.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY) {
+        String boundAction = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION);
+        String boundRequestId = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID);
+        String boundJti = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI);
+        String boundExpiry = callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES);
+        String additionalAction = callbackAuth.getClientNote(
+            org.keycloak.protocol.oidc.endpoints.AuthorizationEndpoint.LOGIN_SESSION_NOTE_ADDITIONAL_REQ_PARAMS_PREFIX
+                + WalletAccountRequestExecutor.ACTION_PARAM);
+        if (!"true".equals(callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED))
+            || boundAction == null || !boundAction.equals(additionalAction)
+            || boundRequestId == null
+            || !boundRequestId.equals(accepted.get().accountRequestId())
+            || !boundRequestId.equals(callbackAuth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID))
+            || boundJti == null || !boundJti.equals(accepted.get().accountRequestJti())
+            || boundExpiry == null || !boundExpiry.equals(accepted.get().accountRequestExpires())
+            || !canonicalLong(boundExpiry)
+            || !WalletAccountRequestExecutor.intentForAction(boundAction).equals(accepted.get().intent())) {
+          failClosed(context);
+          return;
+        }
+      }
+      if (accepted.isEmpty()) { failClosed(context); return; }
       // Signup account creation happens after a valid wallet proof and before
       // the pending transaction's atomic consume. The callback may only resolve
       // that exact mapped user; provisioning here would occur after consumption.
-      UserModel user = WalletLoginAccountMapping.findUniqueEnabledUser(
-          context.getSession().users(), context.getRealm(), visibleReceipt.get().identityId());
-      if (user == null || !user.isEnabled()) { failClosed(context); return; }
-      if (visibleReceipt.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP
-          && !WalletLoginAccountMapping.hasUniqueEnabledMapping(context.getSession().users(),
-              context.getRealm(), visibleReceipt.get().identityId())) {
-        failClosed(context);
-        return;
+      var callbackAction = accepted.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY
+          ? "signup_recovery" : "signup";
+      var matchingUser = WalletLoginAccountMapping.findUniqueEnabledUser(
+          context.getSession().users(), context.getRealm(), accepted.get().identityId());
+      if (matchingUser == null || !matchingUser.isEnabled()) { failClosed(context); return; }
+      if (accepted.get().intent() == WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY) {
+        if (WalletLoginAccountMapping.lookupIdentity(context.getSession().users(), context.getRealm(),
+            accepted.get().identityId()) != WalletLoginAccountResolver.Lookup.ENABLED) {
+          failClosed(context);
+          return;
+        }
       }
       String callbackExecutionId = context.getExecution() == null
           ? null : context.getExecution().getId();
       if (callbackExecutionId == null) { failClosed(context); return; }
       // Set the already-validated user before the one-use gate; failures here
       // leave the callback retryable and never mark the authentication execution successful.
-      auth.setAuthenticatedUser(user);
+      callbackAuth.setAuthenticatedUser(matchingUser);
       var receipt = store.takeAccepted(handle, binding);
       if (receipt.isEmpty()) { failClosed(context); return; }
-      if (!receipt.get().equals(visibleReceipt.get())) { failClosed(context); return; }
-      auth.setClientNote(CALLBACK_EXECUTION_NOTE, callbackExecutionId);
-      auth.setClientNote(CALLBACK_COMPLETED_NOTE, "true");
-      auth.setClientNote(CALLBACK_REQUEST_NOTE,
+      if (!receipt.get().equals(accepted.get())) { failClosed(context); return; }
+      callbackAuth.setClientNote(CALLBACK_EXECUTION_NOTE, callbackExecutionId);
+      callbackAuth.setClientNote(CALLBACK_COMPLETED_NOTE, "true");
+      callbackAuth.setClientNote(CALLBACK_REQUEST_NOTE,
           WalletLoginTransportHandler.requestCorrelationId(handle));
       context.success();
-      clearWalletAuthNotes(auth);
+      clearWalletAuthNotes(callbackAuth);
     } catch (Exception failure) {
       failClosed(context);
     }
@@ -255,6 +332,12 @@ public final class WalletChallengeAuthenticator implements Authenticator, Authen
 
   private static String safeCallbackRequestId(String requestId) {
     return WalletRequestCorrelation.isValidRequestId(requestId) ? requestId : "unavailable";
+  }
+
+  private static boolean canonicalLong(String value) {
+    if (value == null) return false;
+    try { return Long.toString(Long.parseLong(value)).equals(value); }
+    catch (NumberFormatException invalid) { return false; }
   }
 
   private static void denyCompletedCallbackReplay(AuthenticationFlowContext context,

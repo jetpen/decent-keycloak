@@ -116,6 +116,25 @@ final class WalletLoginAccountMapping {
     }
   }
 
+  static WalletLoginAccountResolver.Lookup lookupIdentity(UserProvider users, RealmModel realm,
+      String identityId) {
+    if (users == null || realm == null || identityId == null || identityId.isEmpty()) {
+      return WalletLoginAccountResolver.Lookup.UNAVAILABLE;
+    }
+    try (Stream<UserModel> candidates = users.searchForUserByUserAttributeStream(
+        realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
+      List<UserModel> scan = boundedCandidates(candidates, "identity mapping lookup unavailable");
+      List<UserModel> matches = scan.stream().filter(user -> hasExactIdentity(user, identityId))
+          .limit(2).toList();
+      if (matches.size() > 1) return WalletLoginAccountResolver.Lookup.AMBIGUOUS;
+      if (matches.isEmpty()) return WalletLoginAccountResolver.Lookup.ABSENT;
+      return matches.getFirst().isEnabled() ? WalletLoginAccountResolver.Lookup.ENABLED
+          : WalletLoginAccountResolver.Lookup.DISABLED;
+    } catch (RuntimeException unavailable) {
+      return WalletLoginAccountResolver.Lookup.UNAVAILABLE;
+    }
+  }
+
   static boolean hasUniqueEnabledMapping(UserProvider users, RealmModel realm, String identityId) {
     return ensureEnabledUser(users, realm, identityId, false) != null;
   }

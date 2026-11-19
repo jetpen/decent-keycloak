@@ -17,8 +17,12 @@
         <input type="hidden" name="wallet_intent" value="signup" />
         <button type="submit">Create account with wallet</button>
       </form>
-    <#else>
+    <#elseif walletIntent = "signup_recovery">
+      <p>Creating an account for an existing Keycloak identity.</p>
+    <#elseif walletIntent = "signup">
       <p>Creating a new account with this wallet identity.</p>
+    <#else>
+      <p>Signing in with this wallet identity.</p>
     </#if>
     <p class="instruction">Open this login page only through your relying party. The wallet must confirm this origin before approving. Do not share the QR URL.</p>
     <script>
@@ -66,7 +70,7 @@
           polling = false;
           window.setTimeout(poll, 2000);
         };
-        if (walletIntent === "login" || walletIntent === "signup") {
+        if (walletIntent === "login" || walletIntent === "signup" || walletIntent === "signup_recovery") {
           window.setTimeout(poll, 1500);
         }
       }());

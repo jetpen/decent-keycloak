@@ -221,6 +221,81 @@ final class WalletChallengeAuthenticatorTest {
   }
 
   @Test
+  void signedOrdinarySignupStartsTheDistinctBoundAccountSignupIntent() {
+    var transactionStore = mock(WalletLoginTransactionStore.class);
+    var authenticator = new WalletChallengeAuthenticator(() -> transactionStore);
+    var context = mock(AuthenticationFlowContext.class);
+    var authSession = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var keycloakContext = mock(org.keycloak.models.KeycloakContext.class);
+    var uriInfo = mock(org.keycloak.models.KeycloakUriInfo.class);
+    var rootSession = mock(org.keycloak.sessions.RootAuthenticationSessionModel.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var form = mock(org.keycloak.forms.login.LoginFormsProvider.class);
+    var response = mock(jakarta.ws.rs.core.Response.class);
+    var issued = new WalletLoginTransactionStore.IssuedTransaction("A".repeat(43), "B".repeat(43),
+        "C".repeat(43), Instant.now().plusSeconds(300));
+
+    when(context.getSession()).thenReturn(session);
+    when(context.getAuthenticationSession()).thenReturn(authSession);
+    when(context.getRealm()).thenReturn(realm);
+    when(context.form()).thenReturn(form);
+    when(session.getContext()).thenReturn(keycloakContext);
+    when(keycloakContext.getUri()).thenReturn(uriInfo);
+    when(uriInfo.getBaseUri()).thenReturn(URI.create("https://idp.example/auth/"));
+    when(realm.getId()).thenReturn("realm-id");
+    when(realm.getName()).thenReturn("demo");
+    when(realm.isRegistrationAllowed()).thenReturn(true);
+    when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_SITE_LABEL)).thenReturn("Wallet Site");
+    when(authSession.getClient()).thenReturn(client);
+    when(authSession.getParentSession()).thenReturn(rootSession);
+    when(rootSession.getId()).thenReturn("root-session-id");
+    when(authSession.getTabId()).thenReturn("tab-id");
+    when(client.getClientId()).thenReturn("rp-client");
+    when(client.getId()).thenReturn("client-id");
+    when(client.isEnabled()).thenReturn(true);
+    when(client.isStandardFlowEnabled()).thenReturn(true);
+    when(client.getRedirectUris()).thenReturn(Set.of("https://site.example/callback"));
+    when(authSession.getRedirectUri()).thenReturn("https://site.example/callback");
+    when(authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION)).thenReturn("signup");
+    when(authSession.getAuthNote("decent.wallet.account.signed")).thenReturn("true");
+    when(authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID)).thenReturn("AbCdEfGhIjKlMnOpQrStUv");
+    when(authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI)).thenReturn("request-jti");
+    when(authSession.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES)).thenReturn("4102444800");
+    var config = mock(org.keycloak.models.AuthenticatorConfigModel.class);
+    when(context.getAuthenticatorConfig()).thenReturn(config);
+    when(config.getConfig()).thenReturn(Map.of("trusted-origins", "https://idp.example"));
+    when(context.generateAccessCode()).thenReturn("signup-code");
+    when(context.getActionUrl("signup-code")).thenReturn(URI.create("https://idp.example/action"));
+    var execution = mock(org.keycloak.models.AuthenticationExecutionModel.class);
+    when(context.getExecution()).thenReturn(execution);
+    when(execution.getId()).thenReturn("execution-id");
+    when(transactionStore.issue(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq("signup"),
+        org.mockito.ArgumentMatchers.eq("AbCdEfGhIjKlMnOpQrStUv"),
+        org.mockito.ArgumentMatchers.eq("request-jti"), org.mockito.ArgumentMatchers.any()))
+        .thenReturn(issued);
+    when(form.setAuthenticationSession(authSession)).thenReturn(form);
+    when(form.setClientSessionCode(org.mockito.ArgumentMatchers.anyString())).thenReturn(form);
+    when(form.setExecution(org.mockito.ArgumentMatchers.anyString())).thenReturn(form);
+    when(form.setAuthContext(context)).thenReturn(form);
+    when(form.setActionUri(org.mockito.ArgumentMatchers.any(URI.class))).thenReturn(form);
+    when(form.setResponseHeader(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString()))
+        .thenReturn(form);
+    when(form.setAttribute(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any())).thenReturn(form);
+    when(form.createForm("wallet-login.ftl")).thenReturn(response);
+
+    authenticator.authenticate(context);
+
+    verify(transactionStore).issue(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.eq(WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP),
+        org.mockito.ArgumentMatchers.eq("signup"), org.mockito.ArgumentMatchers.eq("AbCdEfGhIjKlMnOpQrStUv"),
+        org.mockito.ArgumentMatchers.eq("request-jti"), org.mockito.ArgumentMatchers.any());
+    verify(context).challenge(response);
+  }
+
+  @Test
   void rejectsAuthenticatorWithoutTrustedOriginOrSiteLabelBeforeIssuingState() {
     var store = mock(WalletLoginTransactionStore.class);
     var authenticator = new WalletChallengeAuthenticator(() -> store);
@@ -468,6 +543,129 @@ final class WalletChallengeAuthenticatorTest {
     verify(context).success();
     verify(context, org.mockito.Mockito.never()).failure(
         AuthenticationFlowError.GENERIC_AUTHENTICATION_ERROR);
+  }
+
+  @Test
+  void callbackActionSupportsMissingHttpRequestAndAcceptsBoundRecoveryAction() {
+    String handle = "A".repeat(43);
+    String identityId = "mailto:recovery@example.org";
+    var binding = new WalletLoginTransactionStore.Binding("realm-id", "client-id", "root-session-id",
+        "tab-id", "https://site.example/callback", "https://idp.example");
+    var accepted = new WalletLoginTransactionStore.AcceptedTransaction(identityId, "AA", "digest", binding,
+        WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY, "signup_recovery", "AbCdEfGhIjKlMnOpQrStUv",
+        "recovery-jti", "4102444800");
+    var store = mock(WalletLoginTransactionStore.class);
+    when(store.getAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
+    when(store.takeAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
+    var authenticator = new WalletChallengeAuthenticator(() -> store);
+    var context = mock(AuthenticationFlowContext.class);
+    var execution = mock(org.keycloak.models.AuthenticationExecutionModel.class);
+    when(execution.getId()).thenReturn("wallet-execution");
+    when(context.getExecution()).thenReturn(execution);
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var root = mock(org.keycloak.sessions.RootAuthenticationSessionModel.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var users = mock(org.keycloak.models.UserProvider.class);
+    var user = mock(org.keycloak.models.UserModel.class);
+    when(context.getAuthenticationSession()).thenReturn(auth);
+    when(context.getRealm()).thenReturn(realm);
+    when(realm.getId()).thenReturn("realm-id");
+    when(context.getSession()).thenReturn(session);
+    when(context.getHttpRequest()).thenReturn(null);
+    when(auth.getClient()).thenReturn(client);
+    when(auth.getParentSession()).thenReturn(root);
+    when(auth.getTabId()).thenReturn("tab-id");
+    when(auth.getRedirectUri()).thenReturn("https://site.example/callback");
+    when(auth.getAuthNote("decent.wallet.handle")).thenReturn(handle);
+    when(auth.getAuthNote("decent.wallet.origin")).thenReturn("https://idp.example");
+    when(auth.getAuthNote("decent.wallet.account.action")).thenReturn("signup_recovery");
+    when(auth.getAuthNote("decent.wallet.account.signed")).thenReturn("true");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION)).thenReturn("signup_recovery");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID)).thenReturn("AbCdEfGhIjKlMnOpQrStUv");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI)).thenReturn("recovery-jti");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES)).thenReturn("4102444800");
+    when(auth.getClientNote(org.keycloak.protocol.oidc.endpoints.AuthorizationEndpoint
+        .LOGIN_SESSION_NOTE_ADDITIONAL_REQ_PARAMS_PREFIX + WalletAccountRequestExecutor.ACTION_PARAM))
+        .thenReturn("signup_recovery");
+    when(client.getId()).thenReturn("client-id");
+    when(root.getId()).thenReturn("root-session-id");
+    when(session.users()).thenReturn(users);
+    when(users.searchForUserByUserAttributeStream(realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenAnswer(ignored -> java.util.stream.Stream.of(user));
+    when(user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)).thenReturn(identityId);
+    when(user.isEnabled()).thenReturn(true);
+
+    authenticator.action(context);
+
+    verify(users, org.mockito.Mockito.never()).addUser(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.anyBoolean());
+    verify(store).takeAccepted(handle, binding);
+    verify(auth).setAuthenticatedUser(user);
+    verify(context).success();
+  }
+
+  @Test
+  void callbackAcceptsProvisionedSignedOrdinarySignupAccount() {
+    String handle = "B".repeat(43);
+    String identityId = "mailto:signup@example.org";
+    var binding = new WalletLoginTransactionStore.Binding("realm-id", "client-id", "root-session-id",
+        "tab-id", "https://site.example/callback", "https://idp.example");
+    var accepted = new WalletLoginTransactionStore.AcceptedTransaction(identityId, "AA", "digest", binding,
+        WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP, "signup", "AbCdEfGhIjKlMnOpQrStUv",
+        "signup-jti", "4102444800");
+    var store = mock(WalletLoginTransactionStore.class);
+    when(store.getAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
+    when(store.takeAccepted(handle, binding)).thenReturn(java.util.Optional.of(accepted));
+    var authenticator = new WalletChallengeAuthenticator(() -> store);
+    var context = mock(AuthenticationFlowContext.class);
+    var execution = mock(org.keycloak.models.AuthenticationExecutionModel.class);
+    when(execution.getId()).thenReturn("wallet-execution");
+    when(context.getExecution()).thenReturn(execution);
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var root = mock(org.keycloak.sessions.RootAuthenticationSessionModel.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var users = mock(org.keycloak.models.UserProvider.class);
+    var user = mock(org.keycloak.models.UserModel.class);
+    when(context.getAuthenticationSession()).thenReturn(auth);
+    when(context.getRealm()).thenReturn(realm);
+    when(realm.getId()).thenReturn("realm-id");
+    when(context.getSession()).thenReturn(session);
+    when(context.getHttpRequest()).thenReturn(null);
+    when(auth.getClient()).thenReturn(client);
+    when(auth.getParentSession()).thenReturn(root);
+    when(auth.getTabId()).thenReturn("tab-id");
+    when(auth.getRedirectUri()).thenReturn("https://site.example/callback");
+    when(auth.getAuthNote("decent.wallet.handle")).thenReturn(handle);
+    when(auth.getAuthNote("decent.wallet.origin")).thenReturn("https://idp.example");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION)).thenReturn("signup");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED)).thenReturn("true");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID)).thenReturn("AbCdEfGhIjKlMnOpQrStUv");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI)).thenReturn("signup-jti");
+    when(auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_EXPIRES)).thenReturn("4102444800");
+    when(auth.getClientNote(org.keycloak.protocol.oidc.endpoints.AuthorizationEndpoint
+        .LOGIN_SESSION_NOTE_ADDITIONAL_REQ_PARAMS_PREFIX + WalletAccountRequestExecutor.ACTION_PARAM))
+        .thenReturn("signup");
+    when(client.getId()).thenReturn("client-id");
+    when(root.getId()).thenReturn("root-session-id");
+    when(session.users()).thenReturn(users);
+    when(users.searchForUserByUserAttributeStream(realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId))
+        .thenAnswer(ignored -> java.util.stream.Stream.of(user));
+    when(user.getFirstAttribute(WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE)).thenReturn(identityId);
+    when(user.isEnabled()).thenReturn(true);
+
+    authenticator.action(context);
+
+    verify(users, org.mockito.Mockito.never()).addUser(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.anyBoolean(), org.mockito.ArgumentMatchers.anyBoolean());
+    verify(store).takeAccepted(handle, binding);
+    verify(auth).setAuthenticatedUser(user);
+    verify(context).success();
   }
 
   @Test

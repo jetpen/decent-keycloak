@@ -2,7 +2,9 @@ package org.decentwallet.keycloak.wallet;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.core.Response;
 import java.nio.charset.StandardCharsets;
@@ -668,11 +670,353 @@ final class WalletLoginTransportHandlerTest {
   }
 
   @Test
+  void signedOrdinarySignupForAbsentIdentityCreatesOneAccountAndAccepts() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var signupBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "signed-absent-root", "signed-absent-tab", BINDING.redirectUri(), IDP_ORIGIN);
+    var issued = store.issue(signupBinding, WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP,
+        "signup", "AbCdEfGhIjKlMnOpQrStVw", "signed-absent-jti", Clock.systemUTC().instant().plusSeconds(300));
+    String identity = "mailto:signed-absent@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var creates = new AtomicInteger();
+    var user = mock(org.keycloak.models.UserModel.class);
+    when(user.isEnabled()).thenReturn(true);
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return creates.get() > 0; }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) { return creates.get() > 0; }
+      @Override public Lookup lookupExact(String exactIdentityId) {
+        assertEquals(identity, exactIdentityId);
+        return creates.get() == 0 ? Lookup.ABSENT : Lookup.ENABLED;
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        assertEquals(identity, exactIdentityId);
+        assertEquals(0, creates.getAndIncrement(), "signed ordinary signup provisions exactly once");
+        return user;
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, accounts, true);
+
+    var accepted = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN, WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP);
+
+    assertEquals(202, accepted.status());
+    assertEquals(1, creates.get());
+    assertEquals(WalletLoginAccountResolver.Lookup.ENABLED, accounts.lookupExact(identity));
+    assertEquals(WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP,
+        store.getAccepted(issued.handle(), signupBinding).orElseThrow().intent());
+    assertTrue(store.callbackGateAvailable(issued.handle(), signupBinding));
+  }
+
+  @Test
+  void ordinarySignupForBoundExistingAccountIsDeniedBeforeAcceptance() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC());
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP,
+        "signup", "AbCdEfGhIjKlMnOpQrStVw", "ordinary-signup-jti",
+        java.time.Instant.now().plusSeconds(240));
+    String identity = "mailto:existing-signup@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
+    var policyLookups = new AtomicInteger();
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) {
+        assertEquals(identity, exactIdentityId);
+        policyLookups.incrementAndGet();
+        return true;
+      }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
+        return true;
+      }
+      @Override public Lookup lookupExact(String exactIdentityId) {
+        assertEquals(identity, exactIdentityId);
+        policyLookups.incrementAndGet();
+        return Lookup.ENABLED;
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, accounts, true);
+
+    var result = handler.submitProof(issued.handle(), null, null, null, null,
+        "application/json", null, proof, IDP_ORIGIN);
+
+    assertEquals(1, policyLookups.get(), "fresh proof must reach the account policy guard");
+    assertEquals(403, result.status());
+    assertTrue(store.load(issued.handle()).isPresent(), "policy denial leaves the transaction pending");
+    assertTrue(store.getAccepted(issued.handle(), BINDING).isEmpty());
+    assertFalse(store.callbackGateAvailable(issued.handle(), BINDING));
+    assertTrue(provider.entries.keySet().stream().noneMatch(key -> key.startsWith(
+        "decent-wallet-login-v1:accepted:")));
+    assertTrue(provider.entries.keySet().stream().noneMatch(key -> key.startsWith(
+        "decent-wallet-login-v1:callback:")));
+  }
+
+  @Test
+  void existingEnabledExactAccountOrdinarySignupIsDeniedAndSignupRecoveryIsAccepted() throws Exception {
+    var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+    var provider = new MemoryStore();
+    var store = new WalletLoginTransactionStore(provider, new java.security.SecureRandom(), Clock.systemUTC(),
+        new WalletLoginAcceptanceGuard());
+    String identity = "mailto:existing-account@example.org";
+    var creates = new AtomicInteger();
+    var account = mock(org.keycloak.models.UserModel.class);
+    when(account.isEnabled()).thenReturn(true);
+    WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return true; }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) { return true; }
+      @Override public Lookup lookupExact(String exactIdentityId) { return Lookup.ENABLED; }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        creates.incrementAndGet();
+        return account;
+      }
+    };
+    var recoveryMappings = new java.util.concurrent.atomic.AtomicInteger();
+    WalletLoginAccountResolver recoveryAccounts = new WalletLoginAccountResolver() {
+      @Override public boolean hasUniqueEnabledUser(String exactIdentityId) { return true; }
+      @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) { return true; }
+      @Override public Lookup lookupExact(String exactIdentityId) {
+        return recoveryMappings.incrementAndGet() == 1 ? Lookup.ENABLED : Lookup.ABSENT;
+      }
+      @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
+        creates.incrementAndGet();
+        return account;
+      }
+    };
+    var handler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, accounts, true);
+
+    var signupBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "new-signup-root", "new-signup-tab", BINDING.redirectUri(), IDP_ORIGIN);
+    var signup = store.issue(signupBinding, WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP,
+        "signup", "AbCdEfGhIjKlMnOpQrStYw", "ordinary-signup-jti",
+        java.time.Instant.now().plusSeconds(240));
+    var denied = handler.submitProof(signup.handle(), null, null, null, null, "application/json", null,
+        signedProof(signup.challenge(), identity, keyPair), IDP_ORIGIN);
+    assertEquals(403, denied.status());
+    assertTrue(store.load(signup.handle()).isPresent());
+    assertTrue(store.getAccepted(signup.handle(), signupBinding).isEmpty());
+    assertFalse(store.callbackGateAvailable(signup.handle(), signupBinding));
+    assertEquals(0, creates.get());
+
+    var recoveryBinding = new WalletLoginTransactionStore.Binding("realm-id", "client-id",
+        "new-recovery-root", "new-recovery-tab", BINDING.redirectUri(), IDP_ORIGIN);
+    var recovery = store.issue(recoveryBinding, WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY,
+        "signup_recovery", "AbCdEfGhIjKlMnOpQrStVw", "recovery-jti",
+        java.time.Instant.now().plusSeconds(240));
+    var recoveryHandler = new WalletLoginTransportHandler(store, exact ->
+        new WalletIdentityKeyResolver.ResolvedIdentityKey(exact, rawKey(keyPair)), WALLET_ORIGIN,
+        IDP_ORIGIN, recoveryAccounts, true);
+    var accepted = recoveryHandler.submitProof(recovery.handle(), null, null, null, null, "application/json", null,
+        signedProof(recovery.challenge(), identity, keyPair), IDP_ORIGIN);
+    assertEquals(202, accepted.status());
+    assertEquals(WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY,
+        store.getAccepted(recovery.handle(), recoveryBinding).orElseThrow().intent());
+    assertEquals(0, creates.get());
+    assertEquals(1, recoveryMappings.get(), "recovery requires one enabled exact lookup and never provisions");
+  }
+
+  @Test
+  void accountRequestClientPolicyFactoryIsDiscoverableByServiceLoader() {
+    var factory = java.util.ServiceLoader.load(
+        org.keycloak.services.clientpolicy.executor.ClientPolicyExecutorProviderFactory.class)
+        .stream()
+        .map(java.util.ServiceLoader.Provider::get)
+        .filter(candidate -> WalletAccountRequestExecutor.PROVIDER_ID.equals(candidate.getId()))
+        .findFirst()
+        .orElseThrow();
+
+    assertEquals(WalletAccountRequestExecutor.PROVIDER_ID, factory.getId());
+  }
+
+  @Test
+  void signedAccountRequestExecutorRequiresStrictRequestObjectAndBindsOneUseAction() throws Exception {
+    var session = mock(org.keycloak.models.KeycloakSession.class);
+    var client = mock(org.keycloak.models.ClientModel.class);
+    var auth = mock(org.keycloak.sessions.AuthenticationSessionModel.class);
+    var realm = mock(org.keycloak.models.RealmModel.class);
+    var uriInfo = mock(org.keycloak.models.KeycloakUriInfo.class);
+    var mapper = new ObjectMapper();
+    long now = java.time.Instant.now().getEpochSecond();
+    var requestId = "AbCdEfGhIjKlMnOpQrStVw";
+    assertTrue(WalletAccountRequestExecutor.isCanonicalRequestId(requestId));
+    assertFalse(WalletAccountRequestExecutor.isCanonicalRequestId("AbCdEfGhIjKlMnOpQrStVx"),
+        "noncanonical trailing bits must not alias the same 128-bit request ID");
+    assertFalse(WalletAccountRequestExecutor.isCanonicalRequestId("not-a-request-id"),
+        "request IDs must decode to exactly 16 bytes canonically");
+
+    var requestNode = mapper.createObjectNode();
+    requestNode.put("iss", "rp-client");
+    requestNode.put("client_id", "rp-client");
+    requestNode.put("aud", "https://idp.example/realms/demo");
+    requestNode.put("iat", now);
+    requestNode.put("exp", now + 300);
+    requestNode.put("jti", "request-jti-one");
+    requestNode.put(WalletAccountRequestExecutor.ACTION_PARAM, "signup_recovery");
+    var extension = requestNode.putObject(WalletAccountRequestExecutor.REQUEST_PARAM);
+    extension.put("profile", "decent-account-disclosure-v1");
+    extension.put("request_id", requestId);
+    extension.put("purpose", "Create site account");
+    extension.putArray("claims").addObject().put("id", "urn:decent:account:v1:email")
+        .put("required", false);
+    String requestJson = mapper.writeValueAsString(requestNode);
+    KeyPairGenerator keyPair = KeyPairGenerator.getInstance("EC");
+    keyPair.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"));
+    var signingKey = keyPair.generateKeyPair();
+    String requestJws = signedRequestObject(requestNode, signingKey, "request-key-1");
+    var keyWrapper = keyWrapper(signingKey, "request-key-1");
+    var singleUse = new MemoryStore();
+    when(session.singleUseObjects()).thenReturn(singleUse);
+    when(session.tokens()).thenReturn(new org.keycloak.jose.jws.DefaultTokenManager(session));
+    when(session.getProvider(org.keycloak.keys.PublicKeyStorageProvider.class)).thenReturn(
+        new TestClientPublicKeyStorage(keyWrapper));
+    when(session.getProvider(org.keycloak.crypto.ClientSignatureVerifierProvider.class, "ES256"))
+        .thenReturn(new TestClientSignatureVerifierProvider(keyWrapper));
+    when(session.getAttribute(org.keycloak.protocol.oidc.endpoints.request.AuthzEndpointRequestParser.AUTHZ_REQUEST_OBJECT,
+        JsonNode.class)).thenReturn(mapper.readTree(requestJson));
+    when(session.getContext()).thenReturn(mock(org.keycloak.models.KeycloakContext.class));
+    var keycloakContext = session.getContext();
+    when(keycloakContext.getUri()).thenReturn(uriInfo);
+    when(keycloakContext.getRealm()).thenReturn(realm);
+    when(uriInfo.getBaseUri()).thenReturn(java.net.URI.create("https://idp.example/"));
+    when(realm.getName()).thenReturn("demo");
+    when(client.getClientId()).thenReturn("rp-client");
+    when(client.getId()).thenReturn("client-id");
+    when(org.keycloak.protocol.oidc.OIDCAdvancedConfigWrapper.fromClientModel(client)
+        .getRequestObjectSignatureAlg()).thenReturn("ES256");
+    when(auth.getClient()).thenReturn(client);
+    when(client.getAttribute("jwks")).thenThrow(new AssertionError("raw JWKS attributes must not be read"));
+    var params = new jakarta.ws.rs.core.MultivaluedHashMap<String, String>();
+    params.add("request", requestJws);
+    var endpointRequest = new org.keycloak.protocol.oidc.endpoints.request.AuthorizationEndpointRequest();
+    var context = new org.keycloak.services.clientpolicy.context.AuthorizationRequestContext(
+        mock(org.keycloak.protocol.oidc.utils.OIDCResponseType.class), endpointRequest,
+        "https://site.example/callback", params, auth);
+    var executor = new WalletAccountRequestExecutor(session);
+    var configuration = new WalletAccountRequestExecutor.Configuration();
+    configuration.setEnabled(true);
+    executor.setupConfiguration(configuration);
+    singleUse.failClaimAfterFirst = true;
+    assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class,
+        () -> executor.executeOnEvent(context), "a losing second one-use claim must abort adoption");
+    assertFalse(singleUse.contains(WalletAccountRequestExecutor.oneUseKey(
+        WalletAccountRequestExecutor.REQUEST_ID_PREFIX, "client-id", requestId)),
+        "the first request ID claim must be rolled back");
+    verify(auth, org.mockito.Mockito.never()).setAuthNote(
+        WalletAccountRequestExecutor.AUTH_NOTE_ACTION, "signup_recovery");
+
+    executor.executeOnEvent(context);
+
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION, "signup_recovery");
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID, requestId);
+    verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_JTI, "request-jti-one");
+    var attackerKeyPair = KeyPairGenerator.getInstance("EC");
+    attackerKeyPair.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"));
+    String attackerRequest = signedRequestObject(requestNode, attackerKeyPair.generateKeyPair(), "attacker-key");
+    var changedSignature = compactWithInvalidSignature(requestJws);
+    for (String malformed : java.util.List.of(attackerRequest, changedSignature)) {
+      var malformedParams = new jakarta.ws.rs.core.MultivaluedHashMap<String, String>();
+      malformedParams.add("request", malformed);
+      var malformedContext = new org.keycloak.services.clientpolicy.context.AuthorizationRequestContext(
+          mock(org.keycloak.protocol.oidc.utils.OIDCResponseType.class), endpointRequest,
+          "https://site.example/callback", malformedParams, auth);
+      assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class,
+          () -> executor.executeOnEvent(malformedContext), "an invalid client signature must fail closed");
+    }
+    assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class, () -> {
+      var duplicateClaims = requestNode.deepCopy();
+      var duplicateExtension = (com.fasterxml.jackson.databind.node.ObjectNode)
+          duplicateClaims.get(WalletAccountRequestExecutor.REQUEST_PARAM);
+      var duplicateList = duplicateExtension.putArray("claims");
+      duplicateList.addObject().put("id", "urn:decent:account:v1:email").put("required", false);
+      duplicateList.addObject().put("id", "urn:decent:account:v1:email").put("required", true);
+      duplicateExtension.put("request_id", "AbCdEfGhIjKlMnOpQrStXw");
+      duplicateClaims.put("jti", "request-jti-duplicate-claims");
+      String duplicateJws = signedRequestObject(duplicateClaims, signingKey, "request-key-1");
+      params.put("request", java.util.List.of(duplicateJws));
+      when(session.getAttribute(org.keycloak.protocol.oidc.endpoints.request.AuthzEndpointRequestParser.AUTHZ_REQUEST_OBJECT,
+          JsonNode.class)).thenReturn(duplicateClaims);
+      executor.executeOnEvent(context);
+    }, "duplicate claim identifiers must be rejected");
+    assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class, () -> {
+      var unsupportedClaims = requestNode.deepCopy();
+      var unsupportedExtension = (com.fasterxml.jackson.databind.node.ObjectNode)
+          unsupportedClaims.get(WalletAccountRequestExecutor.REQUEST_PARAM);
+      unsupportedExtension.putArray("claims").addObject().put("id", "urn:decent:account:v1:postal_address")
+          .put("required", false);
+      unsupportedExtension.put("request_id", "AbCdEfGhIjKlMnOpQrStYw");
+      unsupportedClaims.put("jti", "request-jti-unsupported-claim");
+      String unsupportedJws = signedRequestObject(unsupportedClaims, signingKey, "request-key-1");
+      params.put("request", java.util.List.of(unsupportedJws));
+      when(session.getAttribute(org.keycloak.protocol.oidc.endpoints.request.AuthzEndpointRequestParser.AUTHZ_REQUEST_OBJECT,
+          JsonNode.class)).thenReturn(unsupportedClaims);
+      executor.executeOnEvent(context);
+    }, "unsupported profile claims must be rejected");
+    assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class, () -> {
+      var malformedUnicode = requestNode.deepCopy();
+      var malformedExtension = (com.fasterxml.jackson.databind.node.ObjectNode)
+          malformedUnicode.get(WalletAccountRequestExecutor.REQUEST_PARAM);
+      malformedExtension.put("purpose", "Invalid " + (char) 0xd800 + " purpose");
+      malformedExtension.put("request_id", "AbCdEfGhIjKlMnOpQrStZw");
+      malformedUnicode.put("jti", "request-jti-invalid-unicode");
+      String malformedUnicodeJws = signedRequestObject(malformedUnicode, signingKey, "request-key-1");
+      params.put("request", java.util.List.of(malformedUnicodeJws));
+      when(session.getAttribute(org.keycloak.protocol.oidc.endpoints.request.AuthzEndpointRequestParser.AUTHZ_REQUEST_OBJECT,
+          JsonNode.class)).thenReturn(malformedUnicode);
+      executor.executeOnEvent(context);
+    }, "invalid Unicode scalar values must be rejected");
+    assertDoesNotThrow(() -> {
+      var currentClaims = requestNode.deepCopy();
+      var currentExtension = (com.fasterxml.jackson.databind.node.ObjectNode)
+          currentClaims.get(WalletAccountRequestExecutor.REQUEST_PARAM);
+      var adoptedRequestId = "AbCdEfGhIjKlMnOpQrStYw";
+      currentExtension.put("request_id", adoptedRequestId);
+      currentClaims.put("jti", "request-jti-current-profile-claims-unique");
+      var adoptedClaims = currentExtension.putArray("claims");
+      adoptedClaims.addObject().put("id", "urn:decent:account:v1:phone").put("required", true);
+      adoptedClaims.addObject().put("id", "urn:decent:account:v1:locale").put("required", false);
+      String currentProfileJws = signedRequestObject(currentClaims, signingKey, "request-key-1");
+      params.put("request", java.util.List.of(currentProfileJws));
+      when(session.getAttribute(org.keycloak.protocol.oidc.endpoints.request.AuthzEndpointRequestParser.AUTHZ_REQUEST_OBJECT,
+          JsonNode.class)).thenReturn(mapper.readTree(mapper.writeValueAsString(currentClaims)));
+      try {
+        executor.executeOnEvent(context);
+      } catch (org.keycloak.services.clientpolicy.ClientPolicyException rejected) {
+        throw new AssertionError("account request rejected: " + rejected.getErrorDetail(), rejected);
+      }
+      verify(auth).setAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_REQUEST_ID, adoptedRequestId);
+    }, "adopted phone/locale claims must be accepted by Request Object validation");
+
+    assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class, () -> {
+      var aliasedRequest = requestNode.deepCopy();
+      var aliasedExtension = (com.fasterxml.jackson.databind.node.ObjectNode)
+          aliasedRequest.get(WalletAccountRequestExecutor.REQUEST_PARAM);
+      aliasedExtension.put("request_id", "AbCdEfGhIjKlMnOpQrStYx");
+      aliasedRequest.put("jti", "request-jti-noncanonical-alias");
+      String aliasedJws = signedRequestObject(aliasedRequest, signingKey, "request-key-1");
+      params.put("request", java.util.List.of(aliasedJws));
+      when(session.getAttribute(org.keycloak.protocol.oidc.endpoints.request.AuthzEndpointRequestParser.AUTHZ_REQUEST_OBJECT,
+          JsonNode.class)).thenReturn(mapper.readTree(mapper.writeValueAsString(aliasedRequest)));
+      executor.executeOnEvent(context);
+    }, "alternate base64url trailing bits must be rejected for request_id");
+
+    assertThrows(org.keycloak.services.clientpolicy.ClientPolicyException.class, () -> {
+      params.add(WalletAccountRequestExecutor.ACTION_PARAM, "signup_recovery");
+      executor.executeOnEvent(context);
+    }, "even a valid signed action cannot be shadowed by an outer parameter");
+  }
+
+  @Test
   void signupPendingIntentCanBeResumedAfterWalletProof() throws Exception {
     var keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
     var store = new WalletLoginTransactionStore(new MemoryStore(), new java.security.SecureRandom(), Clock.systemUTC());
     var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.SIGNUP);
-    byte[] proof = signedProof(issued.challenge(), "mailto:signup@example.org", keyPair);
+    String identity = "mailto:signup@example.org";
+    byte[] proof = signedProof(issued.challenge(), identity, keyPair);
     var identityLookups = new java.util.concurrent.atomic.AtomicInteger();
     var provisions = new java.util.concurrent.atomic.AtomicInteger();
     WalletLoginAccountResolver accounts = new WalletLoginAccountResolver() {
@@ -680,7 +1024,11 @@ final class WalletLoginTransportHandlerTest {
         return provisions.get() > 0;
       }
       @Override public boolean hasUniqueMappedUserIncludingDisabled(String exactIdentityId) {
-        return false;
+        return provisions.get() > 0;
+      }
+      @Override public Lookup lookupExact(String exactIdentityId) {
+        identityLookups.incrementAndGet();
+        return provisions.get() > 0 ? Lookup.ENABLED : Lookup.ABSENT;
       }
       @Override public org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) {
         provisions.incrementAndGet();
@@ -698,7 +1046,7 @@ final class WalletLoginTransportHandlerTest {
         "application/json", null, proof, IDP_ORIGIN);
 
     assertEquals(202, rejected.status());
-    assertEquals(1, identityLookups.get());
+    assertEquals(3, identityLookups.get(), "resolver, initial exact lookup, and post-create confirmation");
     assertEquals(1, provisions.get());
     assertTrue(store.load(issued.handle()).isEmpty());
     assertTrue(store.getAccepted(issued.handle(), BINDING).isPresent());
@@ -724,7 +1072,7 @@ final class WalletLoginTransportHandlerTest {
   void accountPolicyDecisionLogIncludesOnlyOpaqueRequestCorrelationId() throws Exception {
     var source = java.nio.file.Files.readString(java.nio.file.Path.of(
         "src/main/java/org/decentwallet/keycloak/wallet/WalletLoginTransportHandler.java"));
-    var start = source.indexOf("if (intent != WalletLoginTransactionStore.Intent.SIGNUP || !acceptSignup || occupied)");
+    var start = source.indexOf("} else if (intent == WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP)");
     var end = source.indexOf("return HttpResult.empty(403);", start);
     var log = source.substring(start, end);
 
@@ -907,10 +1255,10 @@ final class WalletLoginTransportHandlerTest {
       assertFalse(losingResponse.headers().containsKey("Location"));
       assertNotEquals(winningTransaction.handle(), losingTransaction.handle());
       assertNotEquals(winnerBinding.rootSessionId(), loserBinding.rootSessionId());
-      assertEquals(5, searchesByCaller.get("winner").get(),
-          "winner completes three empty pre-create lookups, post-create readback, and handler recheck");
-      assertEquals(5, searchesByCaller.get("loser").get(),
-          "loser completes three empty pre-create lookups, conflict readback, and handler recheck");
+      assertEquals(6, searchesByCaller.get("winner").get(),
+          "winner completes initial policy lookup, three create-race lookups, readback, and handler recheck");
+      assertEquals(6, searchesByCaller.get("loser").get(),
+          "loser completes initial policy lookup, three create-race lookups, conflict readback, and handler recheck");
       assertTrue(provider.losingConsumeWasInjected.get(),
           "the losing pending key is removed only when its production consume reaches the provider");
       assertTrue(store.getAccepted(winningTransaction.handle(), winnerBinding).isPresent());
@@ -2397,6 +2745,134 @@ final class WalletLoginTransportHandlerTest {
         .getBytes(StandardCharsets.UTF_8);
   }
 
+  private static String signedRequestObject(JsonNode payload, KeyPair keyPair, String kid) throws Exception {
+    var signer = new org.keycloak.crypto.SignatureSignerContext() {
+      @Override public String getKid() { return kid; }
+      @Override public String getAlgorithm() { return "ES256"; }
+      @Override public String getHashAlgorithm() { return "SHA-256"; }
+      @Override public byte[] sign(byte[] message) throws org.keycloak.crypto.SignatureException {
+        try {
+          Signature signature = Signature.getInstance("SHA256withECDSA");
+          signature.initSign(keyPair.getPrivate());
+          signature.update(message);
+          return derToJose(signature.sign());
+        } catch (Exception failure) {
+          throw new org.keycloak.crypto.SignatureException("fixture signing failed", failure);
+        }
+      }
+    };
+    return new org.keycloak.jose.jws.JWSBuilder().jsonContent(payload).sign(signer);
+  }
+
+  private static String compactWithInvalidSignature(String compact) {
+    String[] pieces = compact.split("\\.", -1);
+    byte[] signature = Base64.getUrlDecoder().decode(pieces[2]);
+    signature[0] ^= 0x01;
+    pieces[2] = Base64.getUrlEncoder().withoutPadding().encodeToString(signature);
+    return String.join(".", pieces);
+  }
+
+  private static byte[] derToJose(byte[] der) {
+    int offset = 2;
+    int rLength = Byte.toUnsignedInt(der[offset + 1]);
+    byte[] r = java.util.Arrays.copyOfRange(der, offset + 2, offset + 2 + rLength);
+    offset += 2 + rLength;
+    int sLength = Byte.toUnsignedInt(der[offset + 1]);
+    byte[] s = java.util.Arrays.copyOfRange(der, offset + 2, offset + 2 + sLength);
+    byte[] jose = new byte[64];
+    copyUnsignedInteger(r, jose, 0);
+    copyUnsignedInteger(s, jose, 32);
+    return jose;
+  }
+
+  private static byte[] joseToDer(byte[] jose) {
+    byte[] r = derInteger(java.util.Arrays.copyOfRange(jose, 0, 32));
+    byte[] s = derInteger(java.util.Arrays.copyOfRange(jose, 32, 64));
+    byte[] der = new byte[2 + r.length + s.length];
+    int i = 0;
+    der[i++] = 0x30;
+    der[i++] = (byte) (r.length + s.length);
+    System.arraycopy(r, 0, der, i, r.length); i += r.length;
+    System.arraycopy(s, 0, der, i, s.length);
+    return der;
+  }
+
+  private static byte[] derInteger(byte[] value) {
+    int first = 0;
+    while (first < value.length - 1 && value[first] == 0) first++;
+    boolean signBit = (value[first] & 0x80) != 0;
+    int length = value.length - first + (signBit ? 1 : 0);
+    byte[] result = new byte[length + 2];
+    result[0] = 0x02;
+    result[1] = (byte) length;
+    System.arraycopy(value, first, result, 2 + (signBit ? 1 : 0), value.length - first);
+    return result;
+  }
+
+
+  private static void copyUnsignedInteger(byte[] value, byte[] target, int offset) {
+    int first = value.length > 32 && value[0] == 0 ? 1 : 0;
+    int length = value.length - first;
+    if (length > 32) throw new IllegalArgumentException("fixture ECDSA integer too large");
+    System.arraycopy(value, first, target, offset + 32 - length, length);
+  }
+
+  private static final class TestClientSignatureVerifierProvider
+      implements org.keycloak.crypto.ClientSignatureVerifierProvider {
+    private final org.keycloak.crypto.KeyWrapper key;
+    TestClientSignatureVerifierProvider(org.keycloak.crypto.KeyWrapper key) { this.key = key; }
+    @Override public String getAlgorithm() { return "ES256"; }
+    @Override public boolean isAsymmetricAlgorithm() { return true; }
+    @Override public org.keycloak.crypto.SignatureVerifierContext verifier(
+        org.keycloak.models.ClientModel client, org.keycloak.jose.jws.JWSInput input) {
+      return new org.keycloak.crypto.SignatureVerifierContext() {
+        @Override public String getKid() { return key.getKid(); }
+        @Override public String getAlgorithm() { return key.getAlgorithm(); }
+        @Override public boolean verify(byte[] data, byte[] signatureBytes)
+            throws org.keycloak.common.VerificationException {
+          try {
+            Signature verifier = Signature.getInstance("SHA256withECDSA");
+            verifier.initVerify((java.security.PublicKey) key.getPublicKey());
+            verifier.update(data);
+            return verifier.verify(joseToDer(signatureBytes));
+          } catch (Exception failure) {
+            throw new org.keycloak.common.VerificationException("fixture verification failed", failure);
+          }
+        }
+      };
+    }
+    @Override public void close() { }
+  }
+
+  private static org.keycloak.crypto.KeyWrapper keyWrapper(KeyPair pair, String kid) {
+    var wrapper = new org.keycloak.crypto.KeyWrapper();
+    wrapper.setKid(kid);
+    wrapper.setType(org.keycloak.crypto.KeyType.EC);
+    wrapper.setAlgorithm("ES256");
+    wrapper.setUse(org.keycloak.crypto.KeyUse.SIG);
+    wrapper.setPublicKey(pair.getPublic());
+    wrapper.setPrivateKey(pair.getPrivate());
+    return wrapper;
+  }
+
+  private static final class TestClientPublicKeyStorage implements org.keycloak.keys.PublicKeyStorageProvider {
+    private final org.keycloak.crypto.KeyWrapper key;
+    TestClientPublicKeyStorage(org.keycloak.crypto.KeyWrapper key) { this.key = key; }
+    @Override public org.keycloak.crypto.KeyWrapper getPublicKey(String cacheKey, String kid, String alg,
+        org.keycloak.keys.PublicKeyLoader loader) {
+      return key.getKid().equals(kid) && key.getAlgorithm().equals(alg) ? key : null;
+    }
+    @Override public org.keycloak.crypto.KeyWrapper getFirstPublicKey(String cacheKey, String alg,
+        org.keycloak.keys.PublicKeyLoader loader) { return key; }
+    @Override public org.keycloak.crypto.KeyWrapper getFirstPublicKey(String cacheKey,
+        java.util.function.Predicate<org.keycloak.crypto.KeyWrapper> predicate,
+        org.keycloak.keys.PublicKeyLoader loader) { return predicate.test(key) ? key : null; }
+    @Override public java.util.List<org.keycloak.crypto.KeyWrapper> getKeys(String cacheKey,
+        org.keycloak.keys.PublicKeyLoader loader) { return java.util.List.of(key); }
+    @Override public boolean reloadKeys(String cacheKey, org.keycloak.keys.PublicKeyLoader loader) { return true; }
+    @Override public void close() { }
+  }
+
   private static String transactionKey(String handle) {
     try {
       return "decent-wallet-login-v1:transaction:" + java.util.HexFormat.of().formatHex(
@@ -2587,6 +3063,8 @@ final class WalletLoginTransportHandlerTest {
 
   private static class MemoryStore implements SingleUseObjectProvider {
     private final Map<String, Map<String, String>> entries = new java.util.concurrent.ConcurrentHashMap<>();
+    private boolean failClaimAfterFirst;
+    private int claims;
     @Override public void put(String key, long lifespanSeconds, Map<String, String> notes) { entries.put(key, Map.copyOf(notes)); }
     @Override public Map<String, String> get(String key) { return entries.get(key); }
     @Override public Map<String, String> remove(String key) { return entries.remove(key); }
@@ -2596,6 +3074,7 @@ final class WalletLoginTransportHandlerTest {
       return true;
     }
     @Override public boolean putIfAbsent(String key, long lifespanSeconds) {
+      if (failClaimAfterFirst && ++claims == 2) return false;
       return entries.putIfAbsent(key, Map.of()) == null;
     }
     @Override public boolean contains(String key) { return entries.containsKey(key); }

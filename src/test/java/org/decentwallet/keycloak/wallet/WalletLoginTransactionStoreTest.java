@@ -76,6 +76,26 @@ final class WalletLoginTransactionStoreTest {
   }
 
   @Test
+  void loadRejectsNoncanonicalAccountRequestIdInStoredTransaction() {
+    var provider = new MemorySingleUseStore();
+    var clock = new MutableClock(Instant.parse("2026-10-12T00:00:00Z"));
+    var store = new WalletLoginTransactionStore(provider, new SecureRandom(), clock);
+    var issued = store.issue(BINDING, WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP,
+        "signup", "AbCdEfGhIjKlMnOpQrStVw", "request-jti-canonical-id-test",
+        clock.instant().plusSeconds(240));
+    String transactionKey = provider.keyStartingWith("decent-wallet-login-v1:transaction:");
+    var notes = provider.get(transactionKey);
+    assertNotNull(notes);
+    assertEquals("AbCdEfGhIjKlMnOpQrStVw", notes.get("account_request_id"));
+
+    notes.put("account_request_id", "AbCdEfGhIjKlMnOpQrStVx");
+    assertTrue(provider.replace(transactionKey, notes));
+
+    assertTrue(store.load(issued.handle()).isEmpty(),
+        "stored request IDs with noncanonical trailing bits must be rejected");
+  }
+
+  @Test
   void acceptedReceiptRetainsCsrfUntilBoundBrowserPollAndExpires() {
     var clock = new MutableClock(Instant.parse("2026-10-12T00:00:00Z"));
     var store = new WalletLoginTransactionStore(new MemorySingleUseStore(), new SecureRandom(), clock);

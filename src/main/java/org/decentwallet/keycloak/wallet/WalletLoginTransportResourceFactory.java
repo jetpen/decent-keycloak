@@ -61,6 +61,9 @@ public final class WalletLoginTransportResourceFactory
       @Override public boolean hasUniqueMappedUserIncludingDisabled(String identityId) {
         return WalletLoginAccountMapping.hasUniqueMappingIncludingDisabled(session.users(), realm, identityId);
       }
+      @Override public Lookup lookupExact(String identityId) {
+        return WalletLoginAccountMapping.lookupIdentity(session.users(), realm, identityId);
+      }
       @Override public org.keycloak.models.UserModel ensureEnabledUser(String identityId) {
         return WalletLoginAccountMapping.ensureEnabledUser(session.users(), realm, identityId, true);
       }

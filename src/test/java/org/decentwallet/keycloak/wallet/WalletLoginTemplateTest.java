@@ -76,7 +76,7 @@ final class WalletLoginTemplateTest {
   @Test
   void startsStatusPollingForBothLoginAndSignupIntents() throws Exception {
     String template = Files.readString(Path.of("src/main/resources/theme-resources/templates/wallet-login.ftl"));
-    assertTrue(template.contains("if (walletIntent === \"login\" || walletIntent === \"signup\") {"));
+    assertTrue(template.contains("if (walletIntent === \"login\" || walletIntent === \"signup\" || walletIntent === \"signup_recovery\") {"));
     assertTrue(template.contains("window.setTimeout(poll, 1500);"));
   }
 
