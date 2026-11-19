@@ -15,4 +15,7 @@ interface WalletLoginAccountResolver {
   default org.keycloak.models.UserModel ensureEnabledUser(String exactIdentityId) throws Exception {
     return null;
   }
+  default org.keycloak.models.UserModel createNewEnabledUser(String exactIdentityId) throws Exception {
+    return ensureEnabledUser(exactIdentityId);
+  }
 }

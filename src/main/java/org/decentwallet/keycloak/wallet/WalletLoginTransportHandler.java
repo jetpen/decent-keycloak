@@ -196,8 +196,16 @@ public final class WalletLoginTransportHandler {
         }
         if (!acceptSignup || occupied) return HttpResult.empty(403);
         try (WalletRequestCorrelation.Scope ignored = WalletRequestCorrelation.open(requestId)) {
-          org.keycloak.models.UserModel provisioned = accounts.ensureEnabledUser(proof.identityId());
-          if (provisioned == null || !provisioned.isEnabled()) return HttpResult.empty(503);
+          org.keycloak.models.UserModel provisioned = intent == WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP
+              ? accounts.createNewEnabledUser(proof.identityId())
+              : accounts.ensureEnabledUser(proof.identityId());
+          if (provisioned == null || !provisioned.isEnabled()) {
+            if (intent == WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP
+                && accounts.lookupExact(proof.identityId()) == WalletLoginAccountResolver.Lookup.ENABLED) {
+              return HttpResult.empty(403);
+            }
+            return HttpResult.empty(503);
+          }
           if (accounts.lookupExact(proof.identityId()) != WalletLoginAccountResolver.Lookup.ENABLED) {
             return HttpResult.empty(503);
           }

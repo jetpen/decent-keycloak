@@ -39,6 +39,15 @@ final class WalletLoginAccountMapping {
 
   static UserModel ensureEnabledUser(UserProvider users, RealmModel realm, String identityId,
       boolean createIfMissing) {
+    return ensureEnabledUser(users, realm, identityId, createIfMissing, true);
+  }
+
+  static UserModel createNewEnabledUser(UserProvider users, RealmModel realm, String identityId) {
+    return ensureEnabledUser(users, realm, identityId, true, false);
+  }
+
+  private static UserModel ensureEnabledUser(UserProvider users, RealmModel realm, String identityId,
+      boolean createIfMissing, boolean adoptConcurrentCreation) {
     if (users == null || realm == null || identityId == null || identityId.isEmpty()) return null;
     List<UserModel> matches;
     try (Stream<UserModel> candidates = users.searchForUserByUserAttributeStream(
@@ -49,7 +58,9 @@ final class WalletLoginAccountMapping {
           .limit(2)
           .toList();
     }
-    if (matches.size() == 1 && matches.getFirst().isEnabled()) return matches.getFirst();
+    if (matches.size() == 1 && matches.getFirst().isEnabled()) {
+      return createIfMissing && !adoptConcurrentCreation ? null : matches.getFirst();
+    }
     if (!createIfMissing || !matches.isEmpty()) return null;
     String username;
     try {
@@ -63,9 +74,8 @@ final class WalletLoginAccountMapping {
     try {
       created = users.addUser(realm, null, username, true, true);
     } catch (RuntimeException concurrentUsernameCreation) {
-      // A concurrent request for the same exact identity may already have
-      // inserted the deterministic username and mapping. Adopt only after an
-      // independent exact-ID read proves there is one enabled winner.
+      // A concurrent request may already have inserted the deterministic username
+      // and mapping. Only legacy provisioning may adopt that exact winner.
       List<UserModel> exactMatches;
       try (Stream<UserModel> rechecked = users.searchForUserByUserAttributeStream(
           realm, WalletChallengeAuthenticator.IDENTITY_ATTRIBUTE, identityId)) {
@@ -78,6 +88,7 @@ final class WalletLoginAccountMapping {
       if (exactMatches.isEmpty()) {
         throw new IllegalStateException("user provisioning unavailable", concurrentUsernameCreation);
       }
+      if (!adoptConcurrentCreation) return null;
       return exactMatches.size() == 1 && exactMatches.getFirst().isEnabled()
           ? exactMatches.getFirst() : null;
     }
