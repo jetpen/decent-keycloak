@@ -3,7 +3,6 @@ package org.decentwallet.keycloak.wallet;
 import static org.decentwallet.keycloak.wallet.WalletLoginTransactionStore.Intent.ACCOUNT_SIGNUP;
 import static org.decentwallet.keycloak.wallet.WalletLoginTransactionStore.Intent.SIGNUP_RECOVERY;
 import static org.decentwallet.keycloak.wallet.WalletLoginTransportHandlerTest.configureSignedRequestParser;
-import static org.decentwallet.keycloak.wallet.WalletLoginTransportHandlerTest.parseAuthorizationRequest;
 import static org.decentwallet.keycloak.wallet.WalletLoginTransportHandlerTest.rawKey;
 import static org.decentwallet.keycloak.wallet.WalletLoginTransportHandlerTest.signedProof;
 import static org.decentwallet.keycloak.wallet.WalletLoginTransportHandlerTest.signedRequestObject;
@@ -49,7 +48,6 @@ import org.keycloak.models.UserModel;
 import org.keycloak.models.UserProvider;
 import org.keycloak.protocol.oidc.OIDCConfigAttributes;
 import org.keycloak.protocol.oidc.endpoints.AuthorizationEndpoint;
-import org.keycloak.protocol.oidc.utils.OIDCResponseType;
 import org.keycloak.services.clientpolicy.context.AuthorizationRequestContext;
 import org.keycloak.services.managers.AuthenticationSessionManager;
 import org.keycloak.sessions.AuthenticationSessionModel;
@@ -138,6 +136,44 @@ final class WalletSignedAccountActionFlowTest {
   }
 
   @Test
+  void ordinarySignupDeniesAnEnabledExactPrincipalThatWinsDuringProvisioning() throws Exception {
+    var fixture = new ProviderFixture();
+    fixture.createRaceWinner = true;
+    var signup = fixture.start("signup", ACCOUNT_SIGNUP);
+
+    fixture.assertDeniedAndPending(signup, 403);
+    assertEquals(List.of("registry", "lookup", "lookup", "lookup", "create", "lookup", "lookup"),
+        fixture.accountEvents);
+    assertEquals(1, fixture.accounts.size());
+    var winner = fixture.accounts.get("race-winner");
+    assertNotNull(winner);
+    verify(winner).isEnabled();
+    verify(winner, never()).setEnabled(anyBoolean());
+    verify(winner, never()).setSingleAttribute(anyString(), anyString());
+    verify(fixture.users).addUser(eq(fixture.realm), isNull(), anyString(), eq(true), eq(true));
+    assertTrue(fixture.singleUse.storedKeys().stream().noneMatch(key ->
+        key.startsWith("decent-wallet-login-v1:accepted:") || key.startsWith("decent-wallet-login-v1:callback:")));
+  }
+
+  @Test
+  void ordinarySignupDeniesAnEnabledExactPrincipalThatAppearsBeforeProvisioningLookup() throws Exception {
+    var fixture = new ProviderFixture();
+    fixture.createRaceWinnerOnThirdLookup = true;
+    var signup = fixture.start("signup", ACCOUNT_SIGNUP);
+
+    fixture.assertDeniedAndPending(signup, 403);
+    assertEquals(1, fixture.accounts.size());
+    var winner = fixture.accounts.get("race-winner");
+    assertNotNull(winner);
+    verify(winner, atLeastOnce()).isEnabled();
+    verify(winner, never()).setEnabled(anyBoolean());
+    verify(winner, never()).setSingleAttribute(anyString(), anyString());
+    verify(fixture.users, never()).addUser(any(), any(), anyString(), anyBoolean(), anyBoolean());
+    assertTrue(fixture.singleUse.storedKeys().stream().noneMatch(key ->
+        key.startsWith("decent-wallet-login-v1:accepted:") || key.startsWith("decent-wallet-login-v1:callback:")));
+  }
+
+  @Test
   void signedSignupWithUnavailableExactLookupStaysPendingWithoutCreatingAnAccount() throws Exception {
     var fixture = new ProviderFixture();
     fixture.lookupUnavailable = true;
@@ -191,11 +227,28 @@ final class WalletSignedAccountActionFlowTest {
     WalletLoginTransactionStore.Binding binding() { return pending.binding(); }
   }
 
+  private static final class CapturingAuthorizationEndpoint extends AuthorizationEndpoint {
+    AuthenticationSessionModel authenticationSession;
+
+    CapturingAuthorizationEndpoint(KeycloakSession session, EventBuilder event) {
+      super(session, event);
+    }
+
+    @Override
+    protected Response handleBrowserAuthenticationRequest(AuthenticationSessionModel authSession,
+        org.keycloak.protocol.LoginProtocol protocol, boolean isPassive, boolean redirectToAuthentication) {
+      authenticationSession = authSession;
+      return Response.ok().build();
+    }
+  }
+
   private static final class ProviderFixture {
     final KeycloakSession session = mock(KeycloakSession.class);
     final RealmModel realm = mock(RealmModel.class);
     final ClientModel client = mock(ClientModel.class);
     final KeycloakUriInfo uriInfo = mock(KeycloakUriInfo.class);
+    final KeycloakContext context = mock(KeycloakContext.class);
+    final AtomicReference<AuthenticationSessionModel> currentAuth = new AtomicReference<>();
     final UserProvider users = mock(UserProvider.class);
     final Map<String, UserModel> accounts = new HashMap<>();
     final List<String> accountEvents = new ArrayList<>();
@@ -206,22 +259,38 @@ final class WalletSignedAccountActionFlowTest {
     final KeyPair ownerKey;
     final KeyPair rpKey;
     boolean lookupUnavailable;
+    boolean createRaceWinner;
+    boolean createRaceWinnerOnThirdLookup;
+    int accountLookupCount;
 
     ProviderFixture() throws Exception {
+      if (org.keycloak.common.Profile.getInstance() == null) {
+        org.keycloak.common.Profile.configure();
+      }
       ownerKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
       var ec = KeyPairGenerator.getInstance("EC");
       ec.initialize(new ECGenParameterSpec("secp256r1"));
       rpKey = ec.generateKeyPair();
       configureSignedRequestParser(session, rpKey);
-      var context = mock(KeycloakContext.class);
       when(session.getContext()).thenReturn(context);
       when(session.singleUseObjects()).thenReturn(singleUse);
       when(session.users()).thenReturn(users);
       when(context.getRealm()).thenReturn(realm);
       when(context.getUri()).thenReturn(uriInfo);
+      when(context.getAuthenticationSession()).thenAnswer(call -> currentAuth.get());
+      doAnswer(call -> { currentAuth.set(call.getArgument(0)); return null; })
+          .when(context).setAuthenticationSession(any());
+      when(context.getConnection()).thenReturn(mock(org.keycloak.common.ClientConnection.class));
+      when(context.getHttpRequest()).thenReturn(mock(org.keycloak.http.HttpRequest.class));
+      when(context.getRequestHeaders()).thenReturn(mock(jakarta.ws.rs.core.HttpHeaders.class));
+      when(context.getHttpResponse()).thenReturn(mock(org.keycloak.http.HttpResponse.class));
       when(uriInfo.getBaseUri()).thenReturn(URI.create(ORIGIN + "/"));
       when(realm.getId()).thenReturn("realm-id");
       when(realm.getName()).thenReturn("demo");
+      when(realm.isEnabled()).thenReturn(true);
+      var parConfig = mock(org.keycloak.models.ParConfig.class);
+      when(realm.getParPolicy()).thenReturn(parConfig);
+      when(parConfig.isRequirePushedAuthorizationRequests(client)).thenReturn(false);
       when(realm.isRegistrationAllowed()).thenReturn(true);
       when(realm.getClientByClientId(CLIENT)).thenReturn(client);
       when(realm.getAttribute(WalletLoginTransportResourceFactory.KEY_SITE_LABEL)).thenReturn("Example Site");
@@ -239,6 +308,16 @@ final class WalletSignedAccountActionFlowTest {
       var config = new WalletAccountRequestExecutor.Configuration();
       config.setEnabled(true);
       policy.setupConfiguration(config);
+      var clientPolicy = mock(org.keycloak.services.clientpolicy.ClientPolicyManager.class);
+      when(session.clientPolicy()).thenReturn(clientPolicy);
+      doAnswer(call -> {
+        var clientPolicyContext = call.getArgument(0, org.keycloak.services.clientpolicy.ClientPolicyContext.class);
+        if (clientPolicyContext instanceof AuthorizationRequestContext authorizationRequest) {
+          policy.executeOnEvent(authorizationRequest);
+        }
+        return null;
+      }).when(clientPolicy).triggerOnEvent(any());
+      when(session.getProvider(LoginFormsProvider.class)).thenReturn(mock(LoginFormsProvider.class, RETURNS_SELF));
       authenticator = (WalletChallengeAuthenticator) new WalletChallengeAuthenticatorFactory().create(session);
 
       when(users.searchForUserByUserAttributeStream(any(), anyString(), anyString())).thenAnswer(call -> {
@@ -246,12 +325,18 @@ final class WalletSignedAccountActionFlowTest {
         assertEquals(IDENTITY_ATTRIBUTE, call.getArgument(1));
         assertEquals(IDENTITY, call.getArgument(2));
         accountEvents.add("lookup");
+        accountLookupCount++;
+        if (createRaceWinnerOnThirdLookup && accountLookupCount == 3) addRaceWinner();
         return lookupUnavailable ? null : accounts.values().stream()
             .filter(user -> IDENTITY.equals(user.getFirstAttribute(IDENTITY_ATTRIBUTE)));
       });
       when(users.addUser(any(), any(), anyString(), anyBoolean(), anyBoolean())).thenAnswer(call -> {
         assertSame(realm, call.getArgument(0));
         accountEvents.add("create");
+        if (createRaceWinner) {
+          addRaceWinner();
+          throw new IllegalStateException("concurrent username creation");
+        }
         String username = call.getArgument(2);
         var user = mock(UserModel.class);
         var attributes = new HashMap<String, String>();
@@ -267,6 +352,14 @@ final class WalletSignedAccountActionFlowTest {
       });
     }
 
+    private void addRaceWinner() {
+      var winner = mock(UserModel.class);
+      when(winner.getId()).thenReturn("race-winner-subject");
+      when(winner.getFirstAttribute(IDENTITY_ATTRIBUTE)).thenReturn(IDENTITY);
+      when(winner.isEnabled()).thenReturn(true);
+      accounts.put("race-winner", winner);
+    }
+
     UserModel existingAccount() {
       var existing = mock(UserModel.class);
       when(existing.getId()).thenReturn("existing-subject");
@@ -278,7 +371,6 @@ final class WalletSignedAccountActionFlowTest {
 
     Ceremony start(String action, WalletLoginTransactionStore.Intent intent) throws Exception {
       var request = Request.fresh();
-      var auth = newAuthenticationSession();
       long now = Instant.now().getEpochSecond();
       long expires = now + 240;
       var payload = new ObjectMapper().createObjectNode()
@@ -295,18 +387,29 @@ final class WalletSignedAccountActionFlowTest {
       var params = new MultivaluedHashMap<String, String>();
       params.add("client_id", CLIENT);
       params.add("request", signedRequestObject(payload, rpKey, RP_KID));
-      var parsed = parseAuthorizationRequest(session, client, params);
-      policy.executeOnEvent(new AuthorizationRequestContext(mock(OIDCResponseType.class), parsed,
-          parsed.getRedirectUri(), params, auth));
+      when(uriInfo.getQueryParameters()).thenReturn(params);
 
-      // Project the real parser result using the pinned endpoint's note conventions.
-      // This fixture does not invoke AuthorizationEndpoint.buildGet or activate realm client policies.
-      auth.setRedirectUri(parsed.getRedirectUri());
-      AuthorizationEndpoint.performActionOnParameters(parsed, auth::setClientNote);
-      parsed.getAdditionalReqParams().forEach((key, value) -> auth.setClientNote(
-          AuthorizationEndpoint.LOGIN_SESSION_NOTE_ADDITIONAL_REQ_PARAMS_PREFIX + key, value));
+      var root = mock(RootAuthenticationSessionModel.class);
+      when(root.getId()).thenReturn(randomToken(16));
+      var auth = newAuthenticationSession(root);
+      when(root.createAuthenticationSession(client)).thenReturn(auth);
+      var endpoint = new CapturingAuthorizationEndpoint(session,
+          mock(EventBuilder.class, RETURNS_SELF));
+      try (var managers = mockConstruction(AuthenticationSessionManager.class, (manager, ignored) -> {
+        when(manager.getCurrentRootAuthenticationSession(realm)).thenReturn(null);
+        when(manager.getUserSessionFromAuthenticationCookie(realm)).thenReturn(null);
+        when(manager.createAuthenticationSession(realm, true)).thenReturn(root);
+      }); var response = endpoint.buildGet()) {
+        assertEquals(200, response.getStatus());
+        assertNull(response.getLocation());
+      }
+      assertSame(auth, endpoint.authenticationSession);
       assertEquals("true", auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_SIGNED));
       assertEquals(action, auth.getAuthNote(WalletAccountRequestExecutor.AUTH_NOTE_ACTION));
+      assertEquals(action, auth.getClientNote("client_request_param_"
+          + WalletAccountRequestExecutor.ACTION_PARAM));
+      assertNotNull(auth.getClientNote("client_request_param_"
+          + WalletAccountRequestExecutor.REQUEST_PARAM));
       assertEquals(request.state(), auth.getClientNote("state"));
       assertEquals(request.nonce(), auth.getClientNote("nonce"));
       assertEquals(request.challenge(), auth.getClientNote("code_challenge"));
@@ -351,13 +454,11 @@ final class WalletSignedAccountActionFlowTest {
           signedProof(pending.challenge(), IDENTITY, ownerKey));
     }
 
-    private AuthenticationSessionModel newAuthenticationSession() {
+    private AuthenticationSessionModel newAuthenticationSession(RootAuthenticationSessionModel root) {
       var auth = mock(AuthenticationSessionModel.class);
-      var root = mock(RootAuthenticationSessionModel.class);
       var authNotes = new HashMap<String, String>();
       var clientNotes = new HashMap<String, String>();
       var redirect = new AtomicReference<String>();
-      when(root.getId()).thenReturn(randomToken(16));
       when(auth.getTabId()).thenReturn(randomToken(16));
       when(auth.getParentSession()).thenReturn(root);
       when(auth.getClient()).thenReturn(client);

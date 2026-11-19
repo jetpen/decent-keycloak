@@ -67,6 +67,9 @@ public final class WalletLoginTransportResourceFactory
       @Override public org.keycloak.models.UserModel ensureEnabledUser(String identityId) {
         return WalletLoginAccountMapping.ensureEnabledUser(session.users(), realm, identityId, true);
       }
+      @Override public org.keycloak.models.UserModel createNewEnabledUser(String identityId) {
+        return WalletLoginAccountMapping.createNewEnabledUser(session.users(), realm, identityId);
+      }
     };
     var resource = new WalletLoginTransportResource();
     resource.configure(session,
