@@ -1,6 +1,9 @@
 # Maven build output
 target/
 
+# Persistent keycloakctl run-ID reservations (not Maven build output)
+/.keycloakctl/
+
 # Python test/runtime artifacts
 scripts/__pycache__/
 container/__pycache__/

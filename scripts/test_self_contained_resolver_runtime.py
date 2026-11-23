@@ -684,7 +684,8 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
       self.assertRegex(source['commit'], re.compile(r'^[0-9a-f]{40}$'))
       self.assertNotIn('archive_sha256', source)
       self.assertNotIn('url', source)
-      self.assertRegex(source['git_url'], re.compile(r'^https://github\.com/[^/]+/[^/]+\.git$'))
+      self.assertTrue(source['git_url'].startswith('https://github.com/'))
+      self.assertTrue(source['git_url'].endswith('.git'))
       self.assertTrue(source['requirements_lock'])
 
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
@@ -727,16 +728,39 @@ class SelfContainedResolverRuntimeTest(unittest.TestCase):
     self.assertIn('TIMEOUT_SECONDS = 10', resolver)
     self.assertIn('isConfirmedIdentityNotFound(outputText, exactRegistryObjectKeyHex(identityId))', resolver)
 
+  def test_source_git_url_policy_requires_github_https_urls(self):
+    import importlib.util
+
+    path = ROOT / 'container/verify_resolver_runtime_inputs.py'
+    spec = importlib.util.spec_from_file_location('resolver_input_verifier', path)
+    self.assertIsNotNone(spec)
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    for value in ('https://github.com/jetpen/decent-identity.git',
+                  'https://github.com/jetpen/decent-registry.git'):
+      with self.subTest(value=value):
+        self.assertTrue(verifier.is_pinned_git_url(value))
+    for value in ('git@github.com:jetpen/decent-identity.git',
+                  'https://github.com.evil/jetpen/decent-identity.git',
+                  'ssh://git@github.com/jetpen/decent-identity.git',
+                  'https://github.com/jetpen/decent-identity.git/extra'):
+      with self.subTest(value=value):
+        self.assertFalse(verifier.is_pinned_git_url(value))
+
   def test_source_inputs_are_commit_pinned_git_contexts_not_source_archives(self):
     lock = json.loads((ROOT / 'container/resolver-runtime.lock.json').read_text())
-    self.assertEqual({'identity', 'registry'}, set(lock['sources']))
+    self.assertEqual({'identity': 'https://github.com/jetpen/decent-identity.git',
+                      'registry': 'https://github.com/jetpen/decent-registry.git'},
+                     {name: source['git_url'] for name, source in lock['sources'].items()})
     for name, commit in (
         ('identity', '2caec24de52c2dbe241e72fe317281c051d03f89'),
         ('registry', '628120989703d146da50af97b4602f1f4aa3a068')):
       source = lock['sources'][name]
       self.assertEqual(commit, source['commit'])
       self.assertIsInstance(source.get('git_url'), str)
-      self.assertRegex(source['git_url'], re.compile(r'^https://github\.com/[^/]+/[^/]+\.git$'))
+      self.assertTrue(source['git_url'].startswith('https://github.com/'))
+      self.assertTrue(source['git_url'].endswith('.git'))
       self.assertNotIn('archive_sha256', source)
       self.assertFalse((ROOT / 'container/source-archives' / f'{name}.tar.gz').exists())
 

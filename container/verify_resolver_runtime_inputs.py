@@ -21,7 +21,7 @@ def sha256(path: Path) -> str:
 
 def is_pinned_git_url(value: object) -> bool:
   return isinstance(value, str) and re.fullmatch(
-      r"https://github\.com/[^/]+/[^/]+\.git", value) is not None
+      r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git", value) is not None
 
 
 def verify_repo_overlays(directory: Path, manifest: dict) -> None:
