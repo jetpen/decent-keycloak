@@ -1,0 +1,1060 @@
+"""Offline contract tests through the executable, in isolated scratch repositories."""
+
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class KeycloakctlTest(unittest.TestCase):
+  def setUp(self):
+    scratch = tempfile.TemporaryDirectory(prefix="keycloakctl-test-")
+    self.addCleanup(scratch.cleanup)
+    self.cwd = Path(scratch.name)
+    self.repo = self.cwd / "repo"
+    self.repo.mkdir()
+    (self.repo / "scripts").mkdir()
+    shutil.copy2(ROOT / "keycloakctl", self.repo)
+    (self.repo / "container/rp-fixture").mkdir(parents=True)
+    shutil.copy2(ROOT / "container/Dockerfile", self.repo / "container/Dockerfile")
+    shutil.copy2(ROOT / "container/rp-fixture/Dockerfile", self.repo / "container/rp-fixture/Dockerfile")
+    shutil.copy2(ROOT / "scripts/oidc_rp_fixture.py", self.repo / "scripts/oidc_rp_fixture.py")
+    for relative in ("scripts/lifecycle.py", "scripts/remote_test_host.py"):
+      shutil.copy2(ROOT / relative, self.repo / relative)
+    for module in ROOT.glob("scripts/keycloakctl*.py"):
+      shutil.copy2(module, self.repo / "scripts")
+    if (ROOT / "config/keycloakctl").is_dir():
+      shutil.copytree(ROOT / "config/keycloakctl", self.repo / "config/keycloakctl")
+    python311 = shutil.which("python3.11")
+    self.env = {
+        "HOME": str(self.cwd),
+        "PATH": os.pathsep.join(filter(None, [str(Path(python311).parent) if python311 else None,
+                                                   str(Path(sys.executable).absolute().parent), os.defpath])),
+        "LC_ALL": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+  def cli(self, *args):
+    return subprocess.run([str(self.repo / "keycloakctl"), *args], cwd=self.cwd,
+                          env=self.env, capture_output=True, text=True, timeout=10)
+
+  def config_file(self, data):
+    path = self.cwd / "config.json"
+    path.write_text(json.dumps(data) if isinstance(data, dict) else data, encoding="utf-8")
+    return path.name  # Caller-relative paths, distinct from the executable's repository.
+
+  def test_config_validation_accepts_only_supported_closed_profile_shapes(self):
+    basic = {"version": 1, "profile": "dev", "engine": "podman"}
+    result = self.cli("validate-config", "--config", self.config_file(basic))
+    self.assertEqual(0, result.returncode, result.stderr)
+    self.assertEqual("configuration valid\n", result.stdout)
+    for profile in ("dev", "ci", "readiness", "qualification"):
+      with self.subTest(profile=profile):
+        result = self.cli("validate-config", "--profile", profile, "--config",
+                          str(self.repo / f"config/keycloakctl/{profile}.json"))
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    marker = "test-secret-marker-68f4b979e3"
+    malformed = (
+        {**basic, "password": marker},
+        {**basic, marker: "value"},
+        {**basic, "profile": marker},
+        {**basic, "version": True},
+        {**basic, "version": 1.0},
+        {**basic, "engine": "docker\n"},
+        {**basic, "remote": {}},
+        {**basic, "profile": "readiness", "remote": {"token": marker}},
+        {**basic, "profile": "readiness", "remote": {"target_ip": "100.128.0.1"}},
+        {**basic, "profile": "qualification", "remote": {"route_attested": "yes"}},
+        {**basic, "profile": "qualification", "remote": {"target_host": "user@ben-x260"}},
+        {**basic, "profile": "readiness", "remote": {"target_host": "ben-x260;id"}},
+        {**basic, "profile": "readiness", "remote": {"target_user": "ben;id"}},
+        {**basic, "profile": "qualification", "remote": {"public_origin": f"https://rp.invalid/?token={marker}"}},
+        f'{{"version":1,"profile":"{marker}","profile":"dev","engine":"podman"}}',
+        '{"version":1,"profile":"readiness","engine":"podman","remote":{"target_ip":"100.64.1.1","target_ip":"100.64.1.2"}}',
+        '{"version":1,"profile":"dev","engine":NaN}',
+        " " * 8193 + json.dumps(basic),
+    )
+    for case, data in enumerate(malformed):
+      with self.subTest(case=case):
+        result = self.cli("validate-config", "--config", self.config_file(data))
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("error: invalid configuration\n", result.stderr)
+        self.assertNotIn(marker, result.stderr)
+    self.assertFalse((self.repo / "target").exists())
+    self.assertFalse((self.repo / ".keycloakctl").exists())
+
+  def test_validator_tracks_schema_profile_and_required_rules(self):
+    schema_path = self.repo / "config/keycloakctl/config.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["properties"]["profile"]["enum"].append("review")
+    schema["required"] = ["version", "profile"]
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+    result = self.cli("validate-config", "--profile", "review",
+                      "--config", self.config_file({"version": 1, "profile": "review"}))
+    self.assertEqual((0, "configuration valid\n", ""),
+                     (result.returncode, result.stdout, result.stderr))
+
+  def test_public_https_origin_accepts_valid_explicit_port_only(self):
+    base = self.live_config()
+    for origin in ("https://fictional-keycloak.example.org:443",
+                   "https://fictional-keycloak.example.org:8443",
+                   "https://a.example.org:65535"):
+      with self.subTest(origin=origin):
+        result = self.cli("validate-config", "--config", self.config_file(
+            {**base, "remote": {**base["remote"], "public_origin": origin}}))
+        self.assertEqual(0, result.returncode, result.stderr)
+    for origin in ("https://fictional-keycloak.example.org:0",
+                   "https://fictional-keycloak.example.org:65536",
+                   "https://fictional-keycloak.example.org:user@other.example",
+                   "https://fictional-keycloak.example.org:8443/keycloak",
+                   "https://fictional-keycloak.example.org:8443?x=1",
+                   "https://fictional-keycloak.example.org:8443#fragment"):
+      with self.subTest(origin=origin):
+        result = self.cli("validate-config", "--config", self.config_file(
+            {**base, "remote": {**base["remote"], "public_origin": origin}}))
+        self.assertEqual(2, result.returncode)
+
+  def test_config_rejects_a_fifo_without_waiting_for_a_writer(self):
+    path = self.cwd / "config.pipe"
+    os.mkfifo(path)
+    self.rejection(2, "invalid configuration", "setup", "--config", path.name)
+    self.assertFalse((self.repo / "target").exists())
+    self.assertFalse((self.repo / ".keycloakctl").exists())
+
+  def run_directory(self, run_id):
+    return self.repo / "target/keycloakctl/runs" / run_id
+
+  def prepare_build_inputs(self):
+    shutil.copy2(ROOT / "pom.xml", self.repo / "pom.xml")
+    shutil.copytree(ROOT / "src", self.repo / "src")
+    for relative in ("decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar",
+                     "providers/java-json-canonicalization-1.1.jar", "providers/core-3.4.0.jar"):
+      path = self.repo / "target" / relative
+      path.parent.mkdir(parents=True, exist_ok=True)
+      path.write_bytes(f"test artifact: {relative}".encode("ascii"))
+    for relative in (
+        "container/build_resolver_runtime.py", "container/verify_resolver_runtime_inputs.py",
+        "container/resolver-runtime.lock.json", "container/resolver-binary-dependencies.lock.json",
+        "container/resolver-requirements.lock.txt", "container/resolver-build-requirements.lock.txt",
+        "container/registry-lock-constraints.txt", "container/resolver-requirements.in",
+        "container/rotation_registry_roundtrip.py", "container/patch_resolver_runtime.py",
+        "container/pinned_lookup_outcomes.py", "scripts/test_pinned_dht_peer_outcomes.py",
+        "scripts/test_pinned_registry_lookup_outcomes.py",
+        "scripts/test_pinned_adversarial_identity_peer.py", "scripts/test_rotation_registry_roundtrip.py",
+        "scripts/rotation_registry_roundtrip.py", "scripts/issue5_adversarial_cases.py"):
+      source = ROOT / relative
+      destination = self.repo / relative
+      destination.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(source, destination)
+    shutil.copytree(ROOT / "requirements", self.repo / "requirements")
+    (self.repo / "container").mkdir(exist_ok=True)
+    self.env["MATERIALIZER_LOG"] = str(self.cwd / "materializer.jsonl")
+    (self.repo / "container/build_resolver_runtime.py").write_text('''import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["MATERIALIZER_LOG"], "a") as log:
+  log.write(" ".join(args) + "\\n")
+if "--materialize-sources" in args:
+  if os.environ.get("MATERIALIZER_FAIL") == "sources": raise SystemExit(23)
+  destination = Path(args[args.index("--sources-directory") + 1])
+  for name in ("identity", "registry"):
+    source = destination / name
+    (source / "src").mkdir(parents=True, exist_ok=True)
+    (source / ".pinned-commit").write_text("0" * 40 + "\\n")
+elif "--materialize-binary-dependencies" in args:
+  if os.environ.get("MATERIALIZER_FAIL") == "binary": raise SystemExit(24)
+  destination = Path(args[args.index("--binary-dependencies-directory") + 1])
+  destination.mkdir(parents=True, exist_ok=True)
+  (destination / "locked-test-marker").write_text("test-only")
+else:
+  raise SystemExit(25)
+''', encoding="utf-8")
+    (self.repo / "container/verify_resolver_runtime_inputs.py").write_text('''import os, sys
+with open(os.environ["MATERIALIZER_LOG"], "a") as log:
+  log.write("verify " + " ".join(sys.argv[1:]) + "\\n")
+''', encoding="utf-8")
+    git = self.cwd / "git"
+    git.write_text('''#!/usr/bin/env python3.11
+import sys
+if sys.argv[1:] == ["rev-parse", "--verify", "HEAD"]:
+  print("0123456789abcdef0123456789abcdef01234567")
+else:
+  raise SystemExit(97)
+''', encoding="utf-8")
+    git.chmod(0o700)
+    mvn = self.cwd / "mvn"
+    mvn.write_text('''#!/usr/bin/env python3.11
+import os, sys
+if os.environ.get("MAVEN_SKIP_RC") != "1": raise SystemExit(92)
+if sys.argv[1:] != ["--batch-mode", "--no-transfer-progress", "package"]:
+  raise SystemExit(93)
+raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
+''', encoding="utf-8")
+    mvn.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+
+  def use_unavailable_engine(self):
+    engine = self.cwd / "podman"
+    engine.write_text("#!/bin/sh\nexit 97\n", encoding="ascii")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+
+  def setup_run(self, *args):
+    result = self.cli("setup", *args)
+    self.assertEqual(0, result.returncode, result.stderr)
+    self.assertEqual("", result.stderr)
+    self.assertRegex(result.stdout, r"\A[0-9a-f]{32}\n\Z")
+    return result.stdout.strip()
+
+  def test_setup_creates_a_minimal_run_and_only_reopens_the_named_run(self):
+    first = self.setup_run()
+    second = self.setup_run("--profile", "ci")
+    self.assertNotEqual(first, second)
+    manifest = self.run_directory(first) / "manifest.json"
+    original = manifest.read_bytes()
+    state = json.loads(original)
+    self.assertEqual({"version", "run_id", "profile", "completed", "config_sha256"}, set(state))
+    self.assertEqual((1, first, "dev", ["setup"]),
+                     (state["version"], state["run_id"], state["profile"], state["completed"]))
+    self.assertRegex(state["config_sha256"], r"\A[0-9a-f]{64}\Z")
+    self.assertEqual(first, self.setup_run("--run-id", first))
+    self.assertEqual(second, self.setup_run("--run-id", second))
+    self.assertEqual(original, manifest.read_bytes())
+    self.assertEqual({first, second}, {path.name for path in manifest.parent.parent.iterdir()})
+
+    unknown = self.cli("setup", "--run-id", "f" * 32)
+    self.assertEqual((2, "", "error: unknown run ID\n"),
+                     (unknown.returncode, unknown.stdout, unknown.stderr))
+    self.assertFalse(self.run_directory("f" * 32).exists())
+    for invalid in ("../escape", str(self.cwd / "outside"), "A" * 32, "a" * 33, "a" * 32 + "\n"):
+      with self.subTest(invalid=invalid):
+        result = self.cli("setup", "--run-id", invalid)
+        self.assertEqual((2, "", "error: invalid run ID\n"),
+                         (result.returncode, result.stdout, result.stderr))
+    self.assertEqual({first, second}, {path.name for path in manifest.parent.parent.iterdir()})
+    self.assertFalse((self.cwd / "outside").exists())
+
+  def test_target_cleanup_removes_run_state_but_keeps_reservation(self):
+    config_path = self.config_file(self.live_config(profile="readiness"))
+    run_id = self.setup_run("--config", config_path)
+    manifest = self.run_directory(run_id) / "manifest.json"
+    reservation = self.repo / ".keycloakctl/run-ids" / run_id
+    reservation_before = reservation.read_bytes()
+
+    shutil.rmtree(self.repo / "target")
+
+    self.rejection(2, "run readback conflict", "setup", "--run-id", run_id)
+    self.assertFalse(manifest.exists())
+    self.assertEqual(reservation_before, reservation.read_bytes())
+    new_run_id = self.setup_run()
+    self.assertNotEqual(run_id, new_run_id)
+    self.assertTrue(self.run_directory(new_run_id).is_dir())
+
+  def test_phase_guards_allow_only_next_phase_without_advancing_it(self):
+    result = self.cli("--help")
+    self.assertEqual(0, result.returncode, result.stderr)
+    for text in ("build", "test", "publish", "setup", "preflight", "deploy", "configure", "integration-test",
+                 "verify readiness", "verify qualification", "teardown", "promote", "full",
+                 "dev", "ci", "--profile", "--allow-live", "--allow-publish", "--new-run", "--run-id",
+                 "offline Java", "Surefire"):
+      with self.subTest(help=text):
+        self.assertIn(text, result.stdout)
+
+    self.prepare_build_inputs()
+    self.use_unavailable_engine()
+    run_id = self.setup_run("--profile", "dev")
+    dev = ("--run-id", run_id)
+    original = (self.run_directory(run_id) / "manifest.json").read_bytes()
+    self.rejection(2, "invalid phase order; next phase is build", "test", *dev)
+    self.rejection(2, "phase is not supported by run profile", "publish", *dev, "--allow-live")
+    self.rejection(3, "provider build or image readback failed", "build", *dev)
+    self.rejection(3, "provider build or image readback failed", "build", *dev)
+    self.rejection(3, "preflight unavailable for local profiles", "preflight", *dev)
+    self.assertEqual(original, (self.run_directory(run_id) / "manifest.json").read_bytes())
+
+  def test_build_uses_local_engine_then_verifies_immutable_ids_and_resumes(self):
+    # Fake only the process boundary. The executable must issue two local builds
+    # and inspect each resulting immutable image ID before recording success.
+    self.prepare_build_inputs()
+    maven_log = self.cwd / "maven-build.log"
+    mvn = self.cwd / "mvn"
+    mvn.write_text('''#!/usr/bin/env python3.11
+import os, sys
+from pathlib import Path
+if os.environ.get("MAVEN_SKIP_RC") != "1": raise SystemExit(92)
+Path(os.environ["MAVEN_BUILD_LOG"]).write_text("\\n".join(sys.argv[1:]) + "\\n")
+raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
+''', encoding="utf-8")
+    mvn.chmod(0o700)
+    self.env["MAVEN_BUILD_LOG"] = str(maven_log)
+    engine_log = self.cwd / "engine.jsonl"
+    engine = self.cwd / "docker"
+    engine.write_text('''#!/usr/bin/env python3.11
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["ENGINE_LOG"], "a") as out: out.write(json.dumps(args) + "\\n")
+if args[:2] == ["build", "--no-cache"]:
+  print("build complete")
+elif args[:3] == ["image", "inspect", "--format"]:
+  image = args[-1]
+  print(image if image.startswith("sha256:") else ("1" if "provider" in image else "2") * 64)
+else:
+  raise SystemExit(91)
+''', encoding="utf-8")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["ENGINE_LOG"] = str(engine_log)
+    materializer_log = self.cwd / "materializer.jsonl"
+    self.env["MATERIALIZER_LOG"] = str(materializer_log)
+    config = self.config_file({"version": 1, "profile": "ci", "engine": "docker"})
+    run_id = self.setup_run("--profile", "ci", "--config", config)
+    first = self.cli("build", "--config", config, "--run-id", run_id)
+    self.assertEqual((0, "build verified\n", ""),
+                     (first.returncode, first.stdout, first.stderr))
+    self.assertEqual(["--batch-mode", "--no-transfer-progress", "package"],
+                     maven_log.read_text().splitlines())
+    commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
+    self.assertEqual(4, len(commands))
+    provider_build = commands[0]
+    self.assertEqual(["build", "--no-cache", "--network=none", "--label",
+                      f"io.decent-keycloak.run-id={run_id}", "--tag",
+                      f"localhost/decent-keycloak/provider:{run_id}", "--file", "container/Dockerfile"],
+                     provider_build[:provider_build.index("--build-arg")])
+    build_args = [provider_build[index + 1] for index, value in enumerate(provider_build[:-1])
+                  if value == "--build-arg"]
+    self.assertEqual(["LIFECYCLE_RUN_ID=" + run_id,
+                      "SOURCE_REVISION=0123456789abcdef0123456789abcdef01234567"],
+                     [value for value in build_args if value.startswith(("LIFECYCLE_RUN_ID=", "SOURCE_REVISION="))])
+    for name in ("IMAGE_SOURCE_SHA256", "IMAGE_ARTIFACTS_SHA256"):
+      values = [value.split("=", 1)[1] for value in build_args if value.startswith(name + "=")]
+      self.assertEqual(1, len(values))
+      self.assertRegex(values[0], r"\A[0-9a-f]{64}\Z")
+    named_contexts = [provider_build[index + 1] for index, value in enumerate(provider_build[:-1])
+                      if value == "--build-context"]
+    self.assertEqual(["identity-src", "registry-src", "binary-dependencies"],
+                     [value.split("=", 1)[0] for value in named_contexts])
+    self.assertTrue(all(Path(value.split("=", 1)[1]).is_absolute() for value in named_contexts))
+    self.assertEqual(".", provider_build[-1])
+    rp_build = commands[2]
+    self.assertEqual(["build", "--no-cache", "--network=none", "--label",
+                      f"io.decent-keycloak.run-id={run_id}", "--tag",
+                      f"localhost/decent-keycloak/rp-fixture:{run_id}", "--file",
+                      "container/rp-fixture/Dockerfile"], rp_build[:rp_build.index("--build-context")])
+    rp_contexts = [rp_build[index + 1] for index, value in enumerate(rp_build[:-1])
+                   if value == "--build-context"]
+    self.assertEqual(["binary-dependencies"], [value.split("=", 1)[0] for value in rp_contexts])
+    self.assertTrue(all(Path(value.split("=", 1)[1]).is_absolute() for value in rp_contexts))
+    self.assertEqual(".", rp_build[-1])
+    rp_dockerfile = (self.repo / "container/rp-fixture/Dockerfile").read_text()
+    self.assertIn("COPY --from=binary-dependencies /resolver-wheelhouse.tar.gz", rp_dockerfile)
+    self.assertIn("python3.11 -m pip install --disable-pip-version-check --no-compile --no-index", rp_dockerfile)
+    self.assertIn("--find-links=/tmp/rp-fixture-wheelhouse --require-hashes -r /tmp/rp-fixture.lock", rp_dockerfile)
+    self.assertNotRegex(rp_dockerfile, r"(?m)^CMD(?:\s|$)")
+    self.assertIn("cryptography==50.0.1", (self.repo / "requirements/rp-fixture.lock").read_text())
+    materialized_commands = [line.split() for line in materializer_log.read_text().splitlines()]
+    self.assertEqual(3, len(materialized_commands))
+    self.assertIn("--materialize-sources", materialized_commands[0])
+    self.assertIn("--materialize-binary-dependencies", materialized_commands[1])
+    self.assertEqual("verify", materialized_commands[2][0])
+    self.assertTrue(all(not Path(value.split("=", 1)[1]).exists() for value in named_contexts))
+    self.assertEqual(["image", "inspect", "--format", "{{.Id}}",
+                      f"localhost/decent-keycloak/provider:{run_id}"], commands[1])
+    self.assertEqual(["image", "inspect", "--format", "{{.Id}}",
+                      f"localhost/decent-keycloak/rp-fixture:{run_id}"], commands[3])
+    self.assertTrue(all("--network=none" in command for command in commands if command[0] == "build"))
+    self.assertFalse(any(token in {"push", "publish", "deploy", "run"}
+                         for command in commands for token in command))
+    receipt = self.run_directory(run_id) / "build.json"
+    state = json.loads(receipt.read_text())
+    self.assertEqual("complete", state["status"])
+    self.assertEqual("sha256:" + "1" * 64, state["images"]["provider"]["image_id"])
+    self.assertEqual("sha256:" + "2" * 64, state["images"]["rp-fixture"]["image_id"])
+    for image in state["images"].values():
+      self.assertRegex(image["source_sha256"], r"\A[0-9a-f]{64}\Z")
+      self.assertRegex(image["config_sha256"], r"\A[0-9a-f]{64}\Z")
+    before = receipt.read_bytes()
+    materializer_count = len(materializer_log.read_text().splitlines())
+    self.env["MATERIALIZER_FAIL"] = "sources"
+    again = self.cli("build", "--config", config, "--run-id", run_id)
+    self.assertEqual((0, "build verified\n", ""),
+                     (again.returncode, again.stdout, again.stderr))
+    self.assertEqual(before, receipt.read_bytes())
+    self.assertEqual(materializer_count, len(materializer_log.read_text().splitlines()))
+    self.assertEqual(6, len(engine_log.read_text().splitlines()))
+
+  def test_build_stops_before_materializing_or_building_when_provider_package_fails(self):
+    self.prepare_build_inputs()
+    self.use_unavailable_engine()
+    self.env["MAVEN_BUILD_EXIT"] = "1"
+    run_id = self.setup_run()
+
+    result = self.cli("build", "--run-id", run_id)
+
+    self.assertEqual((3, "", ["error: offline provider package failed"]),
+                     (result.returncode, result.stdout, result.stderr.splitlines()))
+    run_dir = self.run_directory(run_id)
+    failures = [json.loads(path.read_text()) for path in run_dir.glob("failure-*.json")]
+    self.assertEqual([{"version": 1, "run_id": run_id, "phase": "provider-package", "status": "failed"}],
+                     failures)
+    self.assertEqual([], list(run_dir.glob("provider.json")))
+    self.assertFalse((self.cwd / "materializer.jsonl").exists())
+    self.assertFalse((self.cwd / "engine.jsonl").exists())
+
+  def test_test_phase_follows_verified_build_and_runs_offline_checks_once(self):
+    self.prepare_build_inputs()
+    engine_log = self.cwd / "engine.jsonl"
+    engine = self.cwd / "podman"
+    engine.write_text('''#!/usr/bin/env python3.11
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["ENGINE_LOG"], "a") as out: out.write(json.dumps(args) + "\\n")
+if args[0] == "build": print("build complete")
+elif args[:3] == ["image", "inspect", "--format"]:
+  image = args[-1]
+  print(image if image.startswith("sha256:") else ("1" if "provider" in image else "2") * 64)
+elif args[:3] == ["run", "--rm", "--network=none"]:
+  image = args[args.index("--entrypoint") + 2]
+  if image.startswith("sha256:" + "1" * 64):
+    with open(os.environ["STEP_LOG"], "a") as out: out.write("image-smoke\\n")
+    print("Keycloak 26.8.0\\nJVM: 21")
+  else:
+    with open(os.environ["STEP_LOG"], "a") as out: out.write("rp-fixture-smoke\\n")
+    print("RP fixture import ok")
+    raise SystemExit(int(os.environ.get("RP_SMOKE_EXIT", "0")))
+else: raise SystemExit(91)
+''', encoding="utf-8")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["ENGINE_LOG"] = str(engine_log)
+    run_id = self.setup_run()
+    self.rejection(2, "invalid phase order; next phase is build", "test", "--run-id", run_id)
+    built = self.cli("build", "--run-id", run_id)
+    self.assertEqual((0, "build verified\n", ""), (built.returncode, built.stdout, built.stderr))
+
+    failed_java_run = self.setup_run()
+    java_rebuild = self.cli("build", "--run-id", failed_java_run)
+    self.assertEqual(0, java_rebuild.returncode, java_rebuild.stderr)
+    failed_surefire_run = self.setup_run()
+    surefire_rebuild = self.cli("build", "--run-id", failed_surefire_run)
+    self.assertEqual(0, surefire_rebuild.returncode, surefire_rebuild.stderr)
+    failed_fixture_smoke_run = self.setup_run()
+    fixture_build = self.cli("build", "--run-id", failed_fixture_smoke_run)
+    self.assertEqual(0, fixture_build.returncode, fixture_build.stderr)
+    failed_compile_run = self.setup_run()
+    compile_build = self.cli("build", "--run-id", failed_compile_run)
+    self.assertEqual(0, compile_build.returncode, compile_build.stderr)
+    failed_diff_run = self.setup_run()
+    diff_build = self.cli("build", "--run-id", failed_diff_run)
+    self.assertEqual(0, diff_build.returncode, diff_build.stderr)
+
+    test_log = self.cwd / "python-tests.log"
+    surefire_log = self.cwd / "surefire.log"
+    step_log = self.cwd / "steps.log"
+    mvn = self.cwd / "mvn"
+    mvn.write_text('''#!/usr/bin/env python3.11
+import os, shutil, sys
+from pathlib import Path
+if os.environ.get("MAVEN_SKIP_RC") != "1": raise SystemExit(92)
+with open(os.environ["STEP_LOG"], "a") as out: out.write("java-tests\\n")
+Path(os.environ["MAVEN_LOG"]).write_text("\\n".join(sys.argv[1:]) + "\\n")
+if "clean" in sys.argv[1:]: shutil.rmtree(Path.cwd() / "target", ignore_errors=True)
+raise SystemExit(int(os.environ.get("MAVEN_EXIT", "0")))
+''', encoding="utf-8")
+    mvn.chmod(0o700)
+    (self.repo / "scripts/lifecycle.py").write_text('''import os, sys
+from pathlib import Path
+def java_21_runtime(output):
+  return "JVM: 21" in output
+if __name__ == "__main__":
+  if sys.argv[1:] == ["verify-surefire"]:
+    with open(os.environ["STEP_LOG"], "a") as out: out.write("surefire\\n")
+    Path(os.environ["SUREFIRE_LOG"]).write_text("verified\\n")
+    raise SystemExit(int(os.environ.get("SUREFIRE_EXIT", "0")))
+  elif sys.argv[1:] in (["python-tests"], ["python-compile"], ["diff-check"]):
+    action = sys.argv[1]
+    with open(os.environ["STEP_LOG"], "a") as out: out.write(action + "\\n")
+    if action == "python-tests":
+      Path(os.environ["PYTHON_TEST_LOG"]).write_text("passed\\n")
+    raise SystemExit(int(os.environ.get(action.upper().replace('-', '_') + "_EXIT", "0")))
+  else: raise SystemExit(91)
+''', encoding="utf-8")
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["STEP_LOG"] = str(step_log)
+    self.env["MAVEN_LOG"] = str(self.cwd / "maven.log")
+    self.env["SUREFIRE_LOG"] = str(surefire_log)
+    self.env["PYTHON_TEST_LOG"] = str(test_log)
+    tested = self.cli("test", "--run-id", run_id)
+    self.assertEqual((0, "test verified\n", ""), (tested.returncode, tested.stdout, tested.stderr))
+    self.assertTrue((self.run_directory(run_id) / "manifest.json").exists())
+    self.assertEqual("passed\n", test_log.read_text())
+    self.assertEqual(["--offline", "--batch-mode", "--no-transfer-progress", "package"],
+                     (self.cwd / "maven.log").read_text().splitlines())
+    self.assertEqual(["verified"], surefire_log.read_text().splitlines())
+    self.assertEqual(["java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check"],
+                     step_log.read_text().splitlines())
+    receipt = json.loads((self.run_directory(run_id) / "test.json").read_text())
+    self.assertEqual("complete", receipt["status"])
+    self.assertEqual([
+        {"name": "java-tests", "status": "pass"},
+        {"name": "surefire", "status": "pass"},
+        {"name": "python-tests", "status": "pass"},
+        {"name": "python-compile", "status": "pass"},
+        {"name": "image-smoke", "status": "pass"},
+        {"name": "rp-fixture-smoke", "status": "pass"},
+        {"name": "diff-check", "status": "pass"},
+    ], receipt["steps"])
+    self.assertEqual("sha256:" + "1" * 64, receipt["provider_image_id"])
+    engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
+    smoke_commands = [command for command in engine_commands
+                      if command[:3] == ["run", "--rm", "--network=none"]]
+    self.assertEqual(2, len(smoke_commands))
+    self.assertEqual(["run", "--rm", "--network=none", "--entrypoint",
+                      "/opt/keycloak/bin/kc.sh", "sha256:" + "1" * 64, "--version"],
+                     smoke_commands[0])
+    self.assertEqual(["run", "--rm", "--network=none", "--entrypoint", "python3.11",
+                      "sha256:" + "2" * 64, "-c", "import sys; sys.path.insert(0, '/opt/rp-fixture'); "
+                      "import oidc_rp_fixture; print('RP fixture import ok')"], smoke_commands[1])
+
+    resumed = self.cli("test", "--run-id", run_id)
+    self.assertEqual((0, "test verified\n", ""), (resumed.returncode, resumed.stdout, resumed.stderr))
+    self.assertEqual("passed\n", test_log.read_text())
+    self.assertEqual(2, sum(command[:3] == ["run", "--rm", "--network=none"]
+                             for command in map(json.loads, engine_log.read_text().splitlines())))
+    java_test_source = next((self.repo / "src/test/java").rglob("*.java"))
+    java_test_source.write_text(java_test_source.read_text() + chr(10) + "// test input changed")
+    stale_receipt = self.cli("test", "--run-id", run_id)
+    self.assertEqual(2, stale_receipt.returncode)
+    self.assertEqual("", stale_receipt.stdout)
+    self.assertEqual(["error: test source readback conflict"], stale_receipt.stderr.splitlines())
+    self.assertEqual(["java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check"],
+                     step_log.read_text().splitlines())
+
+    self.env["MAVEN_EXIT"] = "23"
+    test_log.unlink()
+    failed_java = self.cli("test", "--run-id", failed_java_run)
+    self.assertEqual(3, failed_java.returncode)
+    self.assertEqual("", failed_java.stdout)
+    self.assertEqual(["error: offline Java test suite failed"], failed_java.stderr.splitlines())
+    java_failure = json.loads(next(self.run_directory(failed_java_run).glob("failure-*.json")).read_text())
+    self.assertEqual("java-tests", java_failure["phase"])
+    self.assertFalse((self.run_directory(failed_java_run) / "test.json").exists())
+    self.assertFalse(test_log.exists())
+    self.assertEqual(["java-tests"], step_log.read_text().splitlines()[-1:])
+
+    self.env["MAVEN_EXIT"] = "0"
+    self.env["SUREFIRE_EXIT"] = "19"
+    failed_surefire = self.cli("test", "--run-id", failed_surefire_run)
+    self.assertEqual(3, failed_surefire.returncode)
+    self.assertEqual("", failed_surefire.stdout)
+    self.assertEqual(["error: Surefire verification failed"], failed_surefire.stderr.splitlines())
+    surefire_failure = json.loads(next(self.run_directory(failed_surefire_run).glob("failure-*.json")).read_text())
+    self.assertEqual("surefire", surefire_failure["phase"])
+    self.assertFalse((self.run_directory(failed_surefire_run) / "test.json").exists())
+    self.assertFalse(test_log.exists())
+    self.assertEqual(["java-tests", "surefire"], step_log.read_text().splitlines()[-2:])
+    engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
+    self.assertEqual(2, sum(command[:3] == ["run", "--rm", "--network=none"]
+                             for command in engine_commands))
+
+    self.env["MAVEN_EXIT"] = "0"
+    self.env["SUREFIRE_EXIT"] = "0"
+    self.env["RP_SMOKE_EXIT"] = "19"
+    failed_fixture_smoke = self.cli("test", "--run-id", failed_fixture_smoke_run)
+    self.assertEqual((3, "", "error: RP fixture image smoke failed\n"),
+                     (failed_fixture_smoke.returncode, failed_fixture_smoke.stdout,
+                      failed_fixture_smoke.stderr))
+    fixture_failure = json.loads(next(self.run_directory(failed_fixture_smoke_run)
+                                      .glob("failure-*.json")).read_text())
+    self.assertEqual("rp-fixture-smoke", fixture_failure["phase"])
+    self.assertFalse((self.run_directory(failed_fixture_smoke_run) / "test.json").exists())
+    engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
+    self.assertEqual(4, sum(command[:3] == ["run", "--rm", "--network=none"]
+                             for command in engine_commands))
+
+    self.env["PYTHON_COMPILE_EXIT"] = "17"
+    failed_compile = self.cli("test", "--run-id", failed_compile_run)
+    self.assertEqual((3, "", "error: Python compilation failed\n"),
+                     (failed_compile.returncode, failed_compile.stdout, failed_compile.stderr))
+    compile_failure = json.loads(next(self.run_directory(failed_compile_run)
+                                      .glob("failure-*.json")).read_text())
+    self.assertEqual({"version": 1, "run_id": failed_compile_run,
+                      "phase": "python-compile", "status": "failed"}, compile_failure)
+    self.assertFalse((self.run_directory(failed_compile_run) / "test.json").exists())
+    self.assertEqual(["java-tests", "surefire", "python-tests", "python-compile"],
+                     step_log.read_text().splitlines()[-4:])
+
+    self.env["PYTHON_COMPILE_EXIT"] = "0"
+    self.env["RP_SMOKE_EXIT"] = "0"
+    self.env["DIFF_CHECK_EXIT"] = "21"
+    failed_diff = self.cli("test", "--run-id", failed_diff_run)
+    self.assertEqual((3, "", "error: diff check failed\n"),
+                     (failed_diff.returncode, failed_diff.stdout, failed_diff.stderr))
+    diff_failure = json.loads(next(self.run_directory(failed_diff_run)
+                                   .glob("failure-*.json")).read_text())
+    self.assertEqual({"version": 1, "run_id": failed_diff_run,
+                      "phase": "diff-check", "status": "failed"}, diff_failure)
+    self.assertFalse((self.run_directory(failed_diff_run) / "test.json").exists())
+    self.assertEqual(["java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check"],
+                     step_log.read_text().splitlines()[-7:])
+
+  def test_build_stops_before_engine_when_locked_input_fetch_fails(self):
+    self.prepare_build_inputs()
+    engine_log = self.cwd / "engine.jsonl"
+    engine = self.cwd / "podman"
+    engine.write_text('''#!/usr/bin/env python3.11
+import json, os, sys
+with open(os.environ["ENGINE_LOG"], "a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")
+raise SystemExit(91)
+''', encoding="utf-8")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["ENGINE_LOG"] = str(engine_log)
+    self.env["MATERIALIZER_FAIL"] = "sources"
+    run_id = self.setup_run()
+
+    failed = self.cli("build", "--run-id", run_id)
+
+    self.assertEqual((3, "", "error: provider build prerequisites failed\n"),
+                     (failed.returncode, failed.stdout, failed.stderr))
+    run_dir = self.run_directory(run_id)
+    failure = json.loads(next(run_dir.glob("failure-*.json")).read_text())
+    self.assertEqual({"version": 1, "run_id": run_id,
+                      "phase": "resolver-inputs", "status": "failed"}, failure)
+    self.assertFalse(engine_log.exists())
+    materialized = [line.split() for line in
+                    (self.cwd / "materializer.jsonl").read_text().splitlines()]
+    sources = Path(materialized[0][materialized[0].index("--sources-directory") + 1])
+    self.assertFalse(sources.exists())
+    self.assertFalse((self.repo / "resolver-wheelhouse.tar.gz").exists())
+
+  def test_build_failure_is_durable_and_resume_keeps_verified_provider(self):
+    self.prepare_build_inputs()
+    engine_log = self.cwd / "engine.jsonl"
+    engine = self.cwd / "podman"
+    engine.write_text('''#!/usr/bin/env python3.11
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["ENGINE_LOG"], "a") as out: out.write(json.dumps(args) + "\\n")
+if args[0] == "build":
+  if "rp-fixture" in args[args.index("--tag") + 1] and os.environ.get("FAIL_RP") == "1":
+    raise SystemExit(12)
+elif args[:3] == ["image", "inspect", "--format"]:
+  image = args[-1]
+  print(image if image.startswith("sha256:") else "sha256:" + ("1" if "provider" in image else "2") * 64)
+else:
+  raise SystemExit(91)
+''', encoding="utf-8")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["ENGINE_LOG"] = str(engine_log)
+    self.env["FAIL_RP"] = "1"
+    run_id = self.setup_run()
+    failed = self.cli("build", "--run-id", run_id)
+    self.assertEqual((3, "", "error: rp-fixture build or image readback failed\n"),
+                     (failed.returncode, failed.stdout, failed.stderr))
+    run_dir = self.run_directory(run_id)
+    self.assertTrue((run_dir / "provider.json").is_file())
+    self.assertFalse((run_dir / "rp-fixture.json").exists())
+    self.assertFalse((run_dir / "build.json").exists())
+    failures = list(run_dir.glob("failure-*.json"))
+    self.assertEqual(1, len(failures))
+    self.assertEqual({"version": 1, "run_id": run_id,
+                      "phase": "rp-fixture", "status": "failed"}, json.loads(failures[0].read_text()))
+    self.assertEqual(["build", "image", "build"],
+                     [json.loads(line)[0] for line in engine_log.read_text().splitlines()])
+
+    self.env.pop("FAIL_RP")
+    resumed = self.cli("build", "--run-id", run_id)
+    self.assertEqual((0, "build verified\n", ""),
+                     (resumed.returncode, resumed.stdout, resumed.stderr))
+    self.assertTrue((run_dir / "build.json").is_file())
+    commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
+    self.assertEqual(6, len(commands))
+    self.assertEqual("sha256:" + "1" * 64,
+                     json.loads((run_dir / "provider.json").read_text())["image_id"])
+    self.assertTrue(all("--network=none" in command for command in commands if command[0] == "build"))
+    self.assertFalse(any(token in {"push", "publish", "deploy", "run"}
+                         for command in commands for token in command))
+
+  def test_build_rejects_invalid_immutable_id_readback_before_success(self):
+    self.prepare_build_inputs()
+    engine_log = self.cwd / "engine.jsonl"
+    engine = self.cwd / "podman"
+    engine.write_text('''#!/usr/bin/env python3.11
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["ENGINE_LOG"], "a") as out: out.write(json.dumps(args) + "\\n")
+if args[0] == "build": print("ok")
+elif args[:3] == ["image", "inspect", "--format"]: print("not-an-image-id")
+else: raise SystemExit(91)
+''', encoding="utf-8")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["ENGINE_LOG"] = str(engine_log)
+    run_id = self.setup_run()
+    result = self.cli("build", "--run-id", run_id)
+    self.assertEqual((3, "", "error: provider build or image readback failed\n"),
+                     (result.returncode, result.stdout, result.stderr))
+    run_dir = self.run_directory(run_id)
+    self.assertFalse((run_dir / "provider.json").exists())
+    self.assertFalse((run_dir / "build.json").exists())
+    failure = json.loads(next(run_dir.glob("failure-*.json")).read_text())
+    self.assertEqual("provider", failure["phase"])
+    self.assertEqual(["build", "image"],
+                     [json.loads(line)[0] for line in engine_log.read_text().splitlines()])
+
+  def test_build_resume_conflicts_if_a_provider_artifact_changes(self):
+    self.prepare_build_inputs()
+    engine_log = self.cwd / "engine.jsonl"
+    engine = self.cwd / "podman"
+    engine.write_text('''#!/usr/bin/env python3.11
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["ENGINE_LOG"], "a") as out: out.write(json.dumps(args) + "\\n")
+if args[0] == "build": print("build complete")
+elif args[:3] == ["image", "inspect", "--format"]:
+  image = args[-1]
+  print(image if image.startswith("sha256:") else "sha256:" + ("1" if "provider" in image else "2") * 64)
+else: raise SystemExit(91)
+''', encoding="utf-8")
+    engine.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["ENGINE_LOG"] = str(engine_log)
+    run_id = self.setup_run()
+    result = self.cli("build", "--run-id", run_id)
+    self.assertEqual((0, "build verified\n", ""),
+                     (result.returncode, result.stdout, result.stderr))
+
+    artifact = self.repo / "target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar"
+    artifact.write_bytes(b"changed provider artifact")
+    resumed = self.cli("build", "--run-id", run_id)
+    self.assertEqual((2, "", "error: build source or configuration readback conflict\n"),
+                     (resumed.returncode, resumed.stdout, resumed.stderr))
+    self.assertEqual(4, len(engine_log.read_text().splitlines()))
+
+  def test_read_only_preflight_can_be_rechecked_without_advancing_any_phase(self):
+    config = self.live_config()
+    path = self.config_file(config)
+    run_id = self.setup_run("--config", path)
+    self.install_preflight_adapters()
+    original = self.storage_snapshot()
+    for _ in range(2):
+      result = self.cli("preflight", "--run-id", run_id, "--config", path)
+      self.assertEqual((0, "preflight passed\n", ""),
+                       (result.returncode, result.stdout, result.stderr))
+    self.assertEqual(original, self.storage_snapshot())
+    manifest = self.run_directory(run_id) / "manifest.json"
+    self.assertEqual(["setup"], json.loads(manifest.read_text())["completed"])
+    calls = [json.loads(line) for line in (self.cwd / "tailscale.jsonl").read_text().splitlines()]
+    self.assertEqual(4, len(calls))
+    for call in calls:
+      self.assertEqual(["ssh", "ben@ben-x260"], call[:2])
+    self.assertEqual(["tailscale status --json"], calls[0][2:])
+    self.assertEqual(["podman info --format json"], calls[1][2:])
+    self.assertFalse((self.cwd / "ssh.jsonl").exists())
+    self.assertEqual(["tailscale version", "podman --version"] * 2,
+                     (self.cwd / "tool.jsonl").read_text().splitlines())
+
+  def install_preflight_adapters(self, *, ip="100.64.12.100", rootless=True, malformed=False, ssh_status=0):
+    tailscale = self.cwd / "tailscale"
+    tailscale.write_text('''#!/usr/bin/python3
+import json, os, sys
+args = sys.argv[1:]
+if args == ["version"]:
+  with open(os.environ["TOOL_LOG"], "a") as out: out.write("tailscale version" + chr(10))
+  if os.environ.get("FAIL_TOOL") == "tailscale": raise SystemExit(1)
+  raise SystemExit(0)
+if args[:1] != ["ssh"] or len(args) != 3: raise SystemExit(91)
+with open(os.environ["TAILSCALE_LOG"], "a") as out: out.write(json.dumps(args) + chr(10))
+if os.environ.get("SSH_STATUS", "0") != "0": raise SystemExit(int(os.environ["SSH_STATUS"]))
+command = args[2]
+if command == "tailscale status --json":
+  print(json.dumps({"Self": {"DNSName": os.environ["TARGET_DNS_NAME"], "TailscaleIPs": [os.environ["TARGET_IP"]]}}))
+elif command == "podman info --format json":
+  if os.environ.get("MALFORMED"): print("not json")
+  else: print(json.dumps({"host": {"security": {"rootless": os.environ["ROOTLESS"] == "true"}}}))
+else: raise SystemExit(91)
+''', encoding="utf-8")
+    tailscale.chmod(0o700)
+    podman = self.cwd / "podman"
+    podman.write_text('''#!/usr/bin/python3
+import os, sys
+with open(os.environ["TOOL_LOG"], "a") as out:
+  out.write("podman " + " ".join(sys.argv[1:]) + chr(10))
+if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
+''', encoding="utf-8")
+    podman.chmod(0o700)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    self.env["TAILSCALE_LOG"] = str(self.cwd / "tailscale.jsonl")
+    self.env["TOOL_LOG"] = str(self.cwd / "tool.jsonl")
+    self.env["TARGET_IP"] = ip
+    self.env["TARGET_DNS_NAME"] = "ben-x260.tailnet.ts.net"
+    self.env["ROOTLESS"] = "true" if rootless else "false"
+    self.env["MALFORMED"] = "1" if malformed else ""
+    self.env["SSH_STATUS"] = str(ssh_status)
+    self.env["FAIL_TOOL"] = ""
+
+  def test_preflight_fails_closed_on_target_identity_and_remote_rootless_check(self):
+    cases = (("identity mismatch", {"TARGET_IP": "100.64.12.101"}),
+             ("identity mismatch", {"TARGET_DNS_NAME": "other-device.tailnet.ts.net"}),
+             ("identity mismatch", {"TARGET_DNS_NAME": "ben-x260.other-tailnet.ts.net"}),
+             ("not rootless", {"ROOTLESS": "false"}),
+             ("invalid Podman response", {"MALFORMED": "1"}),
+             ("SSH check failed", {"SSH_STATUS": "255"}),
+             ("local tool check failed", {"FAIL_TOOL": "podman"}),
+             ("local tool check failed", {"FAIL_TOOL": "tailscale"}))
+    for message, overrides in cases:
+      with self.subTest(message=message):
+        config = self.live_config()
+        path = self.config_file(config)
+        run_id = self.setup_run("--config", path)
+        self.install_preflight_adapters()
+        self.env.update(overrides)
+        before = self.storage_snapshot()
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+        self.assertEqual((2, "", f"error: preflight {message}\n"),
+                         (result.returncode, result.stdout, result.stderr))
+        self.assertEqual(before, self.storage_snapshot())
+
+  def test_preflight_requires_an_explicit_expected_tailscale_dns_name(self):
+    config = self.live_config()
+    del config["remote"]["target_dns_name"]
+    path = self.config_file(config)
+    run_id = self.setup_run("--config", path)
+    self.install_preflight_adapters()
+
+    result = self.cli("preflight", "--run-id", run_id, "--config", path)
+
+    self.assertEqual((2, "", "error: preflight requires matching operator inputs and route attestation\n"),
+                     (result.returncode, result.stdout, result.stderr))
+
+  def test_full_first_step_uses_same_public_read_only_preflight_without_live_flag(self):
+    config = self.live_config()
+    path = self.config_file(config)
+    run_id = self.setup_run("--config", path)
+    self.install_preflight_adapters()
+    before = self.storage_snapshot()
+    for _ in range(2):
+      result = self.cli("full", "--profile", "readiness", "--run-id", run_id, "--config", path)
+      self.assertEqual((0, "preflight passed\n", ""),
+                       (result.returncode, result.stdout, result.stderr))
+    self.assertEqual(before, self.storage_snapshot())
+    self.assertEqual(["setup"], json.loads((self.run_directory(run_id) / "manifest.json").read_text())["completed"])
+
+  def rejection(self, code, message, *args):
+    result = self.cli(*args)
+    self.assertEqual((code, "", f"error: {message}\n"),
+                     (result.returncode, result.stdout, result.stderr))
+
+  def live_config(self, profile="readiness"):
+    return {"version": 1, "profile": profile, "engine": "podman", "remote": {
+        "target_host": "ben-x260", "target_dns_name": "ben-x260.tailnet.ts.net",
+        "target_user": "ben",
+        "target_ip": "100.64.12.100", "proxy_ip": "100.127.12.101",
+        "public_origin": "https://fictional-keycloak.example.org", "route_attested": True,
+    }}
+
+  def test_full_requires_explicit_selection_and_resumes_only_the_same_run(self):
+    base = ("full", "--profile", "readiness")
+    unknown = "f" * 32
+    self.rejection(2, "invalid arguments; see --help", *base)
+    self.rejection(2, "invalid arguments; see --help", *base, "--run-id", unknown, "--new-run")
+    self.rejection(2, "invalid arguments; see --help", "full", "--profile", "dev", "--new-run")
+    self.rejection(2, "unknown run ID", *base, "--run-id", unknown)
+    self.assertFalse((self.repo / "target").exists())
+    self.assertFalse((self.repo / ".keycloakctl").exists())
+
+    config = self.live_config()
+    path = self.config_file(config)
+    self.install_preflight_adapters()
+    result = self.cli(*base, "--new-run", "--config", path)
+    self.assertEqual(0, result.returncode, result.stderr)
+    self.assertEqual("", result.stderr)
+    self.assertRegex(result.stdout, r"\A[0-9a-f]{32}\npreflight passed\n\Z")
+    run_id = result.stdout.splitlines()[0]
+    manifest = self.run_directory(run_id) / "manifest.json"
+    original = manifest.read_bytes()
+    self.assertEqual(["setup"], json.loads(original)["completed"])
+    result = self.cli(*base, "--run-id", run_id,
+                      "--config", self.config_file(dict(reversed(list(config.items())))))
+    self.assertEqual((0, "preflight passed\n", ""),
+                     (result.returncode, result.stdout, result.stderr))
+    self.rejection(2, "preflight requires matching operator inputs and route attestation", *base, "--run-id", run_id)
+    self.rejection(2, "run profile does not match", "full", "--profile", "qualification", "--run-id", run_id)
+    self.rejection(2, "run configuration readback conflict", *base, "--run-id", run_id,
+                   "--config", self.config_file({**config, "engine": "docker"}))
+    self.assertEqual({run_id}, {path.name for path in manifest.parent.parent.iterdir()})
+    self.assertEqual(original, manifest.read_bytes())
+
+  def test_live_and_publish_authorization_are_distinct_and_not_persisted(self):
+    config = self.live_config("qualification")
+    qual = ("--run-id", self.setup_run("--config", self.config_file(config)))
+    ready = ("--run-id", self.setup_run("--profile", "readiness"))
+    original = self.storage_snapshot()
+    for command, run in (("publish", qual), ("deploy", qual), ("configure", qual),
+                         ("integration-test", qual), ("teardown", qual), ("verify readiness", ready)):
+      with self.subTest(command=command):
+        args = (*command.split(), *run)
+        denied = f"{command} requires --allow-live on this invocation"
+        self.rejection(2, denied, *args)
+        authorized = ("teardown requires exact run-owned deployment readback" if command == "teardown"
+                      else "invalid phase order; next phase is preflight")
+        self.rejection(2, authorized, *args, "--allow-live")
+        self.rejection(2, denied, *args)
+
+    self.rejection(2, "phase is not supported by run profile", "verify", "readiness", *qual, "--allow-live")
+    self.rejection(2, "phase is not supported by run profile", "integration-test", *ready, "--allow-live")
+    self.rejection(2, "phase is not supported by run profile", "verify", "qualification", *ready)
+    self.rejection(2, "invalid phase order; next phase is preflight", "verify", "qualification", *qual)
+    promote = ("promote", "--receipt", str(self.cwd / "reviewed-receipt.json"),
+               "--destination", "docker://registry.invalid/example:rc-test")
+    self.rejection(2, "promote requires --allow-publish on this invocation", *promote)
+    self.rejection(2, "invalid arguments; see --help", *promote, "--allow-live")
+    self.rejection(3, "promote unavailable in the offline foundation", *promote, "--allow-publish")
+    self.rejection(2, "promote requires --allow-publish on this invocation", *promote)
+    self.assertEqual(original, self.storage_snapshot())
+    for raw in original.values():
+      for forbidden in (b"allow-live", b"allow-publish", b"attested", b"fictional-keycloak", b"100.64.12.100"):
+        self.assertNotIn(forbidden, raw)
+
+  def storage_snapshot(self):
+    return {path.relative_to(self.repo): path.read_bytes()
+            for directory in (self.repo / "target", self.repo / ".keycloakctl")
+            for path in directory.rglob("*") if path.is_file()}
+
+  def test_invalid_config_never_creates_state_or_exposes_unknown_values(self):
+    marker = "synthetic-credential-value-53394840d528"
+    path = self.config_file({**self.live_config(), "client_secret": marker})
+    self.rejection(2, "invalid configuration", "setup", "--config", path)
+    self.rejection(2, "invalid configuration", "full", "--profile", "readiness", "--new-run", "--config", path)
+    self.rejection(2, "invalid arguments; see --help", "setup", "--profile", marker)
+    self.assertEqual({}, self.storage_snapshot())
+    self.assertFalse((self.repo / "target").exists())
+    self.assertFalse((self.repo / ".keycloakctl").exists())
+
+  def test_remote_preflight_rejects_missing_or_placeholder_operator_inputs(self):
+    config = self.live_config()
+    for remote in ({}, {**config["remote"], "route_attested": False},
+                   {**config["remote"], "public_origin": "https://readiness.example.invalid"},
+                   {**config["remote"], "proxy_ip": config["remote"]["target_ip"]}):
+      with self.subTest(remote=remote):
+        path = self.config_file({**config, "remote": remote})
+        run_id = self.setup_run("--config", path)
+        original = self.storage_snapshot()
+        self.rejection(2, "preflight requires matching operator inputs and route attestation",
+                       "preflight", "--run-id", run_id, "--config", path)
+        self.assertEqual(original, self.storage_snapshot())
+
+  def reservation(self, run_id):
+    return self.repo / ".keycloakctl/run-ids" / run_id
+
+  def test_readback_refuses_copied_forged_missing_or_symlinked_manifests(self):
+    self.prepare_build_inputs()
+    self.use_unavailable_engine()
+    first, second = self.setup_run(), self.setup_run()
+    manifest = self.run_directory(first) / "manifest.json"
+    other = self.run_directory(second) / "manifest.json"
+    original = manifest.read_bytes()
+    marker = "run-readback-secret-marker-c11abb6fb07"
+    manifest.write_bytes(other.read_bytes())
+    self.rejection(2, "run readback conflict", "build", "--run-id", first)
+    self.rejection(3, "provider build or image readback failed", "build", "--run-id", second)
+    forged = {**json.loads(original), "completed": ["setup", "build"]}
+    for raw in (json.dumps(forged).encode(), json.dumps({**json.loads(original), "token": marker}).encode(),
+                original.replace(b'{', b'{"version":1,', 1)):
+      with self.subTest(case=raw[:20]):
+        # Even if a local editor also changes the hash, invalid state is rejected.
+        self.reservation(first).write_text(sha256(raw).hexdigest(), encoding="ascii")
+        manifest.write_bytes(raw)
+        self.rejection(2, "run readback conflict", "test", "--run-id", first)
+        self.assertEqual(raw, manifest.read_bytes())
+
+    manifest.unlink()
+    self.rejection(2, "run readback conflict", "setup", "--run-id", first)
+    self.reservation(first).write_text(sha256(original).hexdigest(), encoding="ascii")
+    outside = self.cwd / "outside.json"
+    outside.write_bytes(original)
+    manifest.symlink_to(outside)
+    self.rejection(2, "run readback conflict", "setup", "--run-id", first)
+    self.assertEqual(original, outside.read_bytes())
+    manifest.unlink()
+    manifest.write_bytes(original)
+    self.reservation(first).unlink()
+    self.rejection(2, "run readback conflict", "setup", "--run-id", first)
+
+  def test_teardown_never_treats_phase_completion_as_ownership_proof(self):
+    config = self.live_config()
+    run_id = self.setup_run("--config", self.config_file(config))
+    state_path = self.run_directory(run_id) / "manifest.json"
+    original = state_path.read_bytes()
+    result = self.cli("teardown", "--run-id", run_id, "--allow-live")
+    self.assertEqual((2, "", "error: teardown requires exact run-owned deployment readback\n"),
+                     (result.returncode, result.stdout, result.stderr))
+    self.assertEqual(original, state_path.read_bytes())
+    forged = {**json.loads(original), "completed": ["setup", "preflight", "build", "test",
+                                                       "publish", "deploy"]}
+    raw = json.dumps(forged, separators=(",", ":")).encode() + b"\n"
+    self.reservation(run_id).write_text(sha256(raw).hexdigest(), encoding="ascii")
+    state_path.write_bytes(raw)
+    result = self.cli("teardown", "--run-id", run_id, "--allow-live")
+    self.assertEqual((2, "", "error: run readback conflict\n"),
+                     (result.returncode, result.stdout, result.stderr))
+    self.assertEqual(raw, state_path.read_bytes())
+
+  def use_fixed_run_id(self, run_id):
+    # Force a collision across real executable processes. No runtime credentials
+    # or production test flags; inject only the UUID source at interpreter startup.
+    (self.cwd / "sitecustomize.py").write_text(
+        f"import uuid\nuuid.uuid4 = lambda: uuid.UUID('{run_id}')\n", encoding="ascii")
+    self.env["PYTHONPATH"] = str(self.cwd)
+
+  def test_concurrent_setup_exclusively_creates_one_run_and_never_reuses_its_id(self):
+    run_id = "a" * 32
+    self.use_fixed_run_id(run_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+      first = pool.submit(self.cli, "setup", "--profile", "dev")
+      second = pool.submit(self.cli, "setup", "--profile", "ci")
+      results = sorted((first.result(), second.result()), key=lambda result: result.returncode)
+    self.assertEqual((0, run_id + "\n", ""), (results[0].returncode, results[0].stdout, results[0].stderr))
+    self.assertEqual((2, "", "error: run ID already reserved or run directory exists\n"),
+                     (results[1].returncode, results[1].stdout, results[1].stderr))
+    original = self.storage_snapshot()
+    self.assertEqual(run_id, self.setup_run("--run-id", run_id))
+    self.assertEqual(2, len(original))
+    self.assertEqual(original, self.storage_snapshot())
+
+    shutil.rmtree(self.repo / "target", ignore_errors=True)  # Run manifests follow the required target/ layout.
+    self.rejection(2, "run ID already reserved or run directory exists", "setup")
+    self.rejection(2, "run readback conflict", "setup", "--run-id", run_id)
+    self.assertEqual(original[self.reservation(run_id).relative_to(self.repo)],
+                     self.reservation(run_id).read_bytes())
+
+  def test_setup_never_overwrites_a_preexisting_run_directory(self):
+    run_id = "b" * 32
+    self.use_fixed_run_id(run_id)
+    directory = self.run_directory(run_id)
+    directory.mkdir(parents=True)
+    manifest = directory / "manifest.json"
+    manifest.write_bytes(b"existing bytes without a reservation\n")
+    self.rejection(2, "run ID already reserved or run directory exists", "setup")
+    self.assertEqual(b"existing bytes without a reservation\n", manifest.read_bytes())
+    self.rejection(2, "run readback conflict", "setup", "--run-id", run_id)
+    shutil.rmtree(directory)
+    self.rejection(2, "run ID already reserved or run directory exists", "setup")
+    self.assertFalse(directory.exists())
+
+
+if __name__ == "__main__":
+  unittest.main()

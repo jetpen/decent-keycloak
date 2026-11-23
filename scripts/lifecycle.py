@@ -9,12 +9,13 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
@@ -42,6 +43,8 @@ PYTHON_TESTS = (
   "scripts.test_issue7_store_recovery_profile",
   "scripts.test_acceptance_ledger",
   "scripts.test_acceptance_workflow",
+  "scripts.test_keycloakctl",
+  "scripts.test_oidc_rp_fixture",
   "scripts.test_issue6_single_node_profile",
   "scripts.test_lifecycle",
   "scripts.test_image_lifecycle",
@@ -690,24 +693,73 @@ def write_receipt(receipt_path: Path, receipt: dict) -> None:
   temporary_path.replace(receipt_path)
 
 
+def extract_verified_wheelhouse(archive_path: Path, destination: Path) -> int:
+  """Extract only flat wheel files from the already hash-verified resolver bundle."""
+  if destination.exists() or destination.is_symlink():
+    return 2
+  try:
+    destination.mkdir(mode=0o700)
+    with tarfile.open(archive_path, "r:gz") as archive:
+      members = archive.getmembers()
+      names: set[str] = set()
+      if not members:
+        raise ValueError("empty wheelhouse")
+      for member in members:
+        name = member.name
+        if (not member.isfile() or PurePosixPath(name).name != name
+            or not name.endswith((".whl", ".tar.gz")) or name in names):
+          raise ValueError("invalid wheelhouse member")
+        names.add(name)
+        source = archive.extractfile(member)
+        if source is None:
+          raise ValueError("wheelhouse member is unavailable")
+        target = destination / name
+        with source, target.open("xb") as output:
+          shutil.copyfileobj(source, output)
+    return 0
+  except (OSError, tarfile.TarError, ValueError):
+    shutil.rmtree(destination, ignore_errors=True)
+    return 2
+
+
 def run_python_tests() -> int:
   with tempfile.TemporaryDirectory(prefix="decent-keycloak-tests-") as temporary:
     run_dir = Path(temporary)
     install_dir = run_dir / "site-packages"
     oidc_install_dir = run_dir / "oidc-site-packages"
     sources = run_dir / "resolver-sources"
+    dependencies = run_dir / "resolver-dependencies"
+    resolver_wheelhouse = run_dir / "resolver-wheelhouse"
+    oidc_wheelhouse = run_dir / "oidc-wheelhouse"
     env = dict(os.environ)
     env["PIP_CACHE_DIR"] = str(run_dir / "pip-cache")
     commands = (
       [sys.executable, "container/build_resolver_runtime.py", "--materialize-sources",
        "--sources-directory", str(sources)],
-      [sys.executable, "container/verify_resolver_runtime_inputs.py", "--sources", str(sources)],
-      [sys.executable, "-m", "pip", "install", "--require-hashes", "--no-compile",
-       "--target", str(install_dir), "-r", "container/resolver-requirements.lock.txt"],
-      [sys.executable, "-m", "pip", "install", "--require-hashes", "--no-compile",
-       "--target", str(oidc_install_dir), "-r", "requirements/issue8-oidc.lock"],
+      [sys.executable, "container/build_resolver_runtime.py", "--materialize-binary-dependencies",
+       "--binary-dependencies-directory", str(dependencies)],
+      [sys.executable, "container/verify_resolver_runtime_inputs.py", "--sources", str(sources),
+       "--dependencies", str(dependencies)],
+      [sys.executable, "-m", "pip", "download", "--disable-pip-version-check", "--no-cache-dir",
+       "--require-hashes", "--only-binary=:all:", "--index-url", "https://pypi.org/simple",
+       "--dest", str(oidc_wheelhouse), "-r", "requirements/issue8-oidc.lock"],
     )
     for command in commands:
+      result = run(command, env=env)
+      if result:
+        return result
+    if extract_verified_wheelhouse(dependencies / "resolver-wheelhouse.tar.gz", resolver_wheelhouse):
+      print("failed to extract verified resolver wheelhouse", file=sys.stderr)
+      return 2
+    installs = (
+      [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-compile",
+       "--no-index", "--find-links", str(resolver_wheelhouse), "--require-hashes",
+       "--target", str(install_dir), "-r", "container/resolver-requirements.lock.txt"],
+      [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-compile",
+       "--no-index", "--find-links", str(oidc_wheelhouse), "--require-hashes",
+       "--target", str(oidc_install_dir), "-r", "requirements/issue8-oidc.lock"],
+    )
+    for command in installs:
       result = run(command, env=env)
       if result:
         return result

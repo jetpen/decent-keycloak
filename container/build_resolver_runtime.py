@@ -57,7 +57,7 @@ def validate_repo_owned_lock() -> dict:
     if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
       raise RuntimeError(f"source revision is not a full immutable commit: {name}")
     if not is_pinned_git_url(source.get("git_url")):
-      raise RuntimeError(f"source URL is not an HTTPS GitHub repository: {name}")
+      raise RuntimeError(f"source URL is not a GitHub HTTPS repository: {name}")
     if "archive_sha256" in source or "url" in source:
       raise RuntimeError(f"source lock must pin a Git commit, not an archive: {name}")
 

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "profile": "readiness",
+  "engine": "podman",
+  "remote": {
+    "target_host": "ben-x260",
+    "target_dns_name": "ben-x260.example.invalid",
+    "target_user": "ben",
+    "target_ip": "100.64.0.10",
+    "proxy_ip": "100.64.0.11",
+    "public_origin": "https://readiness.example.invalid",
+    "route_attested": false
+  }
+}

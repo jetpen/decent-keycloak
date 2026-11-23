@@ -1,12 +1,14 @@
 """Public contract tests for the repository lifecycle CLI."""
 
 import hashlib
+import io
 import json
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -32,29 +34,66 @@ class LifecycleCliTest(unittest.TestCase):
         check=False,
     )
 
+  def test_wheelhouse_extract_rejects_nonflat_members_without_writing_outside_destination(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      valid_archive = root / "valid.tar.gz"
+      source = root / "resolver-1.0-py3-none-any.whl"
+      source.write_bytes(b"wheel bytes")
+      source_distribution = root / "resolver-src-1.0.tar.gz"
+      source_distribution.write_bytes(b"source distribution")
+      with tarfile.open(valid_archive, "w:gz") as archive:
+        archive.add(source, arcname=source.name)
+        archive.add(source_distribution, arcname=source_distribution.name)
+      extracted = root / "extracted"
+      self.assertEqual(0, lifecycle.extract_verified_wheelhouse(valid_archive, extracted))
+      self.assertEqual(b"wheel bytes", (extracted / source.name).read_bytes())
+      self.assertEqual(b"source distribution", (extracted / source_distribution.name).read_bytes())
+
+      malicious_archive = root / "malicious.tar.gz"
+      with tarfile.open(malicious_archive, "w:gz") as archive:
+        member = tarfile.TarInfo("../escape.whl")
+        member.size = 4
+        archive.addfile(member, io.BytesIO(b"evil"))
+      rejected = root / "rejected"
+      self.assertEqual(2, lifecycle.extract_verified_wheelhouse(malicious_archive, rejected))
+      self.assertFalse(rejected.exists())
+      self.assertFalse((root.parent / "escape.whl").exists())
+
   def test_issue61_native_role_contract_is_in_canonical_python_suite(self):
     self.assertIn("scripts.test_issue61_native_roles", lifecycle.PYTHON_TESTS)
 
-  def test_issue8_oidc_lock_is_installed_in_isolated_suite_environment(self):
-    with mock.patch.object(lifecycle, "run", return_value=0) as run:
+  def test_python_suite_fetches_hash_locked_wheels_then_installs_offline(self):
+    with mock.patch.object(lifecycle, "run", return_value=0) as run, \
+        mock.patch.object(lifecycle, "extract_verified_wheelhouse", return_value=0) as extract:
       self.assertEqual(0, lifecycle.run_python_tests())
 
     calls = run.call_args_list
     commands = [call.args[0] for call in calls]
-    oidc_install_index = next(
-        index for index, command in enumerate(commands)
-        if command[-1:] == ["requirements/issue8-oidc.lock"]
-    )
-    oidc_install = commands[oidc_install_index]
-    self.assertIn("--require-hashes", oidc_install)
-    self.assertIn("--no-compile", oidc_install)
-    self.assertLess(oidc_install_index, len(commands) - 1)
+    source_fetch = next(command for command in commands if "--materialize-sources" in command)
+    binary_fetch = next(command for command in commands if "--materialize-binary-dependencies" in command)
+    verify = next(command for command in commands if "container/verify_resolver_runtime_inputs.py" in command)
+    oidc_download = next(command for command in commands if command[1:3] == ["-m", "pip"]
+                         and "download" in command)
+    oidc_install = next(command for command in commands if command[1:3] == ["-m", "pip"]
+                         and "install" in command and command[-1:] == ["requirements/issue8-oidc.lock"])
+    resolver_install = next(command for command in commands if command[1:3] == ["-m", "pip"]
+                            and "install" in command
+                            and command[-1:] == ["container/resolver-requirements.lock.txt"])
 
-    suite_call = calls[-1]
-    self.assertIn("scripts.test_issue8_oidc", suite_call.args[0])
-    oidc_site_packages = oidc_install[oidc_install.index("--target") + 1]
-    suite_pythonpath = suite_call.kwargs["env"]["PYTHONPATH"].split(lifecycle.os.pathsep)
-    self.assertEqual(oidc_site_packages, suite_pythonpath[0])
+    self.assertIn("--dependencies", verify)
+    self.assertIn("--require-hashes", oidc_download)
+    self.assertIn("--only-binary=:all:", oidc_download)
+    self.assertIn("https://pypi.org/simple", oidc_download)
+    for install in (resolver_install, oidc_install):
+      self.assertIn("--no-index", install)
+      self.assertIn("--find-links", install)
+      self.assertIn("--require-hashes", install)
+    self.assertLess(commands.index(source_fetch), commands.index(binary_fetch))
+    self.assertLess(commands.index(binary_fetch), commands.index(oidc_download))
+    self.assertLess(commands.index(oidc_download), commands.index(oidc_install))
+    self.assertEqual(1, extract.call_count)
+    self.assertFalse(any("resolver-wheelhouse.tar.gz" in str(path) for path in ROOT.rglob("resolver-wheelhouse.tar.gz")))
 
   def test_java_21_detection_accepts_any_java_21_patch_and_rejects_other_majors(self):
     self.assertTrue(lifecycle.java_21_runtime("openjdk version \"21.0.13\" 2026-10-20\n"))
