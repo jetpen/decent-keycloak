@@ -34,6 +34,32 @@ class LifecycleCliTest(unittest.TestCase):
         check=False,
     )
 
+  def test_local_provenance_failure_writes_a_preflight_failure_receipt(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      with mock.patch.object(lifecycle, "ROOT", root), \
+          mock.patch.object(lifecycle, "preflight", return_value=0), \
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={"image_source_sha256": "a" * 64,
+              "image_source_file_count": 12}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              side_effect=RuntimeError("local source provenance unavailable")), \
+          mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
+          redirect_stdout(StringIO()):
+        self.assertEqual(2, lifecycle.run_profile("ci"))
+      receipts = list((root / "target/lifecycle/evidence").glob("*.json"))
+      self.assertEqual(1, len(receipts))
+      receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+      self.assertEqual(2, receipt["exit_code"])
+      self.assertEqual("fail", receipt["steps"]["preflight"]["status"])
+      self.assertEqual("source_provenance_unavailable", receipt["steps"]["preflight"]["detail"])
+      self.assertEqual("unavailable", receipt["source"]["provenance_status"])
+      self.assertEqual("pass", receipt["steps"]["teardown"]["status"])
+
+  def test_local_source_provenance_preserves_git_execution_errors(self):
+    with mock.patch.object(lifecycle, "capture_command", side_effect=FileNotFoundError("git")):
+      with self.assertRaisesRegex(RuntimeError, "provenance unavailable"):
+        lifecycle.local_source_provenance()
+
   def test_wheelhouse_extract_rejects_nonflat_members_without_writing_outside_destination(self):
     with tempfile.TemporaryDirectory() as temporary:
       root = Path(temporary)
@@ -254,7 +280,9 @@ class LifecycleCliTest(unittest.TestCase):
 
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", side_effect=preflight_before_write), \
-          mock.patch.object(lifecycle, "fingerprint_source", return_value={}):
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": False}):
         result = lifecycle.run_profile("offline")
 
       self.assertEqual(2, result)
@@ -269,6 +297,8 @@ class LifecycleCliTest(unittest.TestCase):
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": False}), \
           mock.patch.object(lifecycle, "container_engine", return_value="docker"), \
           mock.patch.object(lifecycle, "run", side_effect=KeyboardInterrupt):
         result = lifecycle.run_profile("offline")
@@ -286,6 +316,8 @@ class LifecycleCliTest(unittest.TestCase):
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": False}), \
           mock.patch.object(lifecycle, "container_engine", return_value="docker"), \
           mock.patch.object(lifecycle, "run", side_effect=[0, KeyboardInterrupt()]), \
           mock.patch.object(lifecycle, "verify_surefire", return_value=0), \
@@ -333,6 +365,8 @@ class LifecycleCliTest(unittest.TestCase):
           mock.patch.object(lifecycle, "fingerprint_source", return_value={
               "image_source_sha256": "1" * 64, "image_artifacts_sha256": "2" * 64,
               "image_artifact_file_count": 3}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": True}), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
           mock.patch.object(lifecycle, "run", side_effect=fake_run), \
@@ -457,6 +491,8 @@ class LifecycleCliTest(unittest.TestCase):
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", side_effect=fingerprint_source_for_run), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": True}), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
           mock.patch.object(lifecycle, "run", side_effect=engine_run), \
@@ -477,6 +513,9 @@ class LifecycleCliTest(unittest.TestCase):
         self._run_profile_with_fake_engine()
 
     self.assertEqual(0, result)
+    self.assertEqual("c" * 40, receipt["source"]["source_revision"])
+    self.assertIs(receipt["source"]["worktree_clean"], True)
+    self.assertRegex(receipt["source"]["image_source_sha256"], r"\A[0-9a-f]{64}\Z")
     self.assertEqual({baseline}, set(images))
     self.assertNotIn(runtime, images)
     self.assertEqual([runtime, builder, base_stage], removals)

@@ -16,11 +16,24 @@ remains for lifecycle capabilities not yet migrated. `keycloakctl` adds the loca
 setup/build/test path in this PR; the acceptance workflow remains on the existing
 canonical lifecycle path pending independent parity review and CI verification.
 
+`keycloakctl` now also exposes `acceptance --profile offline|ci` as a narrow
+entry-point parity check. It delegates to the unchanged `scripts/lifecycle.py
+run <profile>` command and reads back that runner's durable receipt, requiring
+matching profile, source revision/fingerprint and dirty-worktree bit, all local
+steps passed, and cleanup/teardown passed. It does not create a substitute
+receipt, migrate the GitHub Actions caller, or establish parity for the remaining
+lifecycle capabilities. The workflow continues to run
+`python scripts/lifecycle.py run ci` until full parity and CI verification are
+complete.
+
 ## Local commands
 
 ```sh
 ./keycloakctl validate-config --config config/keycloakctl/readiness.json
 dev_id=$(./keycloakctl setup --profile dev --config config/keycloakctl/dev.json)
+# Verify the canonical local lifecycle through keycloakctl; this runs its full offline profile.
+./keycloakctl acceptance --profile offline
+# The canonical CI caller remains scripts/lifecycle.py run ci.
 ./keycloakctl setup --run-id "$dev_id"
 # Fetches locked prerequisites on the host; `--network=none` disables build-step networking, not base-image acquisition.
 ./keycloakctl build --run-id "$dev_id" --config config/keycloakctl/dev.json
