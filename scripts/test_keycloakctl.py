@@ -65,15 +65,29 @@ class KeycloakctlTest(unittest.TestCase):
         provenance = lifecycle.local_source_provenance()
       self.assertEqual({"source_revision": revision, "worktree_clean": False}, provenance)
 
+  def test_local_keycloakctl_steps_stay_aligned_with_canonical_lifecycle(self):
+    canonical_steps = tuple(name for name, _ in lifecycle.core_test_stages())
+    self.assertEqual(canonical_steps, keycloakctl_cli.TEST_STEPS[:len(canonical_steps)])
+
+    for profile in ("offline", "ci"):
+      planned = {step["name"] for step in lifecycle.plan(profile)["steps"]}
+      self.assertTrue(set(canonical_steps) <= planned)
+      self.assertIn("image-smoke", planned)
+      self.assertIn("diff-check", planned)
+    self.assertEqual("rp-fixture-smoke", keycloakctl_cli.TEST_STEPS[-2])
+    self.assertNotIn("rp-fixture-smoke", {step["name"] for step in lifecycle.plan("ci")["steps"]})
+
   def test_acceptance_runs_only_the_canonical_local_profiles_and_verifies_receipt(self):
-    receipt_path = self.repo / "target/lifecycle/evidence/canonical-receipt.json"
+    run_id = "a" * 32
+    receipt_path = self.repo / "target/lifecycle/evidence" / f"{run_id}.json"
     receipt_path.parent.mkdir(parents=True)
     all_steps = ("preflight", "java-tests", "surefire", "python-tests", "python-compile",
         "resolver-sources", "resolver-dependencies", "provider-service-registration",
         "provider-image", "image-smoke", "diff-check", "evidence", "teardown")
-    receipt = {"schema_version": 1, "run_id": "a" * 32, "profile": "ci", "exit_code": 0,
+    receipt = {"schema_version": 1, "run_id": run_id, "profile": "ci", "exit_code": 0,
         "source": {"source_revision": "1" * 40, "image_source_sha256": "2" * 64,
-                   "image_source_file_count": 12, "worktree_clean": False},
+                   "image_source_file_count": 12, "image_artifacts_sha256": "3" * 64,
+                   "image_artifact_file_count": 3, "worktree_clean": False},
         "steps": {name: {"status": "pass"} for name in all_steps},
         "cleanup": {"status": "pass"}}
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
@@ -95,6 +109,14 @@ class KeycloakctlTest(unittest.TestCase):
       self.assertEqual((0, f"acceptance verified: {receipt_path}\n", ""),
                        (result.returncode, result.stdout, result.stderr))
 
+    mismatched_path = receipt_path.with_name("mismatched-id.json")
+    receipt_path.rename(mismatched_path)
+    self.env["CANONICAL_RECEIPT"] = str(mismatched_path)
+    rejected = self.cli("acceptance", "--profile", "ci")
+    self.assertEqual(2, rejected.returncode)
+    self.assertEqual("", rejected.stdout)
+    self.assertIn("acceptance receipt verification failed", rejected.stderr)
+
   def test_acceptance_refuses_live_profiles_and_bad_or_missing_receipts(self):
     for profile in ("wallet-login-qualification", "remote-test-host"):
       result = self.cli("acceptance", "--profile", profile)
@@ -110,13 +132,16 @@ class KeycloakctlTest(unittest.TestCase):
         "if sys.argv[1:] != ['run', 'ci']: raise SystemExit(91)",
         "print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
         "")), encoding="utf-8")
-    bad_receipt = evidence_dir / "bad-receipt.json"
+    bad_receipt = evidence_dir / f"{'b' * 32}.json"
+    required_steps = ("preflight", "java-tests", "surefire", "python-tests", "python-compile",
+        "resolver-sources", "resolver-dependencies", "provider-service-registration",
+        "provider-image", "image-smoke", "diff-check", "evidence", "teardown")
     bad_receipt.write_text(json.dumps({"schema_version": 1, "run_id": "b" * 32,
         "profile": "ci", "exit_code": 0,
         "source": {"source_revision": "1" * 40, "image_source_sha256": "2" * 64,
                    "image_source_file_count": 12, "worktree_clean": False},
-        "steps": {"teardown": {"status": "fail"}}, "cleanup": {"status": "pass"}}),
-        encoding="utf-8")
+        "steps": {name: {"status": "pass"} for name in required_steps},
+        "cleanup": {"status": "pass"}}), encoding="utf-8")
     self.env["CANONICAL_RECEIPT"] = str(bad_receipt)
     rejected = self.cli("acceptance", "--profile", "ci")
     self.assertEqual(2, rejected.returncode)
@@ -131,7 +156,6 @@ class KeycloakctlTest(unittest.TestCase):
   def test_local_setup_docs_pin_required_python_patch_version(self):
     docs = (ROOT / "docs/acceptance/keycloakctl-foundation.md").read_text(encoding="utf-8")
     self.assertIn("Run `./keycloakctl --help` with Python 3.11.13.", docs)
-
   def cli(self, *args):
     return subprocess.run([str(self.repo / "keycloakctl"), *args], cwd=self.cwd,
                           env=self.env, capture_output=True, text=True, timeout=10)

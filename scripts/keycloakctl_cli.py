@@ -1173,6 +1173,11 @@ def run_acceptance(profile: str) -> int:
         or re.fullmatch(r"[0-9a-f]{64}", source["image_source_sha256"]) is None
         or type(source.get("image_source_file_count")) is not int
         or source["image_source_file_count"] < 1
+        or not isinstance(source.get("image_artifacts_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", source["image_artifacts_sha256"]) is None
+        or type(source.get("image_artifact_file_count")) is not int
+        or source["image_artifact_file_count"] < 1
+        or path.name != f"{receipt['run_id']}.json"
         or type(source.get("worktree_clean")) is not bool
         or type(steps) is not dict or not required_steps <= steps.keys()
         or any(type(steps[name]) is not dict or steps[name].get("status") != "pass"
