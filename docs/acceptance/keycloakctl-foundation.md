@@ -8,7 +8,7 @@ preflight evidence; separately authorized live readiness and qualification runs;
 and teardown/promotion safety. The live and qualification profiles are not
 qualified by local tests or by the test-only fake-issuer RP fixture.
 
-Run `./keycloakctl --help` with Python 3.11. For the local Java test phase, make
+Run `./keycloakctl --help` with Python 3.11.13. For the local Java test phase, make
 Java 21 and Maven available on `PATH`. The launcher finds its repository from
 its own location, including when invoked outside the checkout. Explicit `--config`
 paths are relative to the caller. [`scripts/lifecycle.py`](../../scripts/lifecycle.py)
@@ -88,8 +88,20 @@ The default SSH target name is `ben-x260`; `target_host` can override it. Set
 trailing dot); this is checked separately from the SSH target alias. The `.invalid`
 examples are intentionally non-runnable.
 
-Read-only `preflight` executes local `tailscale version` and `podman --version`
-checks, then uses `tailscale ssh` with the configured target user and host.
+Read-only `preflight` is repeatable for local and live profiles. For local
+`dev`/`ci` runs, it requires Python 3.11.13, Java 21, Maven, and Git, then validates
+the selected local engine before issuing engine commands. Docker `DOCKER_HOST`,
+Docker context selection, Podman `CONTAINER_HOST`, and Podman connection selection
+are checked from their local settings; a non-local or unresolved endpoint is
+rejected before any engine command. The local check validates the engine client
+version, daemon/info readback, and image inventory rows with full immutable IDs;
+Docker also requires Buildx, and Podman must report `Host.Security.Rootless`
+exactly `true`. Probe output is
+not printed, no images are built/pulled/run/removed, no Tailscale command is
+invoked, and no run state is written. Success prints only `preflight passed`.
+
+For live readiness/qualification profiles preflight retains the existing local
+`tailscale version` and `podman --version` checks, then uses `tailscale ssh` with the configured target user and host.
 Tailscale SSH validates the destination host key against the node key advertised
 by Tailscale. The preflight checks exact normalized equality with the configured
 Tailscale DNS name and exact configured Tailscale IPv4 address, then requires
@@ -102,15 +114,17 @@ The read-only remote commands are limited to `tailscale status --json` and
 `podman info --format json`; remote commands are constants, while the target
 user/host are validated config fields.
 
-This is only the selected local-tool/target-identity/rootless-container slice
-of criterion 6. The planned topology uses tailnet listeners on ports 18080 and
+This implements only the bounded local-toolchain/engine subclaim plus the
+existing live target-identity/rootless-container subclaims of criterion 6;
+criterion 6 remains partial. The local `dev`/`ci` check does not verify target
+identity or the planned topology. The planned topology uses tailnet listeners on ports 18080 and
 18081, public routes `/keycloak` and `/rp`, and Wallet App Links at
 `/.well-known/assetlinks.json`; this command does not verify that topology. It
 does not verify proxy Tailscale identity, fixed-port availability, actual
 reviewed ACL or forwarded-header evidence beyond the operator's `route_attested`
 boolean, public DNS/TLS, the App Links document, or configured origin/proxy-route
 behavior. Those checks, as well as all deployment and live qualification
-activity, remain out of scope.
+activity, remain out of scope for this bounded local check.
 
 ## Local build and remaining gated phases
 
