@@ -44,6 +44,7 @@ PYTHON_TESTS = (
   "scripts.test_acceptance_ledger",
   "scripts.test_acceptance_workflow",
   "scripts.test_keycloakctl",
+  "scripts.test_keycloakctl_evidence",
   "scripts.test_oidc_rp_fixture",
   "scripts.test_issue6_single_node_profile",
   "scripts.test_lifecycle",
