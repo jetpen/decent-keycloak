@@ -1139,6 +1139,12 @@ def run_acceptance(profile: str) -> int:
   except (OSError, UnicodeError):
     print("error: acceptance source provenance unavailable", file=sys.stderr)
     return 2
+  evidence_directory = ROOT / "target/lifecycle/evidence"
+  try:
+    preexisting_receipts = {path.resolve() for path in evidence_directory.glob("*.json")}
+  except OSError:
+    print("error: acceptance receipt verification failed", file=sys.stderr)
+    return 2
   try:
     result = subprocess.run(
         [sys.executable, "scripts/lifecycle.py", "run", profile], cwd=ROOT,
@@ -1172,6 +1178,7 @@ def run_acceptance(profile: str) -> int:
       resolved = candidate.resolve(strict=True)
       info = candidate.stat()
       if (not candidate.is_symlink() and resolved.parent == expected_directory
+          and resolved not in preexisting_receipts
           and stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024):
         candidates.append((candidate, info))
     except OSError:

@@ -1100,8 +1100,11 @@ def _run_capture(command: list[str], *, env: dict[str, str] | None = None) -> tu
 
 def local_source_provenance() -> dict:
   """Return only the commit identity and cleanliness bit for a local receipt."""
-  revision = capture_command(["git", "rev-parse", "--verify", "HEAD"])
-  status = capture_command(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+  try:
+    revision = capture_command(["git", "rev-parse", "--verify", "HEAD"])
+    status = capture_command(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+  except OSError as error:
+    raise RuntimeError("local source provenance unavailable") from error
   value = revision.stdout.strip()
   if (revision.returncode or status.returncode
       or re.fullmatch(r"[0-9a-f]{40,64}", value) is None):
@@ -1131,8 +1134,13 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
         "removed_image_ids": [], "retained_image_id": None,
         "unowned_new_image_count": 0, "inconclusive_image_count": 0},
   }
+  provenance_error = False
   if profile in ("offline", "ci"):
-    receipt["source"].update(local_source_provenance())
+    try:
+      receipt["source"].update(local_source_provenance())
+    except RuntimeError:
+      provenance_error = True
+      receipt["source"]["provenance_status"] = "unavailable"
   write_receipt(receipt_path, receipt)
   engine = container_engine()
   tag = f"{IMAGE_NAME}:lifecycle-{run_id}"
@@ -1144,6 +1152,10 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
   failure_code = 0
   current_step: str | None = None
   try:
+    if provenance_error:
+      failure_code = 2
+      _record_step(receipt, receipt_path, "preflight", "fail", detail="source_provenance_unavailable")
+      return failure_code
     if preflight_status:
       failure_code = 2
       _record_step(receipt, receipt_path, "preflight", "fail", detail="tool_or_version_mismatch")

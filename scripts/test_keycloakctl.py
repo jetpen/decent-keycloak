@@ -98,6 +98,7 @@ class KeycloakctlTest(unittest.TestCase):
     run_id = "a" * 32
     receipt_path = self.repo / "target/lifecycle/evidence" / f"{run_id}.json"
     receipt_path.parent.mkdir(parents=True)
+    receipt_template = self.cwd / "receipt-template.json"
     all_steps = ("preflight", "java-tests", "surefire", "python-tests", "python-compile",
         "resolver-sources", "resolver-dependencies", "provider-service-registration",
         "provider-image", "image-smoke", "diff-check", "evidence", "teardown")
@@ -110,7 +111,7 @@ class KeycloakctlTest(unittest.TestCase):
                    "worktree_clean": False},
         "steps": {name: {"status": "pass"} for name in all_steps},
         "cleanup": {"status": "pass"}}
-    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
     shutil.copy2(ROOT / "scripts/lifecycle.py", self.repo / "scripts/lifecycle_core.py")
     lifecycle_script = self.repo / "scripts/lifecycle.py"
     lifecycle_script.write_text("\n".join((
@@ -118,19 +119,30 @@ class KeycloakctlTest(unittest.TestCase):
         "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source",
         "if __name__ == '__main__':",
         "  profile = os.environ['CANONICAL_PROFILE']",
+        "  receipt = os.environ['CANONICAL_RECEIPT']",
+        "  if os.environ.get('CANONICAL_REPLAY') != '1': __import__('shutil').copy2(os.environ['CANONICAL_TEMPLATE'], receipt)",
         "  print('lifecycle receipt: /scratch/test-only.json')",
-        "  print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
+        "  print('lifecycle receipt: ' + receipt)",
         "")), encoding="utf-8")
     self.env["CANONICAL_RECEIPT"] = str(receipt_path)
+    self.env["CANONICAL_TEMPLATE"] = str(receipt_template)
 
     for profile in ("offline", "ci"):
       receipt["profile"] = profile
-      receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+      receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
       self.env["CANONICAL_PROFILE"] = profile
       result = self.cli("acceptance", "--profile", profile)
       self.assertEqual(0, result.returncode, result.stderr)
       self.assertEqual(f"acceptance verified: {receipt_path}\n", result.stdout)
       self.assertEqual("", result.stderr)
+      if profile == "offline":
+        receipt_path.unlink()
+
+    self.env["CANONICAL_REPLAY"] = "1"
+    replayed = self.cli("acceptance", "--profile", "ci")
+    self.assertEqual(2, replayed.returncode)
+    self.assertIn("acceptance receipt verification failed", replayed.stderr)
+    self.env.pop("CANONICAL_REPLAY")
 
     mismatch_values = (
         ("source_revision", "f" * 40, source_revision),
@@ -145,7 +157,7 @@ class KeycloakctlTest(unittest.TestCase):
     for field, mismatched, original in mismatch_values:
       with self.subTest(provenance_field=field):
         receipt["source"][field] = mismatched
-        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
         rejected = self.cli("acceptance", "--profile", "ci")
         self.assertEqual(2, rejected.returncode)
         self.assertIn("acceptance receipt verification failed", rejected.stderr)
