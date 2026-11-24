@@ -10,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from scripts import keycloakctl_cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +44,12 @@ class KeycloakctlTest(unittest.TestCase):
                                                    str(Path(sys.executable).absolute().parent), os.defpath])),
         "LC_ALL": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(self.cwd),
     }
+
+  def test_local_setup_docs_pin_required_python_patch_version(self):
+    docs = (ROOT / "docs/acceptance/keycloakctl-foundation.md").read_text(encoding="utf-8")
+    self.assertIn("Run `./keycloakctl --help` with Python 3.11.13.", docs)
 
   def cli(self, *args):
     return subprocess.run([str(self.repo / "keycloakctl"), *args], cwd=self.cwd,
@@ -280,7 +288,6 @@ raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
     self.rejection(2, "phase is not supported by run profile", "publish", *dev, "--allow-live")
     self.rejection(3, "provider build or image readback failed", "build", *dev)
     self.rejection(3, "provider build or image readback failed", "build", *dev)
-    self.rejection(3, "preflight unavailable for local profiles", "preflight", *dev)
     self.assertEqual(original, (self.run_directory(run_id) / "manifest.json").read_bytes())
 
   def test_build_uses_local_engine_then_verifies_immutable_ids_and_resumes(self):
@@ -766,6 +773,236 @@ else: raise SystemExit(91)
     self.assertFalse((self.cwd / "ssh.jsonl").exists())
     self.assertEqual(["tailscale version", "podman --version"] * 2,
                      (self.cwd / "tool.jsonl").read_text().splitlines())
+
+  def install_local_preflight_tools(self, engine):
+    for name in tuple(self.env):
+      if name.startswith(("FAKE_", "DOCKER_", "CONTAINER_")) or name in {
+          "XDG_CONFIG_HOME", "PODMAN_CONNECTIONS_CONF"}:
+        self.env.pop(name)
+    log = self.cwd / "local-preflight-tools.log"
+    log.write_text("", encoding="utf-8")
+    scripts = {
+        "java": '''#!/usr/bin/env python3.11
+import os, sys
+open(os.environ["LOCAL_PREFLIGHT_LOG"], "a").write("java\\n")
+print('openjdk version "' + os.environ.get("FAKE_JAVA", "21.0.1") + '"', file=sys.stderr)
+''',
+        "mvn": '''#!/usr/bin/env python3.11
+import os
+open(os.environ["LOCAL_PREFLIGHT_LOG"], "a").write("mvn\\n")
+print("Apache Maven " + os.environ.get("FAKE_MAVEN", "3.9.9"))
+''',
+        "git": '''#!/usr/bin/env python3.11
+import os
+open(os.environ["LOCAL_PREFLIGHT_LOG"], "a").write("git\\n")
+print("git version " + os.environ.get("FAKE_GIT", "2.47.1"))
+''',
+    }
+    for name, content in scripts.items():
+      path = self.cwd / name
+      path.write_text(content, encoding="utf-8")
+      path.chmod(0o700)
+    if engine == "podman":
+      content = '''#!/usr/bin/env python3.11
+import json, os, sys
+args = sys.argv[1:]
+open(os.environ["LOCAL_PREFLIGHT_LOG"], "a").write("podman " + " ".join(args) + "\\n")
+if args == ["--version"]: print("podman version " + os.environ.get("FAKE_ENGINE", "5.4.0"))
+elif args == ["info", "--format", "json"]: print(os.environ.get("FAKE_INFO", json.dumps({"host":{"security":{"rootless":os.environ.get("FAKE_ROOTLESS", "true") == "true"}}})))
+elif args == ["images", "--no-trunc", "--format", "json"]: print(os.environ.get("FAKE_PODMAN_INVENTORY", "[]"))
+else: raise SystemExit(91)
+'''
+    else:
+      content = '''#!/usr/bin/env python3.11
+import json, os, sys
+args = sys.argv[1:]
+open(os.environ["LOCAL_PREFLIGHT_LOG"], "a").write("docker " + " ".join(args) + "\\n")
+if args == ["--version"]: print("Docker version " + os.environ.get("FAKE_ENGINE", "27.5.1") + ", build deadbee")
+elif args == ["version", "--format", "{{.Server.Version}}"]: print(os.environ.get("FAKE_DAEMON", "27.5.1"))
+elif args == ["image", "ls", "--no-trunc", "--format", "{{json .}}"]: print(os.environ.get("FAKE_INVENTORY", '{"ID":"sha256:' + 'd' * 64 + '"}'))
+elif args == ["buildx", "version"]:
+  if os.environ.get("FAKE_BUILDX") == "missing": raise SystemExit(1)
+  print("github.com/docker/buildx v0.20.1")
+else: raise SystemExit(91)
+'''
+    executable = self.cwd / engine
+    executable.write_text(content, encoding="utf-8")
+    executable.chmod(0o700)
+    tailscale = self.cwd / "tailscale"
+    tailscale.write_text('#!/bin/sh\necho tailscale >> "$LOCAL_PREFLIGHT_LOG"\nexit 99\n', encoding="utf-8")
+    tailscale.chmod(0o700)
+    self.env["LOCAL_PREFLIGHT_LOG"] = str(log)
+    self.env["PATH"] = str(self.cwd) + os.pathsep + self.env["PATH"]
+    return log
+
+  def test_local_preflight_passes_dev_podman_and_ci_docker_without_state_or_tailscale(self):
+    for profile, engine in (("dev", "podman"), ("ci", "docker")):
+      with self.subTest(profile=profile):
+        log = self.install_local_preflight_tools(engine)
+        path = self.config_file({"version": 1, "profile": profile, "engine": engine})
+        run_id = self.setup_run("--profile", profile, "--config", path)
+        before = self.storage_snapshot()
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+        self.assertEqual((0, "preflight passed\n", ""),
+                         (result.returncode, result.stdout, result.stderr))
+        self.assertEqual(before, self.storage_snapshot())
+        self.assertEqual(["setup"], json.loads((self.run_directory(run_id) / "manifest.json").read_text())["completed"])
+        calls = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(["java", "mvn", "git"], calls[:3])
+        self.assertFalse(any(call == "tailscale" for call in calls))
+        self.assertIn(engine + " --version", calls)
+        if engine == "podman":
+          self.assertIn("podman info --format json", calls)
+          self.assertIn("podman images --no-trunc --format json", calls)
+        else:
+          self.assertIn("docker version --format {{.Server.Version}}", calls)
+          self.assertIn("docker buildx version", calls)
+          self.assertIn("docker image ls --no-trunc --format {{json .}}", calls)
+
+  def test_local_preflight_requires_exact_python_311_patch_before_tool_side_effects(self):
+    calls = []
+
+    def record_command(executable, arguments):
+      calls.append((executable, arguments))
+      return {
+          "java": 'openjdk version "21.0.1"',
+          "mvn": "Apache Maven 3.9.9",
+          "git": "git version 2.47.1",
+      }.get(executable, "podman version 5.4.0")
+
+    with patch.object(keycloakctl_cli.sys, "version_info", (3, 11, 12)), \
+         patch.object(keycloakctl_cli, "local_command", side_effect=record_command):
+      with self.assertRaisesRegex(keycloakctl_cli.Rejected,
+                                  "^preflight local tool check failed$"):
+        keycloakctl_cli.perform_local_preflight(None, "dev")
+
+    self.assertEqual([], calls)
+
+  def test_local_preflight_accepts_empty_and_id_shaped_engine_inventories(self):
+    cases = (("docker", "empty", {"FAKE_INVENTORY": ""}),
+             ("docker", "row", {"FAKE_INVENTORY": json.dumps({"ID": "sha256:" + "a" * 64})}),
+             ("podman", "empty", {"FAKE_PODMAN_INVENTORY": "[]"}),
+             ("podman", "row", {"FAKE_PODMAN_INVENTORY": json.dumps([{"Id": "sha256:" + "b" * 64}])}))
+    for engine, inventory_case, overrides in cases:
+      with self.subTest(engine=engine, inventory_case=inventory_case):
+        log = self.install_local_preflight_tools(engine)
+        self.env.update(overrides)
+        profile = "ci" if engine == "docker" else "dev"
+        path = self.config_file({"version": 1, "profile": profile, "engine": engine})
+        run_id = self.setup_run("--profile", profile, "--config", path)
+        before = self.storage_snapshot()
+
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+
+        self.assertEqual((0, "preflight passed\n", ""),
+                         (result.returncode, result.stdout, result.stderr))
+        self.assertEqual(before, self.storage_snapshot())
+        self.assertFalse(any(call == "tailscale" for call in log.read_text().splitlines()))
+
+  def test_local_preflight_rejects_malformed_image_inventory_rows(self):
+    cases = (("docker", {"FAKE_INVENTORY": "{}"}),
+             ("docker", {"FAKE_INVENTORY": json.dumps({"ID": 7})}),
+             ("docker", {"FAKE_INVENTORY": json.dumps({"ID": "not-an-id"})}),
+             ("podman", {"FAKE_PODMAN_INVENTORY": "[{}]"}),
+             ("podman", {"FAKE_PODMAN_INVENTORY": json.dumps([{"Id": 7}])}),
+             ("podman", {"FAKE_PODMAN_INVENTORY": json.dumps([{"Id": "sha256:short"}])}))
+    for engine, overrides in cases:
+      with self.subTest(engine=engine, overrides=overrides):
+        log = self.install_local_preflight_tools(engine)
+        self.env.update(overrides)
+        profile = "ci" if engine == "docker" else "dev"
+        path = self.config_file({"version": 1, "profile": profile, "engine": engine})
+        run_id = self.setup_run("--profile", profile, "--config", path)
+        before = self.storage_snapshot()
+
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+
+        self.assertEqual((2, "", "error: preflight local tool check failed\n"),
+                         (result.returncode, result.stdout, result.stderr))
+        self.assertEqual(before, self.storage_snapshot())
+        self.assertFalse(any(call == "tailscale" for call in log.read_text().splitlines()))
+
+  def test_local_preflight_rejects_bad_toolchain_or_engine_readback(self):
+    cases = (("java", {"FAKE_JAVA": "17.0.12"}),
+             ("mvn", {"FAKE_MAVEN": "not-a-version"}),
+             ("git", {"FAKE_GIT": "not-a-version"}),
+             ("podman", {"FAKE_ENGINE": "not-a-version"}),
+             ("podman", {"FAKE_ROOTLESS": "false"}),
+             ("podman", {"FAKE_INFO": "not-json"}),
+             ("podman", {"FAKE_PODMAN_INVENTORY": "not-json"}),
+             ("docker", {"FAKE_ENGINE": "not-a-version"}),
+             ("docker", {"FAKE_DAEMON": "unavailable"}),
+             ("docker", {"FAKE_BUILDX": "missing"}),
+             ("docker", {"FAKE_INVENTORY": "not-json"}))
+    for engine, overrides in cases:
+      with self.subTest(engine=engine, overrides=overrides):
+        selected_engine = "podman" if engine in {"java", "mvn", "git"} else engine
+        log = self.install_local_preflight_tools(selected_engine)
+        self.env.update(overrides)
+        profile = "ci" if selected_engine == "docker" else "dev"
+        path = self.config_file({"version": 1, "profile": profile, "engine": selected_engine})
+        run_id = self.setup_run("--profile", profile, "--config", path)
+        before = self.storage_snapshot()
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+        self.assertEqual((2, "", "error: preflight local tool check failed\n"),
+                         (result.returncode, result.stdout, result.stderr))
+        self.assertEqual(before, self.storage_snapshot())
+        calls = log.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(call == "tailscale" for call in calls))
+
+    log = self.install_local_preflight_tools("podman")
+    (self.cwd / "mvn").unlink()
+    path = self.config_file({"version": 1, "profile": "dev", "engine": "podman"})
+    run_id = self.setup_run("--profile", "dev", "--config", path)
+    before = self.storage_snapshot()
+    result = self.cli("preflight", "--run-id", run_id, "--config", path)
+    self.assertEqual((2, "", "error: preflight local tool check failed\n"),
+                     (result.returncode, result.stdout, result.stderr))
+    self.assertEqual(before, self.storage_snapshot())
+    calls = log.read_text(encoding="utf-8").splitlines()
+    self.assertTrue(calls)
+    self.assertTrue(all(call == "java" for call in calls))
+
+  def test_local_preflight_rejects_remote_engine_endpoints_before_engine_invocation(self):
+    cases = (("docker", {"DOCKER_HOST": "tcp://remote.invalid:2376"}, None),
+             ("docker", {"DOCKER_CONTEXT": "remote"}, "context"),
+             ("docker", {}, "current-context"),
+             ("docker", {}, "relative-current-context"),
+             ("podman", {"CONTAINER_HOST": "ssh://user@remote.invalid/run/podman.sock"}),
+             ("podman", {"CONTAINER_CONNECTION": "remote"}, "connection"))
+    for case in cases:
+      engine, endpoint_vars = case[:2]
+      fixture = case[2] if len(case) == 3 else None
+      with self.subTest(engine=engine, endpoint_vars=endpoint_vars):
+        log = self.install_local_preflight_tools(engine)
+        self.env.update(endpoint_vars)
+        if fixture in {"context", "current-context", "relative-current-context"}:
+          docker_dir = (self.repo / "docker-config" if fixture == "relative-current-context"
+                        else self.cwd / ".docker")
+          metadata = docker_dir / "contexts/meta/remote-id"
+          metadata.mkdir(parents=True, exist_ok=True)
+          (metadata / "meta.json").write_text(json.dumps({"Name": "remote", "Endpoints": {"docker": {"Host": "tcp://remote.invalid:2376"}}}))
+          if fixture in {"current-context", "relative-current-context"}:
+            (docker_dir / "config.json").write_text(json.dumps({"currentContext": "remote"}))
+          self.env["DOCKER_CONFIG"] = ("docker-config" if fixture == "relative-current-context"
+                                       else str(docker_dir))
+        if fixture == "connection":
+          connections = self.cwd / ".config/containers"
+          connections.mkdir(parents=True)
+          (connections / "podman-connections.json").write_text(json.dumps({
+              "Default": "remote", "Connection list": [{"Name": "remote", "URI": "ssh://user@remote.invalid/run/podman.sock"}]}))
+          self.env["XDG_CONFIG_HOME"] = str(self.cwd / ".config")
+        profile = "ci" if engine == "docker" else "dev"
+        path = self.config_file({"version": 1, "profile": profile, "engine": engine})
+        run_id = self.setup_run("--profile", profile, "--config", path)
+        before = self.storage_snapshot()
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+        self.assertEqual((2, "", "error: preflight local tool check failed\n"),
+                         (result.returncode, result.stdout, result.stderr))
+        calls = log.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(call.startswith(engine + " ") for call in calls))
+        self.assertFalse(any(call == "tailscale" for call in calls))
+        self.assertEqual(before, self.storage_snapshot())
 
   def install_preflight_adapters(self, *, ip="100.64.12.100", rootless=True, malformed=False, ssh_status=0):
     tailscale = self.cwd / "tailscale"

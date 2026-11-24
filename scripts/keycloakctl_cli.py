@@ -34,7 +34,7 @@ PLANS = {
 LIVE_PHASES = {"publish", "deploy", "configure", "integration-test", "verify readiness", "teardown"}
 TEST_STEPS = ("java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check")
 PHASE_HELP = {
-  "preflight": "check local or remote prerequisites without changes",
+  "preflight": "check local toolchain/engine or remote target prerequisites without changes",
   "build": "package the provider, fetch and verify locked resolver inputs, then build the provider and test RP images",
   "test": "run acceptance checks and image smokes; Python checks fetch pinned prerequisites",
   "publish": "transfer exact run images over Tailscale SSH, not to a registry",
@@ -325,9 +325,10 @@ def guard_phase(phase: str, state: dict, config: dict | None) -> None:
 def attempt_phase(phase: str, state: dict, config: dict | None) -> None:
   guard_phase(phase, state, config)
   if phase == "preflight":
-    if state["profile"] not in LIVE_PROFILES:
-      raise Unavailable("preflight unavailable for local profiles")
-    perform_preflight(config)
+    if state["profile"] in LOCAL_PROFILES:
+      perform_local_preflight(config, state["profile"])
+    else:
+      perform_preflight(config)
     print("preflight passed")
     return
   raise Unavailable(f"{phase} unavailable in the offline foundation")
@@ -395,6 +396,183 @@ def perform_preflight(config: dict | None) -> None:
       or type(info["host"].get("security")) is not dict
       or info["host"]["security"].get("rootless") is not True):
     raise Rejected("preflight not rootless")
+
+
+def local_command(executable: str, arguments: list[str]) -> str:
+  """Run a bounded, read-only local probe; never expose its output to users."""
+  path = shutil.which(executable)
+  if path is None:
+    raise Rejected("preflight local tool check failed")
+  try:
+    result = subprocess.run([path, *arguments], cwd=ROOT, capture_output=True,
+                            check=False, timeout=5)
+  except (OSError, subprocess.TimeoutExpired):
+    raise Rejected("preflight local tool check failed") from None
+  if result.returncode or len(result.stdout) > 65536 or len(result.stderr) > 65536:
+    raise Rejected("preflight local tool check failed")
+  try:
+    return (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="strict")
+  except UnicodeError:
+    raise Rejected("preflight local tool check failed") from None
+
+
+def version_match(pattern: str, output: str) -> tuple[int, ...] | None:
+  match = re.search(pattern, output, flags=re.IGNORECASE)
+  if match is None:
+    return None
+  try:
+    return tuple(int(part) for part in match.group(1).split("."))
+  except (ValueError, AttributeError):
+    return None
+
+
+def validate_inventory_entry(entry: object, identifier_field: str) -> bool:
+  if not isinstance(entry, dict):
+    return False
+  image_id = entry.get(identifier_field)
+  if not isinstance(image_id, str):
+    return False
+  return image_id == image_id.strip() and normalize_image_id(image_id) is not None
+
+
+def validate_inventory(output: str, *, docker: bool) -> bool:
+  try:
+    if docker:
+      entries = [json.loads(line) for line in output.splitlines() if line.strip()]
+      return all(validate_inventory_entry(entry, "ID") for entry in entries)
+    entries = json.loads(output)
+    return (type(entries) is list
+            and all(validate_inventory_entry(entry, "Id") for entry in entries))
+  except (ValueError, RecursionError):
+    return False
+
+
+def endpoint_is_local(endpoint: object, *, docker: bool) -> bool:
+  if type(endpoint) is not str or not endpoint or endpoint.strip() != endpoint:
+    return False
+  if endpoint.startswith("unix://"):
+    path = endpoint[7:]
+    return path.startswith("/") and not path.startswith("//")
+  return docker and endpoint.lower().startswith("npipe://./pipe/")
+
+
+def engine_config_path(value: str | Path) -> Path:
+  path = Path(value)
+  return path if path.is_absolute() else ROOT / path
+
+
+def docker_endpoint() -> str | None:
+  """Resolve Docker's selected endpoint from local configuration only."""
+  try:
+    docker_dir = engine_config_path(os.environ.get("DOCKER_CONFIG", Path.home() / ".docker"))
+    if os.environ.get("DOCKER_HOST") and not os.environ.get("DOCKER_CONTEXT"):
+      return os.environ["DOCKER_HOST"]
+    context_name = os.environ.get("DOCKER_CONTEXT")
+    settings_path = docker_dir / "config.json"
+    if settings_path.exists():
+      settings = json.loads(settings_path.read_text(encoding="utf-8"))
+      if type(settings) is not dict:
+        return None
+      context_name = context_name or settings.get("currentContext") or "default"
+    else:
+      context_name = context_name or "default"
+    if context_name == "default":
+      return "unix:///var/run/docker.sock"
+    for metadata_path in (docker_dir / "contexts" / "meta").glob("*/*.json"):
+      metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+      if type(metadata) is dict and metadata.get("Name") == context_name:
+        endpoints = metadata.get("Endpoints")
+        endpoint = endpoints.get("docker") if type(endpoints) is dict else None
+        return endpoint.get("Host") if type(endpoint) is dict else None
+    return None
+  except (OSError, ValueError, RecursionError):
+    return None
+
+
+def podman_endpoint_is_local() -> bool:
+  """Reject selected remote Podman connections without invoking Podman."""
+  try:
+    if "CONTAINER_HOST" in os.environ:
+      if not endpoint_is_local(os.environ["CONTAINER_HOST"], docker=False):
+        return False
+    selected = os.environ.get("CONTAINER_CONNECTION")
+    paths = []
+    if os.environ.get("PODMAN_CONNECTIONS_CONF"):
+      paths.append(engine_config_path(os.environ["PODMAN_CONNECTIONS_CONF"]))
+    config_home = engine_config_path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    paths.append(config_home / "containers" / "podman-connections.json")
+    for path in paths:
+      if not path.exists():
+        continue
+      config = json.loads(path.read_text(encoding="utf-8"))
+      if type(config) is not dict:
+        return False
+      connections = config.get("Connection list", config.get("connections", []))
+      if type(connections) is not list:
+        return False
+      name = selected or config.get("Default", config.get("default"))
+      if not name:
+        continue
+      matching = [item for item in connections
+                  if type(item) is dict and item.get("Name", item.get("name")) == name]
+      if len(matching) != 1:
+        return False
+      uri = matching[0].get("URI", matching[0].get("uri"))
+      return endpoint_is_local(uri, docker=False)
+    return selected is None and "CONTAINER_HOST" not in os.environ
+  except (OSError, ValueError, RecursionError):
+    return False
+
+
+def perform_local_preflight(config: dict | None, profile: str) -> None:
+  """Validate the local toolchain and explicitly selected local container engine."""
+  if sys.version_info[:3] != (3, 11, 13):
+    raise Rejected("preflight local tool check failed")
+  checks = (
+      ("java", ["-version"], r'(?:openjdk|java) version\s+["\']?(\d+(?:\.\d+)*)'),
+      ("mvn", ["-version"], r"Apache Maven\s+(\d+(?:\.\d+){1,2})"),
+      ("git", ["--version"], r"git version\s+(\d+(?:\.\d+){1,2})"),
+  )
+  for executable, arguments, pattern in checks:
+    version = version_match(pattern, local_command(executable, arguments))
+    if version is None or (executable == "java" and version[0] != 21):
+      raise Rejected("preflight local tool check failed")
+
+  engine = (config or {}).get("engine", "docker" if profile == "ci" else "podman")
+  if engine == "docker":
+    if not endpoint_is_local(docker_endpoint(), docker=True):
+      raise Rejected("preflight local tool check failed")
+  elif engine == "podman":
+    if not podman_endpoint_is_local():
+      raise Rejected("preflight local tool check failed")
+  else:
+    raise Rejected("preflight local tool check failed")
+
+  engine_version = version_match(
+      r"(?:podman version|docker version)\s+(\d+(?:\.\d+){1,2})",
+      local_command(engine, ["--version"]))
+  if engine_version is None:
+    raise Rejected("preflight local tool check failed")
+  if engine == "docker":
+    daemon = version_match(r"(\d+(?:\.\d+){1,2})",
+                           local_command(engine, ["version", "--format", "{{.Server.Version}}" ]))
+    buildx = version_match(r"buildx\s+v?(\d+(?:\.\d+){1,2})",
+                           local_command(engine, ["buildx", "version"]))
+    inventory = local_command(engine, ["image", "ls", "--no-trunc", "--format", "{{json .}}"])
+    if daemon is None or buildx is None or not validate_inventory(inventory, docker=True):
+      raise Rejected("preflight local tool check failed")
+  else:
+    try:
+      info = json.loads(local_command(engine, ["info", "--format", "json"]))
+    except (ValueError, RecursionError):
+      raise Rejected("preflight local tool check failed") from None
+    if (type(info) is not dict or type(info.get("host")) is not dict
+        or type(info["host"].get("security")) is not dict
+        or info["host"]["security"].get("rootless") is not True):
+      raise Rejected("preflight local tool check failed")
+    inventory = local_command(engine, ["images", "--no-trunc", "--format", "json"])
+    if not validate_inventory(inventory, docker=False):
+      raise Rejected("preflight local tool check failed")
 
 
 def build_image(engine: str, run_id: str, name: str, dockerfile: str, context: str, *,
@@ -893,8 +1071,10 @@ Use --allow-live on each live invocation (publish, deploy, configure,
 integration-test, verify readiness, teardown, and full at a live step).
 verify qualification checks same-run evidence; promote requires --allow-publish
 and an explicit --destination, separately from publish. These flags do not
-replace scoped human approval. Preflight is a repeatable, read-only SSH check;
-no deployment or qualification phase is implemented here.
+replace scoped human approval. Preflight is repeatable and read-only: local
+profiles check the host toolchain and selected local engine, while live profiles
+check the configured remote target; no deployment or qualification phase is
+implemented here.
 
 Setup, validate-config, local build, and local test phases are implemented. Build packages the provider with Maven on the host (dependency resolution may use the network), then fetches locked resolver inputs and invokes the container engine with image-build networking disabled. Test runs the offline Java package suite, verifies non-empty passing Surefire reports, the canonical Python suite, and no-network provider and RP-fixture image smokes. Other eligible unavailable phases exit 3; refusals exit 2.
 """
