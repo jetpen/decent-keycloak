@@ -254,7 +254,9 @@ class LifecycleCliTest(unittest.TestCase):
 
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", side_effect=preflight_before_write), \
-          mock.patch.object(lifecycle, "fingerprint_source", return_value={}):
+          mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": False}):
         result = lifecycle.run_profile("offline")
 
       self.assertEqual(2, result)
@@ -269,6 +271,8 @@ class LifecycleCliTest(unittest.TestCase):
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": False}), \
           mock.patch.object(lifecycle, "container_engine", return_value="docker"), \
           mock.patch.object(lifecycle, "run", side_effect=KeyboardInterrupt):
         result = lifecycle.run_profile("offline")
@@ -286,6 +290,8 @@ class LifecycleCliTest(unittest.TestCase):
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", return_value={}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": False}), \
           mock.patch.object(lifecycle, "container_engine", return_value="docker"), \
           mock.patch.object(lifecycle, "run", side_effect=[0, KeyboardInterrupt()]), \
           mock.patch.object(lifecycle, "verify_surefire", return_value=0), \
@@ -316,6 +322,8 @@ class LifecycleCliTest(unittest.TestCase):
       def fake_capture(command):
         if command == ["git", "rev-parse", "--verify", "HEAD"]:
           return subprocess.CompletedProcess([], 0, "c" * 40, "")
+        if command == ["git", "status", "--porcelain=v1", "--untracked-files=all"]:
+          return subprocess.CompletedProcess([], 0, "", "")
         if "{{json .}}" in command:
           payload = [{"Id": image_id, "Parent": "", "Config": {"Labels": {
               "io.decent.lifecycle.run-id": owner_run_id["value"]}}}]
@@ -395,6 +403,8 @@ class LifecycleCliTest(unittest.TestCase):
       nonlocal inventory_calls, changed
       if command == ["git", "rev-parse", "--verify", "HEAD"]:
         return subprocess.CompletedProcess([], 0, "c" * 40, "")
+      if command == ["git", "status", "--porcelain=v1", "--untracked-files=all"]:
+        return subprocess.CompletedProcess([], 0, "", "")
       if command[1:3] == ["image", "ls"]:
         inventory_calls += 1
         return subprocess.CompletedProcess([], 0, "\n".join(sorted(images)) + "\n", "")
@@ -477,6 +487,9 @@ class LifecycleCliTest(unittest.TestCase):
         self._run_profile_with_fake_engine()
 
     self.assertEqual(0, result)
+    self.assertEqual("c" * 40, receipt["source"]["source_revision"])
+    self.assertIs(receipt["source"]["worktree_clean"], True)
+    self.assertRegex(receipt["source"]["image_source_sha256"], r"\A[0-9a-f]{64}\Z")
     self.assertEqual({baseline}, set(images))
     self.assertNotIn(runtime, images)
     self.assertEqual([runtime, builder, base_stage], removals)

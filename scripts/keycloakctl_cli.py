@@ -1076,18 +1076,22 @@ profiles check the host toolchain and selected local engine, while live profiles
 check the configured remote target; no deployment or qualification phase is
 implemented here.
 
-Setup, validate-config, local build, and local test phases are implemented. Build packages the provider with Maven on the host (dependency resolution may use the network), then fetches locked resolver inputs and invokes the container engine with image-build networking disabled. Test runs the offline Java package suite, verifies non-empty passing Surefire reports, the canonical Python suite, and no-network provider and RP-fixture image smokes. Other eligible unavailable phases exit 3; refusals exit 2.
+Setup, validate-config, and local run phases are implemented. `keycloakctl acceptance --profile offline|ci` is a bounded verifier/delegator: it invokes the unchanged `scripts/lifecycle.py run <profile>` entry point and checks the lifecycle-produced receipt's source provenance, every local step, and cleanup/teardown before reporting verification. The canonical GitHub Actions command remains `python scripts/lifecycle.py run ci`; this wrapper does not migrate CI or claim complete former-lifecycle parity. Build packages the provider with Maven on the host (dependency resolution may use the network), then fetches locked resolver inputs and invokes the container engine with image-build networking disabled. Test runs the offline Java package suite, verifies non-empty passing Surefire reports, the canonical Python suite, and no-network provider and RP-fixture image smokes. Other eligible unavailable phases exit 3; refusals exit 2.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
+                  "acceptance": "run and verify the canonical local lifecycle",
                   **PHASE_HELP, "full": "create or resume one readiness or qualification run"}
   for name, description in descriptions.items():
     command = commands.add_parser(name, help=description, description=description, allow_abbrev=False)
-    command.add_argument("--config", required=name == "validate-config", metavar="FILE",
-                         help="non-secret JSON file, relative to the caller if not absolute")
-    if name in ("setup", "validate-config", "full"):
+    if name != "acceptance":
+      command.add_argument("--config", required=name == "validate-config", metavar="FILE",
+                           help="non-secret JSON file, relative to the caller if not absolute")
+    if name == "acceptance":
+      command.add_argument("--profile", choices=("offline", "ci"), required=True)
+    elif name in ("setup", "validate-config", "full"):
       profile_choices = config_fields()["profile"]["enum"] if name == "validate-config" else (
           LIVE_PROFILES if name == "full" else PROFILES)
       command.add_argument("--profile", choices=profile_choices,
@@ -1096,7 +1100,7 @@ Setup, validate-config, local build, and local test phases are implemented. Buil
       selection = command.add_mutually_exclusive_group(required=True)
       selection.add_argument("--new-run", action="store_true")
       selection.add_argument("--run-id")
-    elif name != "validate-config":
+    elif name not in ("validate-config", "acceptance"):
       command.add_argument("--run-id", required=name not in ("setup", "promote"))
     if name in LIVE_PHASES or name in ("verify", "full"):
       command.add_argument("--allow-live", action="store_true", help="required on each live invocation")
@@ -1109,10 +1113,86 @@ Setup, validate-config, local build, and local test phases are implemented. Buil
   return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-  args = make_parser().parse_args(argv)
+def run_acceptance(profile: str) -> int:
+  """Run the legacy canonical local lifecycle and verify its durable receipt."""
+  if profile not in ("offline", "ci"):
+    print("error: acceptance supports only offline and ci profiles", file=sys.stderr)
+    return 2
   try:
-    if args.command == "validate-config":
+    result = subprocess.run(
+        [sys.executable, "scripts/lifecycle.py", "run", profile], cwd=ROOT,
+        capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+  except (OSError, UnicodeError):
+    print("error: canonical lifecycle could not be started", file=sys.stderr)
+    return 2
+  if result.returncode:
+    print("error: canonical lifecycle failed", file=sys.stderr)
+    return result.returncode if 0 < result.returncode < 256 else 2
+  reported = [line.removeprefix("lifecycle receipt: ") for line in result.stdout.splitlines()
+              if line.startswith("lifecycle receipt: ")]
+  try:
+    expected_directory = (ROOT / "target/lifecycle/evidence").resolve(strict=True)
+  except OSError:
+    print("error: acceptance receipt verification failed", file=sys.stderr)
+    return 2
+  candidates = []
+  for value in reported:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+      candidate = ROOT / candidate
+    try:
+      resolved = candidate.resolve(strict=True)
+      info = candidate.stat()
+      if (not candidate.is_symlink() and resolved.parent == expected_directory
+          and stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024):
+        candidates.append((candidate, info))
+    except OSError:
+      continue
+  if len(candidates) != 1:
+    print("error: acceptance receipt verification failed", file=sys.stderr)
+    return 2
+  path, info = candidates[0]
+  try:
+    receipt = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_members)
+    source = receipt.get("source") if type(receipt) is dict else None
+    steps = receipt.get("steps") if type(receipt) is dict else None
+    cleanup = receipt.get("cleanup") if type(receipt) is dict else None
+    required_steps = {"preflight", "java-tests", "surefire", "python-tests", "python-compile",
+        "resolver-sources", "resolver-dependencies", "provider-service-registration",
+        "provider-image", "image-smoke", "diff-check", "evidence", "teardown"}
+    if (type(receipt) is not dict or type(receipt.get("schema_version")) is not int
+        or receipt["schema_version"] != 1
+        or receipt.get("profile") != profile or type(receipt.get("run_id")) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", receipt["run_id"]) is None
+        or type(receipt.get("exit_code")) is not int or receipt["exit_code"] != 0
+        or type(source) is not dict
+        or not isinstance(source.get("source_revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", source["source_revision"]) is None
+        or not isinstance(source.get("image_source_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", source["image_source_sha256"]) is None
+        or type(source.get("image_source_file_count")) is not int
+        or source["image_source_file_count"] < 1
+        or type(source.get("worktree_clean")) is not bool
+        or type(steps) is not dict or not required_steps <= steps.keys()
+        or any(type(steps[name]) is not dict or steps[name].get("status") != "pass"
+               for name in required_steps)
+        or type(cleanup) is not dict or cleanup.get("status") != "pass"):
+      raise ValueError
+  except (OSError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
+    print("error: acceptance receipt verification failed", file=sys.stderr)
+    return 2
+  print(f"acceptance verified: {path}")
+  return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+  parser = make_parser()
+  args = parser.parse_args(argv)
+  try:
+    if args.command == "acceptance":
+      return run_acceptance(args.profile)
+    elif args.command == "validate-config":
       load_config(args.config, args.profile)
       print("configuration valid")
     elif args.command == "setup":

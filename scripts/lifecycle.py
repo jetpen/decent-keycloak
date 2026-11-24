@@ -1098,6 +1098,17 @@ def _run_capture(command: list[str], *, env: dict[str, str] | None = None) -> tu
   return result.returncode, result.stdout + result.stderr
 
 
+def local_source_provenance() -> dict:
+  """Return only the commit identity and cleanliness bit for a local receipt."""
+  revision = capture_command(["git", "rev-parse", "--verify", "HEAD"])
+  status = capture_command(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+  value = revision.stdout.strip()
+  if (revision.returncode or status.returncode
+      or re.fullmatch(r"[0-9a-f]{40,64}", value) is None):
+    raise RuntimeError("local source provenance unavailable")
+  return {"source_revision": value, "worktree_clean": status.stdout == ""}
+
+
 def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = False) -> int:
   run_id = uuid.uuid4().hex
   preflight_status = (preflight(live=True, remote_test_host=True)
@@ -1120,6 +1131,8 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
         "removed_image_ids": [], "retained_image_id": None,
         "unowned_new_image_count": 0, "inconclusive_image_count": 0},
   }
+  if profile in ("offline", "ci"):
+    receipt["source"].update(local_source_provenance())
   write_receipt(receipt_path, receipt)
   engine = container_engine()
   tag = f"{IMAGE_NAME}:lifecycle-{run_id}"
@@ -1214,7 +1227,7 @@ def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = F
       _record_step(receipt, receipt_path, "provider-image", "fail", detail="source_revision_unavailable")
       return 2
     source_revision = revision_result.stdout.strip()
-    receipt["source"] = dict(build_fingerprint)
+    receipt["source"].update(build_fingerprint)
     receipt["source"]["source_revision"] = source_revision
     write_receipt(receipt_path, receipt)
     baseline_image_ids = _image_inventory(engine)
