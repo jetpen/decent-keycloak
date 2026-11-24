@@ -374,9 +374,11 @@ def run(command: list[str], *, env: dict[str, str] | None = None) -> int:
   return subprocess.run(command, cwd=ROOT, env=env, check=False).returncode
 
 
-def capture_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-  print("+ " + shlex.join(command), flush=True)
-  return subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+def capture_command(command: list[str], *, cwd: Path = ROOT,
+                    echo: bool = True) -> subprocess.CompletedProcess[str]:
+  if echo:
+    print("+ " + shlex.join(command), flush=True)
+  return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
 
 
 def diff_check() -> int:
@@ -1098,18 +1100,47 @@ def _run_capture(command: list[str], *, env: dict[str, str] | None = None) -> tu
   return result.returncode, result.stdout + result.stderr
 
 
-def local_source_provenance() -> dict:
-  """Return only the commit identity and cleanliness bit for a local receipt."""
+def local_source_provenance(root: Path | None = None) -> dict:
+  """Fingerprint the commit and exact tracked/untracked worktree contents."""
+  root = ROOT if root is None else root
   try:
-    revision = capture_command(["git", "rev-parse", "--verify", "HEAD"])
-    status = capture_command(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+    revision = capture_command(["git", "rev-parse", "--verify", "HEAD"], cwd=root, echo=False)
+    status = capture_command(["git", "status", "--porcelain=v1", "--untracked-files=all",
+                              "--", ".", ":!target/**"], cwd=root, echo=False)
+    # Hash patch bytes, not the caller's preferred diff presentation.
+    tracked_diff = subprocess.run(["git", "diff", "--binary", "--no-color", "--no-ext-diff",
+        "--no-textconv", "--diff-algorithm=myers", "--no-indent-heuristic", "--no-renames",
+        "--unified=3", "--inter-hunk-context=0", "--src-prefix=a/", "--dst-prefix=b/",
+        "HEAD", "--", ".", ":!target/**"], cwd=root, capture_output=True, check=False)
+    untracked = capture_command(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=root, echo=False)
   except OSError as error:
     raise RuntimeError("local source provenance unavailable") from error
   value = revision.stdout.strip()
-  if (revision.returncode or status.returncode
+  if (revision.returncode or status.returncode or tracked_diff.returncode or untracked.returncode
       or re.fullmatch(r"[0-9a-f]{40,64}", value) is None):
     raise RuntimeError("local source provenance unavailable")
-  return {"source_revision": value, "worktree_clean": status.stdout == ""}
+  digest = hashlib.sha256()
+  digest.update(b"tracked-diff\0")
+  digest.update(tracked_diff.stdout)
+  untracked_paths = sorted(path for path in untracked.stdout.split("\0")
+      if path and not path.startswith("target/"))
+  for relative in untracked_paths:
+    path = root / relative
+    try:
+      contents = path.read_bytes()
+    except OSError as error:
+      raise RuntimeError("local source provenance unavailable") from error
+    digest.update(len(relative.encode("utf-8")).to_bytes(8, "big"))
+    digest.update(relative.encode("utf-8"))
+    digest.update(len(contents).to_bytes(8, "big"))
+    digest.update(contents)
+  return {
+    "source_revision": value,
+    "worktree_clean": status.stdout == "",
+    "worktree_diff_sha256": digest.hexdigest(),
+    "worktree_untracked_file_count": len(untracked_paths),
+  }
 
 
 def run_profile(profile: str, *, pull_base: bool = False, retain_image: bool = False) -> int:

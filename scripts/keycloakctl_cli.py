@@ -1114,19 +1114,9 @@ Setup, validate-config, and local run phases are implemented. `keycloakctl accep
 
 
 def acceptance_source_provenance() -> dict:
-  """Capture Git and image-source provenance before lifecycle delegation."""
-  from scripts.lifecycle import fingerprint_source
-
-  revision = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=ROOT,
-      capture_output=True, text=True, encoding="utf-8", check=False)
-  status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all"],
-      cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False)
-  source_revision = revision.stdout.strip()
-  if (revision.returncode or status.returncode
-      or re.fullmatch(r"[0-9a-f]{40,64}", source_revision) is None):
-    raise OSError("acceptance source provenance unavailable")
-  return {"source_revision": source_revision, "worktree_clean": status.stdout == "",
-      **fingerprint_source()}
+  """Return shared lifecycle provenance for the current source tree."""
+  from scripts.lifecycle import fingerprint_source, local_source_provenance
+  return {**local_source_provenance(ROOT), **fingerprint_source()}
 
 
 def run_acceptance(profile: str) -> int:
@@ -1156,6 +1146,18 @@ def run_acceptance(profile: str) -> int:
   if result.returncode:
     print("error: canonical lifecycle failed", file=sys.stderr)
     return result.returncode if 0 < result.returncode < 256 else 2
+  try:
+    current_source = acceptance_source_provenance()
+  except (OSError, UnicodeError, RuntimeError, ValueError):
+    print("error: acceptance source provenance changed during lifecycle", file=sys.stderr)
+    return 2
+  if (current_source["source_revision"] != expected_source["source_revision"]
+      or current_source["worktree_clean"] is not expected_source["worktree_clean"]
+      or current_source["worktree_diff_sha256"] != expected_source["worktree_diff_sha256"]
+      or current_source["worktree_untracked_file_count"]
+          != expected_source["worktree_untracked_file_count"]):
+    print("error: acceptance source provenance changed during lifecycle", file=sys.stderr)
+    return 2
   try:
     from scripts.lifecycle import fingerprint_source
     expected_receipt_source = fingerprint_source(include_build_artifacts=True)
@@ -1203,6 +1205,9 @@ def run_acceptance(profile: str) -> int:
         or type(source) is not dict
         or source.get("source_revision") != expected_source["source_revision"]
         or source.get("worktree_clean") is not expected_source["worktree_clean"]
+        or source.get("worktree_diff_sha256") != expected_source["worktree_diff_sha256"]
+        or source.get("worktree_untracked_file_count")
+            != expected_source["worktree_untracked_file_count"]
         or source.get("image_source_sha256") != expected_source["image_source_sha256"]
         or source.get("image_source_file_count") != expected_source["image_source_file_count"]
         or source.get("image_artifacts_sha256") != expected_receipt_source["image_artifacts_sha256"]

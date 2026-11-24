@@ -348,8 +348,6 @@ class LifecycleCliTest(unittest.TestCase):
       def fake_capture(command):
         if command == ["git", "rev-parse", "--verify", "HEAD"]:
           return subprocess.CompletedProcess([], 0, "c" * 40, "")
-        if command == ["git", "status", "--porcelain=v1", "--untracked-files=all"]:
-          return subprocess.CompletedProcess([], 0, "", "")
         if "{{json .}}" in command:
           payload = [{"Id": image_id, "Parent": "", "Config": {"Labels": {
               "io.decent.lifecycle.run-id": owner_run_id["value"]}}}]
@@ -367,6 +365,8 @@ class LifecycleCliTest(unittest.TestCase):
           mock.patch.object(lifecycle, "fingerprint_source", return_value={
               "image_source_sha256": "1" * 64, "image_artifacts_sha256": "2" * 64,
               "image_artifact_file_count": 3}), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": True}), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
           mock.patch.object(lifecycle, "run", side_effect=fake_run), \
@@ -429,8 +429,6 @@ class LifecycleCliTest(unittest.TestCase):
       nonlocal inventory_calls, changed
       if command == ["git", "rev-parse", "--verify", "HEAD"]:
         return subprocess.CompletedProcess([], 0, "c" * 40, "")
-      if command == ["git", "status", "--porcelain=v1", "--untracked-files=all"]:
-        return subprocess.CompletedProcess([], 0, "", "")
       if command[1:3] == ["image", "ls"]:
         inventory_calls += 1
         return subprocess.CompletedProcess([], 0, "\n".join(sorted(images)) + "\n", "")
@@ -493,6 +491,8 @@ class LifecycleCliTest(unittest.TestCase):
       with mock.patch.object(lifecycle, "ROOT", root), \
           mock.patch.object(lifecycle, "preflight", return_value=0), \
           mock.patch.object(lifecycle, "fingerprint_source", side_effect=fingerprint_source_for_run), \
+          mock.patch.object(lifecycle, "local_source_provenance",
+              return_value={"source_revision": "c" * 40, "worktree_clean": True}), \
           mock.patch.object(lifecycle, "container_engine", return_value="podman"), \
           mock.patch.object(lifecycle, "core_test_stages", return_value=[]), \
           mock.patch.object(lifecycle, "run", side_effect=engine_run), \

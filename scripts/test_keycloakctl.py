@@ -69,7 +69,18 @@ class KeycloakctlTest(unittest.TestCase):
       (root / "untracked.txt").write_text("new input")
       with patch.object(lifecycle, "ROOT", root):
         provenance = lifecycle.local_source_provenance()
-      self.assertEqual({"source_revision": revision, "worktree_clean": False}, provenance)
+        (root / "target/lifecycle/evidence").mkdir(parents=True)
+        (root / "target/lifecycle/evidence/generated.json").write_text("generated")
+        after_generated_output = lifecycle.local_source_provenance()
+        tracked.write_text("changed while still dirty")
+        changed_provenance = lifecycle.local_source_provenance()
+      self.assertEqual(provenance, after_generated_output)
+      self.assertEqual(revision, provenance["source_revision"])
+      self.assertFalse(provenance["worktree_clean"])
+      self.assertEqual(1, provenance["worktree_untracked_file_count"])
+      self.assertNotEqual(provenance["worktree_diff_sha256"],
+                          changed_provenance["worktree_diff_sha256"])
+      self.assertFalse(changed_provenance["worktree_clean"])
 
   def test_local_keycloakctl_steps_stay_aligned_with_canonical_lifecycle(self):
     canonical_steps = tuple(name for name, _ in lifecycle.core_test_stages())
@@ -107,18 +118,15 @@ class KeycloakctlTest(unittest.TestCase):
     with patch.object(lifecycle, "ROOT", self.repo):
       source_fingerprints = lifecycle.fingerprint_source(include_build_artifacts=True)
     receipt = {"schema_version": 1, "run_id": run_id, "profile": "ci", "exit_code": 0,
-        "source": {"source_revision": source_revision, **source_fingerprints,
-                   "worktree_clean": False},
+        "source": {"source_revision": source_revision, **source_fingerprints},
         "steps": {name: {"status": "pass"} for name in all_steps},
         "cleanup": {"status": "pass"}}
-    receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
     shutil.copy2(ROOT / "scripts/lifecycle.py", self.repo / "scripts/lifecycle_core.py")
     lifecycle_script = self.repo / "scripts/lifecycle.py"
     lifecycle_script.write_text("\n".join((
         "import os",
-        "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source",
+        "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source, local_source_provenance",
         "if __name__ == '__main__':",
-        "  profile = os.environ['CANONICAL_PROFILE']",
         "  receipt = os.environ['CANONICAL_RECEIPT']",
         "  if os.environ.get('CANONICAL_REPLAY') != '1': __import__('shutil').copy2(os.environ['CANONICAL_TEMPLATE'], receipt)",
         "  print('lifecycle receipt: /scratch/test-only.json')",
@@ -126,11 +134,17 @@ class KeycloakctlTest(unittest.TestCase):
         "")), encoding="utf-8")
     self.env["CANONICAL_RECEIPT"] = str(receipt_path)
     self.env["CANONICAL_TEMPLATE"] = str(receipt_template)
+    self.env.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="diff.mnemonicPrefix",
+                    GIT_CONFIG_VALUE_0="false", GIT_CONFIG_KEY_1="diff.context",
+                    GIT_CONFIG_VALUE_1="0")
+    # The same dirty tree must verify despite conflicting diff rendering preferences.
+    with patch.dict(os.environ, {**self.env, "GIT_CONFIG_VALUE_0": "true",
+                                 "GIT_CONFIG_VALUE_1": "10"}, clear=True):
+      receipt["source"].update(lifecycle.local_source_provenance(self.repo))
 
     for profile in ("offline", "ci"):
       receipt["profile"] = profile
       receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
-      self.env["CANONICAL_PROFILE"] = profile
       result = self.cli("acceptance", "--profile", profile)
       self.assertEqual(0, result.returncode, result.stderr)
       self.assertEqual(f"acceptance verified: {receipt_path}\n", result.stdout)
@@ -147,6 +161,11 @@ class KeycloakctlTest(unittest.TestCase):
     mismatch_values = (
         ("source_revision", "f" * 40, source_revision),
         ("worktree_clean", True, False),
+        ("worktree_diff_sha256", "f" * 64,
+         receipt["source"]["worktree_diff_sha256"]),
+        ("worktree_untracked_file_count",
+         receipt["source"]["worktree_untracked_file_count"] + 1,
+         receipt["source"]["worktree_untracked_file_count"]),
         ("image_source_sha256", "f" * 64, source_fingerprints["image_source_sha256"]),
         ("image_source_file_count", source_fingerprints["image_source_file_count"] + 1,
          source_fingerprints["image_source_file_count"]),
@@ -156,15 +175,18 @@ class KeycloakctlTest(unittest.TestCase):
     )
     for field, mismatched, original in mismatch_values:
       with self.subTest(provenance_field=field):
+        # A stale receipt would be rejected before the verifier even reads this field.
+        receipt_path.unlink()
         receipt["source"][field] = mismatched
         receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
         rejected = self.cli("acceptance", "--profile", "ci")
+        self.assertEqual(mismatched, json.loads(receipt_path.read_text())["source"][field])
         self.assertEqual(2, rejected.returncode)
         self.assertIn("acceptance receipt verification failed", rejected.stderr)
         receipt["source"][field] = original
 
     mismatched_path = receipt_path.with_name("mismatched-id.json")
-    receipt_path.rename(mismatched_path)
+    receipt_template.write_text(json.dumps(receipt), encoding="utf-8")
     self.env["CANONICAL_RECEIPT"] = str(mismatched_path)
     rejected = self.cli("acceptance", "--profile", "ci")
     self.assertEqual(2, rejected.returncode)
@@ -195,7 +217,7 @@ class KeycloakctlTest(unittest.TestCase):
     lifecycle_script = self.repo / "scripts/lifecycle.py"
     lifecycle_script.write_text("\n".join((
         "import os",
-        "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source",
+        "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source, local_source_provenance",
         "if __name__ == '__main__': print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
         "")), encoding="utf-8")
     bad_receipt = evidence_dir / f"{'b' * 32}.json"
