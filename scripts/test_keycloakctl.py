@@ -36,6 +36,12 @@ class KeycloakctlTest(unittest.TestCase):
       shutil.copy2(ROOT / relative, self.repo / relative)
     for module in ROOT.glob("scripts/keycloakctl*.py"):
       shutil.copy2(module, self.repo / "scripts")
+
+    subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Acceptance Test"], check=True)
+    subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "fixture"], check=True)
     if (ROOT / "config/keycloakctl").is_dir():
       shutil.copytree(ROOT / "config/keycloakctl", self.repo / "config/keycloakctl")
     python311 = shutil.which("python3.11")
@@ -78,26 +84,42 @@ class KeycloakctlTest(unittest.TestCase):
     self.assertNotIn("rp-fixture-smoke", {step["name"] for step in lifecycle.plan("ci")["steps"]})
 
   def test_acceptance_runs_only_the_canonical_local_profiles_and_verifies_receipt(self):
+    for relative in lifecycle.IMAGE_SOURCE_FILES:
+      source = self.repo / relative
+      if not source.exists():
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"fixture source")
+    for relative in lifecycle.IMAGE_SOURCE_DIRECTORIES:
+      (self.repo / relative).mkdir(parents=True, exist_ok=True)
+    for relative in lifecycle.IMAGE_BUILD_ARTIFACT_FILES:
+      artifact = self.repo / relative
+      artifact.parent.mkdir(parents=True, exist_ok=True)
+      artifact.write_bytes(b"fixture artifact")
     run_id = "a" * 32
     receipt_path = self.repo / "target/lifecycle/evidence" / f"{run_id}.json"
     receipt_path.parent.mkdir(parents=True)
     all_steps = ("preflight", "java-tests", "surefire", "python-tests", "python-compile",
         "resolver-sources", "resolver-dependencies", "provider-service-registration",
         "provider-image", "image-smoke", "diff-check", "evidence", "teardown")
+    source_revision = subprocess.check_output(
+        ["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+    with patch.object(lifecycle, "ROOT", self.repo):
+      source_fingerprints = lifecycle.fingerprint_source(include_build_artifacts=True)
     receipt = {"schema_version": 1, "run_id": run_id, "profile": "ci", "exit_code": 0,
-        "source": {"source_revision": "1" * 40, "image_source_sha256": "2" * 64,
-                   "image_source_file_count": 12, "image_artifacts_sha256": "3" * 64,
-                   "image_artifact_file_count": 3, "worktree_clean": False},
+        "source": {"source_revision": source_revision, **source_fingerprints,
+                   "worktree_clean": False},
         "steps": {name: {"status": "pass"} for name in all_steps},
         "cleanup": {"status": "pass"}}
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-    lifecycle = self.repo / "scripts/lifecycle.py"
-    lifecycle.write_text("\n".join((
-        "import os, sys",
-        "profile = os.environ['CANONICAL_PROFILE']",
-        "if sys.argv[1:] != ['run', profile]: raise SystemExit(91)",
-        "print('lifecycle receipt: /scratch/test-only.json')",
-        "print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
+    shutil.copy2(ROOT / "scripts/lifecycle.py", self.repo / "scripts/lifecycle_core.py")
+    lifecycle_script = self.repo / "scripts/lifecycle.py"
+    lifecycle_script.write_text("\n".join((
+        "import os",
+        "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source",
+        "if __name__ == '__main__':",
+        "  profile = os.environ['CANONICAL_PROFILE']",
+        "  print('lifecycle receipt: /scratch/test-only.json')",
+        "  print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
         "")), encoding="utf-8")
     self.env["CANONICAL_RECEIPT"] = str(receipt_path)
 
@@ -106,8 +128,28 @@ class KeycloakctlTest(unittest.TestCase):
       receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
       self.env["CANONICAL_PROFILE"] = profile
       result = self.cli("acceptance", "--profile", profile)
-      self.assertEqual((0, f"acceptance verified: {receipt_path}\n", ""),
-                       (result.returncode, result.stdout, result.stderr))
+      self.assertEqual(0, result.returncode, result.stderr)
+      self.assertEqual(f"acceptance verified: {receipt_path}\n", result.stdout)
+      self.assertEqual("", result.stderr)
+
+    mismatch_values = (
+        ("source_revision", "f" * 40, source_revision),
+        ("worktree_clean", True, False),
+        ("image_source_sha256", "f" * 64, source_fingerprints["image_source_sha256"]),
+        ("image_source_file_count", source_fingerprints["image_source_file_count"] + 1,
+         source_fingerprints["image_source_file_count"]),
+        ("image_artifacts_sha256", "f" * 64, source_fingerprints["image_artifacts_sha256"]),
+        ("image_artifact_file_count", source_fingerprints["image_artifact_file_count"] + 1,
+         source_fingerprints["image_artifact_file_count"]),
+    )
+    for field, mismatched, original in mismatch_values:
+      with self.subTest(provenance_field=field):
+        receipt["source"][field] = mismatched
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        rejected = self.cli("acceptance", "--profile", "ci")
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("acceptance receipt verification failed", rejected.stderr)
+        receipt["source"][field] = original
 
     mismatched_path = receipt_path.with_name("mismatched-id.json")
     receipt_path.rename(mismatched_path)
@@ -126,11 +168,23 @@ class KeycloakctlTest(unittest.TestCase):
 
     evidence_dir = self.repo / "target/lifecycle/evidence"
     evidence_dir.mkdir(parents=True)
-    lifecycle = self.repo / "scripts/lifecycle.py"
-    lifecycle.write_text("\n".join((
-        "import os, sys",
-        "if sys.argv[1:] != ['run', 'ci']: raise SystemExit(91)",
-        "print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
+    for relative in lifecycle.IMAGE_SOURCE_FILES:
+      source = self.repo / relative
+      if not source.exists():
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"fixture source")
+    for relative in lifecycle.IMAGE_SOURCE_DIRECTORIES:
+      (self.repo / relative).mkdir(parents=True, exist_ok=True)
+    for relative in lifecycle.IMAGE_BUILD_ARTIFACT_FILES:
+      artifact = self.repo / relative
+      artifact.parent.mkdir(parents=True, exist_ok=True)
+      artifact.write_bytes(b"fixture artifact")
+    shutil.copy2(ROOT / "scripts/lifecycle.py", self.repo / "scripts/lifecycle_core.py")
+    lifecycle_script = self.repo / "scripts/lifecycle.py"
+    lifecycle_script.write_text("\n".join((
+        "import os",
+        "if __name__ != '__main__': from scripts.lifecycle_core import fingerprint_source",
+        "if __name__ == '__main__': print('lifecycle receipt: ' + os.environ['CANONICAL_RECEIPT'])",
         "")), encoding="utf-8")
     bad_receipt = evidence_dir / f"{'b' * 32}.json"
     required_steps = ("preflight", "java-tests", "surefire", "python-tests", "python-compile",

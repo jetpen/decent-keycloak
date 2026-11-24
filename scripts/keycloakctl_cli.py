@@ -1113,10 +1113,31 @@ Setup, validate-config, and local run phases are implemented. `keycloakctl accep
   return parser
 
 
+def acceptance_source_provenance() -> dict:
+  """Capture Git and image-source provenance before lifecycle delegation."""
+  from scripts.lifecycle import fingerprint_source
+
+  revision = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=ROOT,
+      capture_output=True, text=True, encoding="utf-8", check=False)
+  status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all"],
+      cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False)
+  source_revision = revision.stdout.strip()
+  if (revision.returncode or status.returncode
+      or re.fullmatch(r"[0-9a-f]{40,64}", source_revision) is None):
+    raise OSError("acceptance source provenance unavailable")
+  return {"source_revision": source_revision, "worktree_clean": status.stdout == "",
+      **fingerprint_source()}
+
+
 def run_acceptance(profile: str) -> int:
   """Run the legacy canonical local lifecycle and verify its durable receipt."""
   if profile not in ("offline", "ci"):
     print("error: acceptance supports only offline and ci profiles", file=sys.stderr)
+    return 2
+  try:
+    expected_source = acceptance_source_provenance()
+  except (OSError, UnicodeError):
+    print("error: acceptance source provenance unavailable", file=sys.stderr)
     return 2
   try:
     result = subprocess.run(
@@ -1129,6 +1150,12 @@ def run_acceptance(profile: str) -> int:
   if result.returncode:
     print("error: canonical lifecycle failed", file=sys.stderr)
     return result.returncode if 0 < result.returncode < 256 else 2
+  try:
+    from scripts.lifecycle import fingerprint_source
+    expected_receipt_source = fingerprint_source(include_build_artifacts=True)
+  except (OSError, RuntimeError, ValueError):
+    print("error: acceptance receipt verification failed", file=sys.stderr)
+    return 2
   reported = [line.removeprefix("lifecycle receipt: ") for line in result.stdout.splitlines()
               if line.startswith("lifecycle receipt: ")]
   try:
@@ -1167,6 +1194,12 @@ def run_acceptance(profile: str) -> int:
         or re.fullmatch(r"[0-9a-f]{32}", receipt["run_id"]) is None
         or type(receipt.get("exit_code")) is not int or receipt["exit_code"] != 0
         or type(source) is not dict
+        or source.get("source_revision") != expected_source["source_revision"]
+        or source.get("worktree_clean") is not expected_source["worktree_clean"]
+        or source.get("image_source_sha256") != expected_source["image_source_sha256"]
+        or source.get("image_source_file_count") != expected_source["image_source_file_count"]
+        or source.get("image_artifacts_sha256") != expected_receipt_source["image_artifacts_sha256"]
+        or source.get("image_artifact_file_count") != expected_receipt_source["image_artifact_file_count"]
         or not isinstance(source.get("source_revision"), str)
         or re.fullmatch(r"[0-9a-f]{40,64}", source["source_revision"]) is None
         or not isinstance(source.get("image_source_sha256"), str)
