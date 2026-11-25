@@ -229,10 +229,13 @@ class KeycloakctlTest(unittest.TestCase):
     self.assertEqual(0, result)
     runner.assert_called_once_with()
 
-  def test_acceptance_stages_match_the_offline_contract(self):
-    self.assertEqual(("java-tests", "surefire", "provider-service-registration",
-                      "python-tests", "python-compile", "diff-check"),
-                     tuple(name for name, _ in keycloakctl_cli.acceptance_stages()))
+  def test_contributor_acceptance_instructions_match_retained_image_contract(self):
+    instructions = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    self.assertIn("cleanup is recorded as `not_run`", instructions)
+    self.assertIn("retains its built images", instructions)
+    self.assertIn("`./keycloakctl images cleanup`", instructions)
+    self.assertNotIn("confirm every stage and cleanup readback passed", instructions)
+    self.assertNotIn("then removes only exact run-owned images", instructions)
 
   def test_acceptance_diff_check_rejects_committed_pr_whitespace(self):
     base = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
@@ -341,7 +344,8 @@ class KeycloakctlTest(unittest.TestCase):
     self.assertEqual("", result.stdout)
     self.assertIn("invalid arguments", result.stderr)
 
-  def test_acceptance_offline_profile_is_accepted_by_public_cli(self):
+  def test_acceptance_offline_profile_receipt_is_the_stage_inventory(self):
+    # Assert the coordinator's real receipt, not a parallel helper's partial list.
     # Exercise argparse, the real coordinator and receipt writer; mock external stages.
     code = """import json
 from pathlib import Path

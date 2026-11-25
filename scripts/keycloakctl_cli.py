@@ -1260,21 +1260,6 @@ def verify_diff_check() -> int:
   return 0
 
 
-def acceptance_stages() -> tuple[tuple[str, list[str]], ...]:
-  """Return the offline acceptance checks owned by keycloakctl."""
-  return (
-      ("java-tests", ["mvn", "--batch-mode", "--no-transfer-progress", "package"]),
-      ("surefire", []),
-      ("provider-service-registration", []),
-      ("python-tests", []),
-      ("python-compile", [sys.executable, "-c",
-          "from pathlib import Path; import py_compile; "
-          "[py_compile.compile(str(path), doraise=True) for folder in ('scripts', 'container') "
-          "for path in Path(folder).glob('*.py')]"]),
-      ("diff-check", ["git", "diff", "--check"]),
-  )
-
-
 def write_acceptance_receipt(receipt: dict) -> Path:
   directory = ROOT / "target/keycloakctl/acceptance"
   directory.mkdir(parents=True, exist_ok=True)
