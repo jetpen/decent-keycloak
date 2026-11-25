@@ -16,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 from scripts import lifecycle
+from scripts import keycloakctl_cli
 from scripts import wallet_login_live_e2e as probe
 from scripts.lifecycle import _engine_command, image_smoke_command, normalize_image_id
 
@@ -283,8 +284,8 @@ class LifecycleCliTest(unittest.TestCase):
         for target in lifecycle.IMAGE_BUILD_ARTIFACTS_BY_TARGET:
           output = StringIO()
           with redirect_stdout(output):
-            self.assertEqual(0, lifecycle.main(["image-fingerprints", "--target", target,
-                "--field", "image_artifacts_sha256"]))
+            self.assertEqual(0, keycloakctl_cli.main([
+                "image-fingerprints", "--target", target, "--field", "image_artifacts_sha256"]))
           self.assertRegex(output.getvalue().strip(), r"^[0-9a-f]{64}$")
 
   def test_image_fingerprint_fails_closed_when_target_artifact_is_missing(self):
@@ -869,6 +870,11 @@ class LifecycleCliTest(unittest.TestCase):
           result = lifecycle.diff_check()
 
     self.assertNotEqual(0, result)
+
+  def test_lifecycle_cli_no_longer_exposes_migrated_image_fingerprint_command(self):
+    result = self.run_cli("--help")
+    self.assertEqual(0, result.returncode, result.stderr)
+    self.assertNotIn("image-fingerprints", result.stdout)
 
   def test_lists_named_profiles_and_distinguishes_live_qualification(self):
     result = self.run_cli("profiles", "--json")

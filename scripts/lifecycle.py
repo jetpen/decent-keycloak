@@ -1844,11 +1844,6 @@ def main(argv: list[str] | None = None) -> int:
   subparsers.add_parser("verify-surefire", help="require nonempty passing Surefire reports")
   subparsers.add_parser("verify-provider", help="verify production provider SPI registration")
   subparsers.add_parser("diff-check", help="validate committed-base, staged, unstaged and untracked whitespace")
-  image_fingerprints_parser = subparsers.add_parser("image-fingerprints",
-      help="print source/artifact fingerprints for a Dockerfile image target")
-  image_fingerprints_parser.add_argument("--target", choices=sorted(IMAGE_BUILD_ARTIFACTS_BY_TARGET), required=True)
-  image_fingerprints_parser.add_argument("--field",
-      choices=("image_source_sha256", "image_artifacts_sha256"), required=True)
   run_parser = subparsers.add_parser("run", help="run a named lifecycle profile")
   run_parser.add_argument("profile", choices=sorted(PROFILES))
   run_parser.add_argument("--plan", action="store_true", help="print the plan without running it")
@@ -1881,14 +1876,6 @@ def main(argv: list[str] | None = None) -> int:
     return verify_provider()
   if args.action == "diff-check":
     return diff_check()
-  if args.action == "image-fingerprints":
-    try:
-      fingerprints = fingerprint_source(include_build_artifacts=True, image_target=args.target)
-    except (OSError, RuntimeError, ValueError) as error:
-      print(f"image fingerprint failed: {type(error).__name__}: {error}", file=sys.stderr)
-      return 2
-    print(fingerprints[args.field])
-    return 0
   if args.action == "promote":
     return run_promotion(args.receipt, args.destination, allow_publish=args.allow_publish)
   if args.profile in {"wallet-login-qualification", "remote-test-host"} and not args.allow_live:

@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from scripts import image_lifecycle
+from scripts import keycloakctl_cli
 from scripts import lifecycle
 
 TEST_REPOSITORY_LABELS = {**image_lifecycle.REPOSITORY_LABELS,
@@ -123,20 +124,22 @@ class ImageLifecycleTest(unittest.TestCase):
         image_lifecycle.remove_image("podman", image_id, now=now)
     run.assert_not_called()
 
-  def test_cli_defaults_to_three_days_and_allows_explicit_environment_configuration(self):
-    with mock.patch.object(image_lifecycle, "cleanup_images", return_value={
-        "removed_ids": [], "kept_recent": 0, "kept_pinned": 0,
-        "kept_extended": 0, "kept_active": 0}) as cleanup, \
+  def test_public_cli_defaults_to_three_days_and_allows_explicit_environment_configuration(self):
+    with mock.patch.object(image_lifecycle, "selected_engine", return_value="podman"), \
+        mock.patch.object(image_lifecycle, "cleanup_images", return_value={
+            "removed_ids": [], "kept_recent": 0, "kept_pinned": 0,
+            "kept_extended": 0, "kept_active": 0}) as cleanup, \
         mock.patch.dict(image_lifecycle.os.environ, {}, clear=True), \
         contextlib.redirect_stdout(io.StringIO()):
-      self.assertEqual(0, image_lifecycle.main(["--engine", "podman", "cleanup"]))
+      self.assertEqual(0, keycloakctl_cli.main(["images", "--engine", "podman", "cleanup"]))
     self.assertEqual(3, cleanup.call_args.kwargs["max_age_days"])
-    with mock.patch.object(image_lifecycle, "cleanup_images", return_value={
-        "removed_ids": [], "kept_recent": 0, "kept_pinned": 0,
-        "kept_extended": 0, "kept_active": 0}) as cleanup, \
+    with mock.patch.object(image_lifecycle, "selected_engine", return_value="podman"), \
+        mock.patch.object(image_lifecycle, "cleanup_images", return_value={
+            "removed_ids": [], "kept_recent": 0, "kept_pinned": 0,
+            "kept_extended": 0, "kept_active": 0}) as cleanup, \
         mock.patch.dict(image_lifecycle.os.environ, {"DECENT_IMAGE_RETENTION_DAYS": "7"}), \
         contextlib.redirect_stdout(io.StringIO()):
-      self.assertEqual(0, image_lifecycle.main(["--engine", "podman", "cleanup"]))
+      self.assertEqual(0, keycloakctl_cli.main(["images", "--engine", "podman", "cleanup"]))
     self.assertEqual(7, cleanup.call_args.kwargs["max_age_days"])
 
   def test_component_role_provenance_and_publication_boundary_are_documented_and_enforced(self):
