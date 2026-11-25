@@ -1371,13 +1371,16 @@ def acceptance_run_stages(profile: str, receipt: dict) -> int:
     if not stage("diff-check", lambda: require_zero(verify_diff_check())): return 2
   finally:
     try:
-      if build_started and baseline_captured:
+      cleanup_attempted = build_started and baseline_captured
+      if cleanup_attempted:
         bundle = read_build_bundle(state)
         owned = {record["image_id"] for record in bundle["records"].values()} if bundle else set()
         result = _cleanup_owned_images(engine, baseline, state["run_id"], known_owned_ids=owned)
         if result.get("status") != "pass" or result.get("inconclusive_image_count"):
           raise RuntimeError("cleanup readback failed")
-      record("cleanup", "pass")
+        record("cleanup", "pass")
+      else:
+        record("cleanup", "not_run")
     except Exception:
       record("cleanup", "fail")
       failed = True
