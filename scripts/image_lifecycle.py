@@ -28,6 +28,7 @@ IMAGE_ROLES = {
     "wallet-provider-issue7-store-recovery-test",
     "wallet-provider-issue6-postconsume-test",
     "wallet-provider-issue6-callback-gate-test",
+    "rp-fixture",
 }
 
 

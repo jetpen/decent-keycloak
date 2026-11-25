@@ -14,7 +14,7 @@ its own location, including when invoked outside the checkout. Explicit `--confi
 paths are relative to the caller. [`scripts/lifecycle.py`](../../scripts/lifecycle.py)
 remains for stages not yet migrated. `keycloakctl` provides local setup/build/test and `acceptance` owns the ordered Maven package, Surefire validation, provider-service-registration, Python-test, Python-compile, and diff-check stages used locally and by PR CI. The Surefire report validator is keycloakctl-owned. Acceptance writes a keycloakctl-owned durable receipt; this is partial phase-ownership parity.
 
-The `acceptance --profile offline|ci` command is the shared local/CI entry point. It records Maven `package`, Surefire validation, provider-service-registration, Python tests, Python compilation, and diff-check outcomes in its durable receipt without invoking `scripts/lifecycle.py` as a CLI command. The Surefire validator is keycloakctl-owned. Local preflight, dedicated resolver materialization receipts, image build/smoke, and teardown remain open and are not run by this command. The PR workflow invokes `./keycloakctl acceptance --profile ci`; this deliberately narrows the previous `scripts/lifecycle.py run ci` caller and defers its legacy image build/smoke and cleanup gates. A green PR job is not equivalent to the former full offline CI profile or full Issue #74 acceptance.
+The `acceptance --profile offline` command is the shared local/CI entry point. It performs local preflight, Maven/Surefire and canonical Python checks, provider registration, both local image builds and smokes, diff-check, and sanitized source-bound receipt writing. It retains the built local images and records cleanup as `not_run`; image retention cleanup is a separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke only imports the fixture module; it is not an RP server or browser flow. The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. Resolver provenance receipts and live/remote phases remain open; this does not complete Issue #74.
 
 ## Local commands
 
@@ -143,7 +143,7 @@ receipt records the ordered steps and binds completion to the test inputs, build
 receipt, config, and provider image. Each failed stage stops later work and writes
 a durable `failure-*.json` step receipt; a failed attempt does not create
 `test.json`. Resume validates the existing source-bound success receipt rather
-than rerunning those checks. The PR workflow invokes `./keycloakctl acceptance --profile ci`; the command owns the five documented local stages. Stage-by-stage ownership for the remaining lifecycle gates and complete CI receipt parity remain open.
+The PR workflow invokes `./keycloakctl acceptance --profile offline`; this invokes the same bounded local acceptance stages documented above.
 Other existing lifecycle capabilities remain unmigrated, so
 `scripts/lifecycle.py` stays until their replacement and caller parity are
 verified.

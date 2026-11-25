@@ -12,13 +12,13 @@ The provider supports explicit `login` and, when enabled by the realm, `signup` 
 
 ## Build and verify locally
 
-The `keycloakctl` acceptance entry point is used locally and by pull-request CI. Start with a narrow test while developing, then run the offline profile before treating an artifact as an install candidate:
+The `keycloakctl` acceptance entry point is used locally and by pull-request CI. Start with a narrow test while developing, then run the shared offline profile before treating an artifact as an install candidate:
 
 ```bash
 ./keycloakctl acceptance --profile offline
 ```
 
-The current command runs Maven `package` without `clean`, verifies nonempty passing Surefire reports, checks provider service registration, runs the canonical Python acceptance suite, compiles Python sources, and checks whitespace. Its durable receipt records the ordered stage outcomes under `target/keycloakctl/acceptance/`. This remains partial: local preflight, dedicated resolver-input receipts, image build/smoke, full teardown, and live qualification are not part of this command. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
+The command runs local preflight, Maven/Surefire and canonical Python suites, compiles Python sources, builds both provider and test-only RP fixture images, runs their offline smokes, checks whitespace, and writes a sanitized source-bound receipt. Offline acceptance retains its built images and records cleanup as `not_run`; remove eligible repository images only through the separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke imports its module; it is not an RP server or browser flow. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
 
 The full offline lifecycle plan is still exposed by the compatibility runner and has not been fully migrated:
 
@@ -26,7 +26,7 @@ The full offline lifecycle plan is still exposed by the compatibility runner and
 python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-The PR workflow invokes `./keycloakctl acceptance --profile ci`, using the same caller as the local `offline` entry point. This deliberately narrows the prior `scripts/lifecycle.py run ci` workflow: PR CI no longer runs its legacy image build/smoke or lifecycle cleanup gates. Those gates remain open for separate migration, so a green job is not full offline lifecycle parity. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
+The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. This restores bounded local/CI image-build and smoke gates while retaining the resulting local images; cleanup is a separate explicit action. Remote transfer, readiness deployment, qualification, and Registry promotion remain outside this profile. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
 
 ```bash
 python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live

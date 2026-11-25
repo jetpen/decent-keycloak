@@ -9,4 +9,7 @@ RUN --network=none mkdir -p /tmp/rp-fixture-wheelhouse \
        --find-links=/tmp/rp-fixture-wheelhouse --require-hashes -r /tmp/rp-fixture.lock \
     && rm -rf /tmp/resolver-wheelhouse.tar.gz /tmp/rp-fixture-wheelhouse /tmp/rp-fixture.lock
 COPY scripts/oidc_rp_fixture.py /opt/rp-fixture/oidc_rp_fixture.py
-LABEL io.decent-keycloak.test-only="true"
+LABEL io.decent.image.repository="https://github.com/jetpen/decent-keycloak" \
+      io.decent.image.component="decent-keycloak" \
+      io.decent.image.role="rp-fixture" \
+      io.decent-keycloak.test-only="true"

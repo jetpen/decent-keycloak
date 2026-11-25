@@ -142,6 +142,17 @@ class ImageLifecycleTest(unittest.TestCase):
       self.assertEqual(0, keycloakctl_cli.main(["images", "--engine", "podman", "cleanup"]))
     self.assertEqual(7, cleanup.call_args.kwargs["max_age_days"])
 
+  def test_rp_fixture_image_is_an_explicit_retention_cleanup_candidate(self):
+    dockerfile = (Path(__file__).parents[1] / "container/rp-fixture/Dockerfile").read_text()
+    role = "rp-fixture"
+    self.assertIn(role, image_lifecycle.IMAGE_ROLES)
+    for key, value in image_lifecycle.REPOSITORY_LABELS.items():
+      self.assertIn(f'{key}="{value}"', dockerfile)
+    self.assertIn(f'io.decent.image.role="{role}"', dockerfile)
+    metadata = {"Config": {"Labels": {**image_lifecycle.REPOSITORY_LABELS,
+                                       "io.decent.image.role": role}}}
+    self.assertTrue(image_lifecycle._is_repository_image(metadata))
+
   def test_component_role_provenance_and_publication_boundary_are_documented_and_enforced(self):
     dockerfile = (Path(__file__).parents[1] / "container/Dockerfile").read_text()
     stages = [line for line in dockerfile.splitlines() if line.startswith("FROM ")]
