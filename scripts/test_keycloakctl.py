@@ -250,6 +250,7 @@ class KeycloakctlTest(unittest.TestCase):
     (self.repo / "untracked_with_trailing_whitespace.txt").write_text(
         "candidate has trailing whitespace \n", encoding="utf-8")
     with (patch.object(keycloakctl_cli, "ROOT", self.repo),
+          patch.dict(os.environ, {"PR_BASE_SHA": ""}),
           redirect_stdout(io.StringIO()) as output,
           redirect_stderr(io.StringIO()) as errors):
       self.assertNotEqual(0, keycloakctl_cli.verify_diff_check())
