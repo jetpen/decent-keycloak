@@ -72,7 +72,7 @@ class KeycloakctlTest(unittest.TestCase):
     for report in (root / "target/surefire-reports").glob("TEST-*.xml"):
       os.utime(report, None)
 
-  def test_acceptance_orchestration_does_not_delegate_to_lifecycle_run(self):
+  def test_acceptance_entrypoint_records_preflight_failure_without_legacy_lifecycle_dispatch(self):
     marker = self.cwd / "lifecycle-run-invoked"
     lifecycle_script = self.repo / "scripts/lifecycle.py"
     lifecycle_script.write_text("\n".join((
@@ -82,6 +82,8 @@ class KeycloakctlTest(unittest.TestCase):
         "def run_python_tests(): return 0",
         "def verify_surefire(): return 0",
         "def verify_provider(): return 0",
+        "def _image_inventory(engine): return set()",
+        "def _cleanup_owned_images(engine, baseline_ids, run_id, **kwargs): return {'status': 'pass', 'inconclusive_image_count': 0}",
         "if __name__ == '__main__':",
         f"  Path({str(marker)!r}).write_text(' '.join(__import__('sys').argv[1:]))",
         "  raise SystemExit(0)",
@@ -89,10 +91,73 @@ class KeycloakctlTest(unittest.TestCase):
     self.install_fixture_test()
     self.write_java_acceptance_artifacts(self.repo)
 
-    result = self.cli("acceptance", "--profile", "ci")
+    result = self.cli("acceptance", "--profile", "offline")
 
-    self.assertEqual(0, result.returncode, result.stderr)
+    self.assertEqual(2, result.returncode)
+    self.assertIn("acceptance stage failed; receipt:", result.stderr)
     self.assertFalse(marker.exists(), "keycloakctl acceptance must own stages instead of delegating lifecycle profile run")
+    receipt_path = Path(result.stderr.strip().split("receipt: ", 1)[1])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    self.assertEqual("offline", receipt["profile"])
+    self.assertEqual("failed", receipt["status"])
+    self.assertEqual([("preflight", "fail"), ("cleanup", "pass")],
+                     [(stage["name"], stage["status"]) for stage in receipt["stages"]])
+
+  def test_acceptance_offline_profile_runs_preflight_build_test_and_owned_cleanup(self):
+    root = self.cwd / "acceptance-profile-root"
+    root.mkdir()
+    original_root = keycloakctl_cli.ROOT
+    events = []
+    def fake_stages(profile, receipt):
+      events.append(("run", profile))
+      receipt["stages"] = [{"name": name, "status": "pass"} for name in (
+          "preflight", "java-tests", "surefire", "provider-service-registration",
+          "python-tests", "python-compile", "provider-image-build",
+          "rp-fixture-image-build", "image-smoke", "rp-fixture-smoke", "diff-check", "cleanup")]
+      return 0
+    try:
+      with patch.object(keycloakctl_cli, "ROOT", root), \
+           patch.object(keycloakctl_cli, "acceptance_source_provenance", return_value={"tree_sha256": "a" * 64}), \
+           patch.object(keycloakctl_cli, "acceptance_run_stages", side_effect=fake_stages):
+        result = keycloakctl_cli.run_acceptance("offline")
+      self.assertEqual(0, result)
+      receipt_path = next((root / "target/keycloakctl/acceptance").glob("*.json"))
+      receipt = json.loads(receipt_path.read_text())
+      self.assertEqual("complete", receipt["status"])
+      self.assertEqual(["preflight", "java-tests", "surefire", "provider-service-registration",
+                        "python-tests", "python-compile", "provider-image-build",
+                        "rp-fixture-image-build", "image-smoke", "rp-fixture-smoke",
+                        "diff-check", "cleanup"], [stage["name"] for stage in receipt["stages"]])
+      self.assertTrue(all(stage["status"] == "pass" for stage in receipt["stages"]))
+      self.assertEqual([("run", "offline")], events)
+    finally:
+      keycloakctl_cli.ROOT = original_root
+
+  def test_acceptance_stage_and_cleanup_failures_are_durable_and_fail_closed(self):
+    root = self.cwd / "acceptance-failure-root"
+    root.mkdir()
+    original_root = keycloakctl_cli.ROOT
+    receipt = {"run_id": "a" * 32, "stages": []}
+    try:
+      with patch.object(keycloakctl_cli, "ROOT", root), \
+           patch.object(keycloakctl_cli, "create_run", return_value={"run_id": "a" * 32, "config_sha256": "b" * 64}), \
+           patch.object(keycloakctl_cli, "perform_local_preflight"), \
+           patch.object(keycloakctl_cli, "surefire_report_snapshot", return_value={}), \
+           patch.object(keycloakctl_cli, "run_acceptance_command", return_value=0), \
+           patch.object(keycloakctl_cli, "verify_surefire_reports", return_value=0), \
+           patch.object(keycloakctl_cli, "verify_provider_registration", return_value=0), \
+           patch.object(keycloakctl_cli, "perform_build"), \
+           patch.object(keycloakctl_cli, "perform_test", side_effect=RuntimeError("stage failure")), \
+           patch.object(keycloakctl_cli, "read_build_bundle", return_value=None), \
+           patch.object(lifecycle, "_image_inventory", return_value={"base-id"}), \
+           patch.object(lifecycle, "_cleanup_owned_images", return_value={"status": "fail", "inconclusive_image_count": 1}) as cleanup:
+        result = keycloakctl_cli.acceptance_run_stages("offline", receipt)
+      self.assertEqual(2, result)
+      self.assertEqual("fail", receipt["stages"][-2]["status"])
+      self.assertEqual({"name": "cleanup", "status": "fail"}, receipt["stages"][-1])
+      cleanup.assert_called_once()
+    finally:
+      keycloakctl_cli.ROOT = original_root
 
   def test_local_receipt_records_commit_and_dirty_worktree_provenance(self):
     with tempfile.TemporaryDirectory() as temporary:
@@ -228,7 +293,7 @@ class KeycloakctlTest(unittest.TestCase):
     subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "candidate whitespace"], check=True)
     self.env["PR_BASE_SHA"] = base
 
-    result = self.cli("acceptance", "--profile", "ci")
+    result = self.cli("acceptance", "--profile", "offline")
 
     self.assertEqual(2, result.returncode)
     receipt_path = Path(result.stderr.strip().split("receipt: ", 1)[1])
@@ -244,7 +309,7 @@ class KeycloakctlTest(unittest.TestCase):
     (self.repo / "untracked_with_trailing_whitespace.txt").write_text(
         "candidate has trailing whitespace \n", encoding="utf-8")
 
-    result = self.cli("acceptance", "--profile", "ci")
+    result = self.cli("acceptance", "--profile", "offline")
 
     self.assertEqual(2, result.returncode)
     self.assertIn("untracked_with_trailing_whitespace.txt:1: trailing whitespace", result.stdout)
@@ -261,7 +326,7 @@ class KeycloakctlTest(unittest.TestCase):
     fake_maven.write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
     fake_maven.chmod(0o755)
 
-    result = self.cli("acceptance", "--profile", "ci")
+    result = self.cli("acceptance", "--profile", "offline")
 
     self.assertEqual(2, result.returncode)
     receipt_path = Path(result.stderr.strip().split("receipt: ", 1)[1])
@@ -386,7 +451,7 @@ class KeycloakctlTest(unittest.TestCase):
     self.install_import_safe_fake_lifecycle(test_count=0)
     self.install_fixture_test()
     self.write_java_acceptance_artifacts(self.repo)
-    result = self.cli("acceptance", "--profile", "ci")
+    result = self.cli("acceptance", "--profile", "offline")
 
     self.assertEqual(2, result.returncode)
     self.assertIn("acceptance stage failed; receipt: ", result.stderr)
@@ -419,7 +484,7 @@ class KeycloakctlTest(unittest.TestCase):
     self.install_fixture_test()
     self.write_java_acceptance_artifacts(self.repo)
     (self.repo / "scripts/broken_acceptance_fixture.py").write_text("def broken(:\n")
-    result = self.cli("acceptance", "--profile", "ci")
+    result = self.cli("acceptance", "--profile", "offline")
     self.assertEqual(2, result.returncode)
     self.assertEqual("Surefire totals: tests=1, failures=0, errors=0, skipped=0\nprovider service registration verified\n", result.stdout)
     receipt_path = Path(result.stderr.strip().split("receipt: ", 1)[1])
@@ -490,7 +555,7 @@ class KeycloakctlTest(unittest.TestCase):
     self.assertIn("`keycloakctl test`", migration_map)
     self.assertIn("`./keycloakctl image-fingerprints --target ... --field ...`", migration_map)
     self.assertIn("`./keycloakctl images cleanup|pin|unpin|extend`", migration_map)
-    self.assertIn("not included in `acceptance` or PR CI", migration_map)
+    self.assertIn("same `keycloakctl acceptance --profile offline` profile", migration_map)
     self.assertNotIn("no keycloakctl-owned build receipt", migration_map)
     for relative in (
         "README.md",

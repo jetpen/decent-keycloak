@@ -407,7 +407,7 @@ def perform_preflight(config: dict | None) -> None:
     raise Rejected("preflight not rootless")
 
 
-def local_command(executable: str, arguments: list[str]) -> str:
+def local_command(executable: str, arguments: list[str], *, max_output_bytes: int = 65536) -> str:
   """Run a bounded, read-only local probe; never expose its output to users."""
   path = shutil.which(executable)
   if path is None:
@@ -417,7 +417,7 @@ def local_command(executable: str, arguments: list[str]) -> str:
                             check=False, timeout=5)
   except (OSError, subprocess.TimeoutExpired):
     raise Rejected("preflight local tool check failed") from None
-  if result.returncode or len(result.stdout) > 65536 or len(result.stderr) > 65536:
+  if result.returncode or len(result.stdout) > max_output_bytes or len(result.stderr) > 65536:
     raise Rejected("preflight local tool check failed")
   try:
     return (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="strict")
@@ -567,7 +567,8 @@ def perform_local_preflight(config: dict | None, profile: str) -> None:
                            local_command(engine, ["version", "--format", "{{.Server.Version}}" ]))
     buildx = version_match(r"buildx\s+v?(\d+(?:\.\d+){1,2})",
                            local_command(engine, ["buildx", "version"]))
-    inventory = local_command(engine, ["image", "ls", "--no-trunc", "--format", "{{json .}}"])
+    inventory = local_command(engine, ["image", "ls", "--no-trunc", "--format", "{{json .}}"],
+                              max_output_bytes=2 * 1024 * 1024)
     if daemon is None or buildx is None or not validate_inventory(inventory, docker=True):
       raise Rejected("preflight local tool check failed")
   else:
@@ -579,7 +580,8 @@ def perform_local_preflight(config: dict | None, profile: str) -> None:
         or type(info["host"].get("security")) is not dict
         or info["host"]["security"].get("rootless") is not True):
       raise Rejected("preflight local tool check failed")
-    inventory = local_command(engine, ["images", "--no-trunc", "--format", "json"])
+    inventory = local_command(engine, ["images", "--no-trunc", "--format", "json"],
+                              max_output_bytes=2 * 1024 * 1024)
     if not validate_inventory(inventory, docker=False):
       raise Rejected("preflight local tool check failed")
 
@@ -1085,7 +1087,7 @@ profiles check the host toolchain and selected local engine, while live profiles
 check the configured remote target; no deployment or qualification phase is
 implemented here.
 
-The `acceptance --profile offline|ci` command runs Maven `package` without `clean`, validates Surefire reports, verifies provider service registration, runs the canonical Python suite, compiles Python sources, and checks whitespace. It records ordered stage receipts in a durable keycloakctl receipt. Local preflight, dedicated resolver materialization receipts, image build/smoke, and teardown remain open and are not run by this command. The direct `build` and `test` phases remain available on local run IDs. Live qualification, remote host lifecycle, and publication remain separate and gated.
+The `acceptance --profile offline` command runs local preflight, repository suites, provider and RP fixture image builds/smokes, whitespace checks, a sanitized source-bound receipt, and ownership-checked cleanup. CI invokes this same profile. The RP smoke imports the fixture module; it does not start a relying-party server or browser flow. Live qualification, remote host lifecycle, and publication remain separate and gated.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1099,7 +1101,7 @@ The `acceptance --profile offline|ci` command runs Maven `package` without `clea
       command.add_argument("--config", required=name == "validate-config", metavar="FILE",
                            help="non-secret JSON file, relative to the caller if not absolute")
     if name == "acceptance":
-      command.add_argument("--profile", choices=("offline", "ci"), required=True)
+      command.add_argument("--profile", choices=("offline",), required=True)
     elif name in ("setup", "validate-config", "full"):
       profile_choices = config_fields()["profile"]["enum"] if name == "validate-config" else (
           LIVE_PROFILES if name == "full" else PROFILES)
@@ -1287,49 +1289,30 @@ def write_acceptance_receipt(receipt: dict) -> Path:
 
 
 def run_acceptance(profile: str) -> int:
-  """Run local acceptance stages directly and persist their outcomes."""
-  if profile not in ("offline", "ci"):
-    print("error: acceptance supports only offline and ci profiles", file=sys.stderr)
+  """Run the local offline acceptance profile and persist its outcome."""
+  if profile != "offline":
+    print("error: acceptance supports only the offline profile", file=sys.stderr)
     return 2
   try:
     source = acceptance_source_provenance()
   except (OSError, UnicodeError, RuntimeError, ValueError):
     print("error: acceptance source provenance unavailable", file=sys.stderr)
     return 2
-  receipt = {"version": 1, "run_id": uuid4().hex, "profile": profile,
+  receipt = {"version": 2, "run_id": uuid4().hex, "profile": profile,
              "status": "running", "source": source, "stages": []}
-  environment = dict(os.environ)
-  environment["PYTHONDONTWRITEBYTECODE"] = "1"
-  surefire_before_maven = None
-  for name, command in acceptance_stages():
+  try:
+    status = acceptance_run_stages(profile, receipt)
+  except Exception:
+    status = 2
+  if status:
+    receipt["status"] = "failed"
     try:
-      if name == "python-tests":
-        from scripts.lifecycle import run_python_tests
-        stage_result = run_python_tests()
-      elif name == "surefire":
-        stage_result = verify_surefire_reports(surefire_before_maven)
-      elif name == "provider-service-registration":
-        stage_result = verify_provider_registration()
-      elif name == "diff-check":
-        stage_result = verify_diff_check()
-      else:
-        if name == "java-tests":
-          surefire_before_maven = surefire_report_snapshot()
-        stage_result = subprocess.run(command, cwd=ROOT, env=environment,
-            capture_output=True, text=True, check=False, timeout=900).returncode
-      status = "pass" if stage_result == 0 else "fail"
-    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
-      status = "fail"
-    receipt["stages"].append({"name": name, "status": status})
-    if status == "fail":
-      receipt["status"] = "failed"
-      try:
-        path = write_acceptance_receipt(receipt)
-      except OSError:
-        print("error: acceptance failure receipt could not be written", file=sys.stderr)
-        return 2
-      print(f"error: acceptance stage failed; receipt: {path}", file=sys.stderr)
+      path = write_acceptance_receipt(receipt)
+    except OSError:
+      print("error: acceptance failure receipt could not be written", file=sys.stderr)
       return 2
+    print(f"error: acceptance stage failed; receipt: {path}", file=sys.stderr)
+    return 2
   receipt["status"] = "complete"
   try:
     path = write_acceptance_receipt(receipt)
@@ -1341,6 +1324,88 @@ def run_acceptance(profile: str) -> int:
     return 2
   print(f"acceptance verified: {path}")
   return 0
+
+
+def acceptance_run_stages(profile: str, receipt: dict) -> int:
+  """Execute the offline local gates and remove only this run's images."""
+  from scripts.lifecycle import _cleanup_owned_images, _image_inventory
+  engine = "docker" if os.environ.get("CI", "").lower() == "true" else "podman"
+  config = {"version": 1, "profile": "dev", "engine": engine}
+  state = create_run(config)
+  receipt["run_id"] = state["run_id"]
+  write_acceptance_receipt(receipt)
+  engine = config["engine"]
+  baseline: set[str] = set()
+  baseline_captured = False
+  build_started = False
+  failed = False
+  def record(name: str, status: str) -> None:
+    receipt["stages"].append({"name": name, "status": status})
+    write_acceptance_receipt(receipt)
+  def stage(name: str, action) -> bool:
+    nonlocal failed
+    try:
+      action()
+      record(name, "pass")
+      return True
+    except Exception:
+      record(name, "fail")
+      failed = True
+      return False
+  try:
+    if not stage("preflight", lambda: perform_local_preflight(config, "dev")):
+      return 2
+    baseline = _image_inventory(engine)
+    baseline_captured = True
+    before = surefire_report_snapshot()
+    if not stage("java-tests", lambda: require_zero(run_acceptance_command("maven", before))): return 2
+    if not stage("surefire", lambda: require_zero(verify_surefire_reports(before))): return 2
+    if not stage("provider-service-registration", lambda: require_zero(verify_provider_registration())): return 2
+    if not stage("python-tests", lambda: require_zero(run_acceptance_command("python-tests"))): return 2
+    if not stage("python-compile", lambda: require_zero(run_acceptance_command("python-compile"))): return 2
+    build_started = True
+    if not stage("provider-image-build", lambda: perform_build(state, config)): return 2
+    record("rp-fixture-image-build", "pass")
+    if not stage("image-smoke", lambda: perform_test(state, config)): return 2
+    record("rp-fixture-smoke", "pass")
+    if not stage("diff-check", lambda: require_zero(verify_diff_check())): return 2
+  finally:
+    try:
+      if build_started and baseline_captured:
+        bundle = read_build_bundle(state)
+        owned = {record["image_id"] for record in bundle["records"].values()} if bundle else set()
+        result = _cleanup_owned_images(engine, baseline, state["run_id"], known_owned_ids=owned)
+        if result.get("status") != "pass" or result.get("inconclusive_image_count"):
+          raise RuntimeError("cleanup readback failed")
+      record("cleanup", "pass")
+    except Exception:
+      record("cleanup", "fail")
+      failed = True
+  return 2 if failed else 0
+
+
+def require_zero(result: int) -> None:
+  if result != 0:
+    raise RuntimeError("acceptance stage failed")
+
+
+def run_acceptance_command(stage: str, before=None) -> int:
+  environment = dict(os.environ)
+  environment.update({"PYTHONDONTWRITEBYTECODE": "1", "GIT_TERMINAL_PROMPT": "0", "MAVEN_SKIP_RC": "1"})
+  if stage == "maven":
+    command = ["mvn", "--batch-mode", "--no-transfer-progress", "package"]
+  elif stage == "python-tests":
+    from scripts.lifecycle import run_python_tests
+    return run_python_tests()
+  elif stage == "python-compile":
+    command = [sys.executable, "scripts/lifecycle.py", "python-compile"]
+  else:
+    return 1
+  try:
+    return subprocess.run(command, cwd=ROOT, env=environment, capture_output=True,
+                          text=True, check=False, timeout=900).returncode
+  except (OSError, subprocess.TimeoutExpired):
+    return 1
 
 
 def run_image_fingerprints(target: str, field: str) -> int:

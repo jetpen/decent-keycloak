@@ -40,4 +40,4 @@ jobs:
       - name: Run keycloakctl acceptance stages
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: ./keycloakctl acceptance --profile ci
+        run: ./keycloakctl acceptance --profile offline
