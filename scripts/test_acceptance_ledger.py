@@ -33,7 +33,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("decent-wallet-login-v1", readme)
     self.assertIn("decent-ecosystem", readme)
     self.assertIn("not production-ready", readme)
-    self.assertIn("python3.11 scripts/lifecycle.py run offline", readme)
+    self.assertIn("./keycloakctl acceptance --profile offline", readme)
     self.assertIn("Build and retain a local image", readme)
     self.assertIn("decent.wallet.registry.bootstrap", readme)
     self.assertIn("## Configure a disposable realm", readme)
@@ -51,7 +51,7 @@ class AcceptanceLedgerTest(unittest.TestCase):
     self.assertIn("Podman", contributing)
     self.assertIn("Docker Engine + Buildx", contributing)
     self.assertIn("OpenSSL", contributing)
-    self.assertIn("python3.11 scripts/lifecycle.py run offline", contributing)
+    self.assertIn("./keycloakctl acceptance --profile offline", contributing)
     self.assertIn("before publishing the PR", contributing)
     self.assertIn("HTTP 503/unavailable is not a clean Identity miss", contributing)
 

@@ -37,11 +37,7 @@ jobs:
       - name: Install pinned OIDC validation dependency
         run: python -m pip install --require-hashes -r requirements/issue8-oidc.lock
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Run the canonical offline lifecycle
+      - name: Run keycloakctl acceptance stages
         env:
-          CONTAINER_ENGINE: docker
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python scripts/lifecycle.py run ci
+        run: ./keycloakctl acceptance --profile ci

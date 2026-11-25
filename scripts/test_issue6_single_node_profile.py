@@ -782,7 +782,7 @@ class Issue6SingleNodeProfileTest(unittest.TestCase):
     lifecycle = (root / 'scripts/lifecycle.py').read_text()
     readme = (root / 'README.md').read_text()
     self.assertIn('scripts.test_issue6_single_node_profile', lifecycle)
-    self.assertIn('python3.11 scripts/lifecycle.py run offline', readme)
+    self.assertIn('./keycloakctl acceptance --profile offline', readme)
 
 
 if __name__ == '__main__':

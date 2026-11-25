@@ -14,6 +14,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from uuid import uuid4
 
 
@@ -1076,13 +1078,13 @@ profiles check the host toolchain and selected local engine, while live profiles
 check the configured remote target; no deployment or qualification phase is
 implemented here.
 
-Setup, validate-config, and local run phases are implemented. `keycloakctl acceptance --profile offline|ci` is a bounded verifier/delegator: it invokes the unchanged `scripts/lifecycle.py run <profile>` entry point and checks the lifecycle-produced receipt's source provenance, every local step, and cleanup/teardown before reporting verification. The canonical GitHub Actions command remains `python scripts/lifecycle.py run ci`; this wrapper does not migrate CI or claim complete former-lifecycle parity. Build packages the provider with Maven on the host (dependency resolution may use the network), then fetches locked resolver inputs and invokes the container engine with image-build networking disabled. Test runs the offline Java package suite, verifies non-empty passing Surefire reports, the canonical Python suite, and no-network provider and RP-fixture image smokes. Other eligible unavailable phases exit 3; refusals exit 2.
+The `acceptance --profile offline|ci` command runs Maven `package` without `clean`, validates Surefire reports, verifies provider service registration, runs the canonical Python suite, compiles Python sources, and checks whitespace. It records ordered stage receipts in a durable keycloakctl receipt. Local preflight, dedicated resolver materialization receipts, image build/smoke, and teardown remain open and are not run by this command. The direct `build` and `test` phases remain available on local run IDs. Live qualification, remote host lifecycle, and publication remain separate and gated.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
-                  "acceptance": "run and verify the canonical local lifecycle",
+                  "acceptance": "run local acceptance stages and write a durable receipt",
                   **PHASE_HELP, "full": "create or resume one readiness or qualification run"}
   for name, description in descriptions.items():
     command = commands.add_parser(name, help=description, description=description, allow_abbrev=False)
@@ -1119,117 +1121,191 @@ def acceptance_source_provenance() -> dict:
   return {**local_source_provenance(ROOT), **fingerprint_source()}
 
 
+def surefire_report_snapshot() -> dict[Path, tuple[int, int, int]]:
+  reports = sorted((ROOT / "target/surefire-reports").glob("TEST-*.xml"))
+  return {report: (report.stat().st_mtime_ns, report.stat().st_ctime_ns, report.stat().st_size)
+          for report in reports}
+
+
+def verify_surefire_reports(before_maven: dict[Path, tuple[int, int, int]] | None = None) -> int:
+  reports = sorted((ROOT / "target/surefire-reports").glob("TEST-*.xml"))
+  if not reports:
+    print("Surefire produced no XML reports", file=sys.stderr)
+    return 2
+  if before_maven is not None:
+    after_maven = surefire_report_snapshot()
+    stale = [report for report in reports
+             if before_maven.get(report) == after_maven.get(report)]
+    if stale:
+      print("Surefire reports were not refreshed by this Maven invocation", file=sys.stderr)
+      return 2
+  suites = []
+  try:
+    for report in reports:
+      root = ET.parse(report).getroot()
+      suites.extend([root] if root.tag == "testsuite" else root.findall(".//testsuite"))
+    if not suites:
+      print("Surefire reports contain no testsuite records", file=sys.stderr)
+      return 2
+    totals = {key: sum(int(suite.attrib.get(key, "0")) for suite in suites)
+              for key in ("tests", "failures", "errors", "skipped")}
+  except (ET.ParseError, OSError, ValueError) as error:
+    print(f"invalid Surefire report: {type(error).__name__}", file=sys.stderr)
+    return 2
+  print("Surefire totals: " + ", ".join(f"{key}={value}" for key, value in totals.items()))
+  return 0 if totals["tests"] > 0 and all(totals[key] == 0 for key in ("failures", "errors", "skipped")) else 1
+
+
+def verify_provider_registration() -> int:
+  jar = ROOT / "target/decent-keycloak-wallet-authenticator-spike-0.1.0-SNAPSHOT.jar"
+  if not jar.is_file():
+    print("provider JAR is missing", file=sys.stderr)
+    return 2
+  descriptor = "META-INF/services/org.keycloak.authentication.AuthenticatorFactory"
+  expected = "org.decentwallet.keycloak.wallet.WalletChallengeAuthenticatorFactory"
+  try:
+    with zipfile.ZipFile(jar) as archive:
+      lines = archive.read(descriptor).decode("utf-8").splitlines()
+  except (KeyError, OSError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+    print(f"provider service registration is invalid: {type(error).__name__}", file=sys.stderr)
+    return 2
+  if expected not in lines:
+    print("provider factory is not registered in the production JAR", file=sys.stderr)
+    return 1
+  print("provider service registration verified")
+  return 0
+
+
+def verify_diff_check() -> int:
+  """Check the PR commit range and every local tracked/untracked change."""
+  commands = []
+  pull_request_base = os.environ.get("PR_BASE_SHA")
+  if pull_request_base:
+    commands.append(["git", "diff", "--check", f"{pull_request_base}...HEAD"])
+  commands.append(["git", "diff", "--check", "HEAD"])
+  for command in commands:
+    try:
+      checked = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", check=False)
+    except (OSError, UnicodeError):
+      print("git whitespace check could not run", file=sys.stderr)
+      return 2
+    if checked.stdout:
+      print(checked.stdout, end="", flush=True)
+    if checked.stderr:
+      print(checked.stderr, end="", file=sys.stderr, flush=True)
+    if checked.returncode:
+      return checked.returncode
+
+  try:
+    untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                               cwd=ROOT, capture_output=True, check=False)
+  except OSError:
+    print("untracked-file whitespace check could not run", file=sys.stderr)
+    return 2
+  if untracked.returncode:
+    if untracked.stderr:
+      print(os.fsdecode(untracked.stderr), end="", file=sys.stderr, flush=True)
+    return untracked.returncode
+  paths_output = untracked.stdout
+  if isinstance(paths_output, str):
+    paths_output = os.fsencode(paths_output)
+  for raw_path in sorted(filter(None, paths_output.split(bytes((0,))))):
+    command = ["git", "diff", "--no-index", "--check", "--", "/dev/null", os.fsdecode(raw_path)]
+    try:
+      checked = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", check=False)
+    except (OSError, UnicodeError):
+      print("untracked-file whitespace check could not run", file=sys.stderr)
+      return 2
+    if checked.stdout:
+      print(checked.stdout, end="", flush=True)
+    if checked.stderr:
+      print(checked.stderr, end="", file=sys.stderr, flush=True)
+    if checked.returncode not in (0, 1):
+      return checked.returncode
+  return 0
+
+
+def acceptance_stages() -> tuple[tuple[str, list[str]], ...]:
+  """Return the offline acceptance checks owned by keycloakctl."""
+  return (
+      ("java-tests", ["mvn", "--batch-mode", "--no-transfer-progress", "package"]),
+      ("surefire", []),
+      ("provider-service-registration", []),
+      ("python-tests", []),
+      ("python-compile", [sys.executable, "-c",
+          "from pathlib import Path; import py_compile; "
+          "[py_compile.compile(str(path), doraise=True) for folder in ('scripts', 'container') "
+          "for path in Path(folder).glob('*.py')]"]),
+      ("diff-check", ["git", "diff", "--check"]),
+  )
+
+
+def write_acceptance_receipt(receipt: dict) -> Path:
+  directory = ROOT / "target/keycloakctl/acceptance"
+  directory.mkdir(parents=True, exist_ok=True)
+  path = directory / f"{receipt['run_id']}.json"
+  temporary = directory / f".{receipt['run_id']}.tmp"
+  with temporary.open("xb") as output:
+    output.write(canonical_json(receipt))
+    output.flush()
+    os.fsync(output.fileno())
+  os.replace(temporary, path)
+  return path
+
+
 def run_acceptance(profile: str) -> int:
-  """Run the legacy canonical local lifecycle and verify its durable receipt."""
+  """Run local acceptance stages directly and persist their outcomes."""
   if profile not in ("offline", "ci"):
     print("error: acceptance supports only offline and ci profiles", file=sys.stderr)
     return 2
   try:
-    expected_source = acceptance_source_provenance()
-  except (OSError, UnicodeError):
+    source = acceptance_source_provenance()
+  except (OSError, UnicodeError, RuntimeError, ValueError):
     print("error: acceptance source provenance unavailable", file=sys.stderr)
     return 2
-  evidence_directory = ROOT / "target/lifecycle/evidence"
-  try:
-    preexisting_receipts = {path.resolve() for path in evidence_directory.glob("*.json")}
-  except OSError:
-    print("error: acceptance receipt verification failed", file=sys.stderr)
-    return 2
-  try:
-    result = subprocess.run(
-        [sys.executable, "scripts/lifecycle.py", "run", profile], cwd=ROOT,
-        capture_output=True, text=True, encoding="utf-8", check=False,
-    )
-  except (OSError, UnicodeError):
-    print("error: canonical lifecycle could not be started", file=sys.stderr)
-    return 2
-  if result.returncode:
-    print("error: canonical lifecycle failed", file=sys.stderr)
-    return result.returncode if 0 < result.returncode < 256 else 2
-  try:
-    current_source = acceptance_source_provenance()
-  except (OSError, UnicodeError, RuntimeError, ValueError):
-    print("error: acceptance source provenance changed during lifecycle", file=sys.stderr)
-    return 2
-  if (current_source["source_revision"] != expected_source["source_revision"]
-      or current_source["worktree_clean"] is not expected_source["worktree_clean"]
-      or current_source["worktree_diff_sha256"] != expected_source["worktree_diff_sha256"]
-      or current_source["worktree_untracked_file_count"]
-          != expected_source["worktree_untracked_file_count"]):
-    print("error: acceptance source provenance changed during lifecycle", file=sys.stderr)
-    return 2
-  try:
-    from scripts.lifecycle import fingerprint_source
-    expected_receipt_source = fingerprint_source(include_build_artifacts=True)
-  except (OSError, RuntimeError, ValueError):
-    print("error: acceptance receipt verification failed", file=sys.stderr)
-    return 2
-  reported = [line.removeprefix("lifecycle receipt: ") for line in result.stdout.splitlines()
-              if line.startswith("lifecycle receipt: ")]
-  try:
-    expected_directory = (ROOT / "target/lifecycle/evidence").resolve(strict=True)
-  except OSError:
-    print("error: acceptance receipt verification failed", file=sys.stderr)
-    return 2
-  candidates = []
-  for value in reported:
-    candidate = Path(value)
-    if not candidate.is_absolute():
-      candidate = ROOT / candidate
+  receipt = {"version": 1, "run_id": uuid4().hex, "profile": profile,
+             "status": "running", "source": source, "stages": []}
+  environment = dict(os.environ)
+  environment["PYTHONDONTWRITEBYTECODE"] = "1"
+  surefire_before_maven = None
+  for name, command in acceptance_stages():
     try:
-      resolved = candidate.resolve(strict=True)
-      info = candidate.stat()
-      if (not candidate.is_symlink() and resolved.parent == expected_directory
-          and resolved not in preexisting_receipts
-          and stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024):
-        candidates.append((candidate, info))
-    except OSError:
-      continue
-  if len(candidates) != 1:
-    print("error: acceptance receipt verification failed", file=sys.stderr)
-    return 2
-  path, info = candidates[0]
+      if name == "python-tests":
+        from scripts.lifecycle import run_python_tests
+        stage_result = run_python_tests()
+      elif name == "surefire":
+        stage_result = verify_surefire_reports(surefire_before_maven)
+      elif name == "provider-service-registration":
+        stage_result = verify_provider_registration()
+      elif name == "diff-check":
+        stage_result = verify_diff_check()
+      else:
+        if name == "java-tests":
+          surefire_before_maven = surefire_report_snapshot()
+        stage_result = subprocess.run(command, cwd=ROOT, env=environment,
+            capture_output=True, text=True, check=False, timeout=900).returncode
+      status = "pass" if stage_result == 0 else "fail"
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+      status = "fail"
+    receipt["stages"].append({"name": name, "status": status})
+    if status == "fail":
+      receipt["status"] = "failed"
+      try:
+        path = write_acceptance_receipt(receipt)
+      except OSError:
+        print("error: acceptance failure receipt could not be written", file=sys.stderr)
+        return 2
+      print(f"error: acceptance stage failed; receipt: {path}", file=sys.stderr)
+      return 2
+  receipt["status"] = "complete"
   try:
-    receipt = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_members)
-    source = receipt.get("source") if type(receipt) is dict else None
-    steps = receipt.get("steps") if type(receipt) is dict else None
-    cleanup = receipt.get("cleanup") if type(receipt) is dict else None
-    required_steps = {"preflight", "java-tests", "surefire", "python-tests", "python-compile",
-        "resolver-sources", "resolver-dependencies", "provider-service-registration",
-        "provider-image", "image-smoke", "diff-check", "evidence", "teardown"}
-    if (type(receipt) is not dict or type(receipt.get("schema_version")) is not int
-        or receipt["schema_version"] != 1
-        or receipt.get("profile") != profile or type(receipt.get("run_id")) is not str
-        or re.fullmatch(r"[0-9a-f]{32}", receipt["run_id"]) is None
-        or type(receipt.get("exit_code")) is not int or receipt["exit_code"] != 0
-        or type(source) is not dict
-        or source.get("source_revision") != expected_source["source_revision"]
-        or source.get("worktree_clean") is not expected_source["worktree_clean"]
-        or source.get("worktree_diff_sha256") != expected_source["worktree_diff_sha256"]
-        or source.get("worktree_untracked_file_count")
-            != expected_source["worktree_untracked_file_count"]
-        or source.get("image_source_sha256") != expected_source["image_source_sha256"]
-        or source.get("image_source_file_count") != expected_source["image_source_file_count"]
-        or source.get("image_artifacts_sha256") != expected_receipt_source["image_artifacts_sha256"]
-        or source.get("image_artifact_file_count") != expected_receipt_source["image_artifact_file_count"]
-        or not isinstance(source.get("source_revision"), str)
-        or re.fullmatch(r"[0-9a-f]{40,64}", source["source_revision"]) is None
-        or not isinstance(source.get("image_source_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", source["image_source_sha256"]) is None
-        or type(source.get("image_source_file_count")) is not int
-        or source["image_source_file_count"] < 1
-        or not isinstance(source.get("image_artifacts_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", source["image_artifacts_sha256"]) is None
-        or type(source.get("image_artifact_file_count")) is not int
-        or source["image_artifact_file_count"] < 1
-        or path.name != f"{receipt['run_id']}.json"
-        or type(source.get("worktree_clean")) is not bool
-        or type(steps) is not dict or not required_steps <= steps.keys()
-        or any(type(steps[name]) is not dict or steps[name].get("status") != "pass"
-               for name in required_steps)
-        or type(cleanup) is not dict or cleanup.get("status") != "pass"):
+    path = write_acceptance_receipt(receipt)
+    stored = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_members)
+    if stored != receipt:
       raise ValueError
-  except (OSError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
+  except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
     print("error: acceptance receipt verification failed", file=sys.stderr)
     return 2
   print(f"acceptance verified: {path}")

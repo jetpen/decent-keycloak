@@ -12,28 +12,18 @@ Run `./keycloakctl --help` with Python 3.11.13. For the local Java test phase, m
 Java 21 and Maven available on `PATH`. The launcher finds its repository from
 its own location, including when invoked outside the checkout. Explicit `--config`
 paths are relative to the caller. [`scripts/lifecycle.py`](../../scripts/lifecycle.py)
-remains for lifecycle capabilities not yet migrated. `keycloakctl` adds the local
-setup/build/test path in this PR; the acceptance workflow remains on the existing
-canonical lifecycle path pending independent parity review and CI verification.
+remains for stages not yet migrated. `keycloakctl` provides local setup/build/test and `acceptance` owns the ordered Maven package, Surefire validation, provider-service-registration, Python-test, Python-compile, and diff-check stages used locally and by PR CI. The Surefire report validator is keycloakctl-owned. Acceptance writes a keycloakctl-owned durable receipt; this is partial phase-ownership parity.
 
-`keycloakctl` now also exposes `acceptance --profile offline|ci` as a narrow
-entry-point parity check. It delegates to the unchanged `scripts/lifecycle.py
-run <profile>` command and reads back that runner's durable receipt, requiring
-matching profile, source revision/fingerprint and dirty-worktree bit, all local
-steps passed, and cleanup/teardown passed. It does not create a substitute
-receipt, migrate the GitHub Actions caller, or establish parity for the remaining
-lifecycle capabilities. The workflow continues to run
-`python scripts/lifecycle.py run ci` until full parity and CI verification are
-complete.
+The `acceptance --profile offline|ci` command is the shared local/CI entry point. It records Maven `package`, Surefire validation, provider-service-registration, Python tests, Python compilation, and diff-check outcomes in its durable receipt without invoking `scripts/lifecycle.py` as a CLI command. The Surefire validator is keycloakctl-owned. Local preflight, dedicated resolver materialization receipts, image build/smoke, and teardown remain open and are not run by this command. The PR workflow invokes `./keycloakctl acceptance --profile ci`; this deliberately narrows the previous `scripts/lifecycle.py run ci` caller and defers its legacy image build/smoke and cleanup gates. A green PR job is not equivalent to the former full offline CI profile or full Issue #74 acceptance.
 
 ## Local commands
 
 ```sh
 ./keycloakctl validate-config --config config/keycloakctl/readiness.json
 dev_id=$(./keycloakctl setup --profile dev --config config/keycloakctl/dev.json)
-# Verify the canonical local lifecycle through keycloakctl; this runs its full offline profile.
+# Run the currently migrated local acceptance stages through keycloakctl.
 ./keycloakctl acceptance --profile offline
-# The canonical CI caller remains scripts/lifecycle.py run ci.
+# The canonical CI caller uses the same named profile through keycloakctl.
 ./keycloakctl setup --run-id "$dev_id"
 # Fetches locked prerequisites on the host; `--network=none` disables build-step networking, not base-image acquisition.
 ./keycloakctl build --run-id "$dev_id" --config config/keycloakctl/dev.json
@@ -153,9 +143,7 @@ receipt records the ordered steps and binds completion to the test inputs, build
 receipt, config, and provider image. Each failed stage stops later work and writes
 a durable `failure-*.json` step receipt; a failed attempt does not create
 `test.json`. Resume validates the existing source-bound success receipt rather
-than rerunning those checks. The PR workflow remains on the canonical
-`python scripts/lifecycle.py run ci` acceptance gate until this new path has
-independent parity review and CI verification; this PR does not migrate it.
+than rerunning those checks. The PR workflow invokes `./keycloakctl acceptance --profile ci`; the command owns the five documented local stages. Stage-by-stage ownership for the remaining lifecycle gates and complete CI receipt parity remain open.
 Other existing lifecycle capabilities remain unmigrated, so
 `scripts/lifecycle.py` stays until their replacement and caller parity are
 verified.
