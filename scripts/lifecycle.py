@@ -777,7 +777,21 @@ def run_python_tests() -> int:
     source_paths = [str(oidc_install_dir), str(install_dir), str(sources / "identity/src"), str(sources / "registry/src")]
     env["PYTHONPATH"] = os.pathsep.join(source_paths + [env.get("PYTHONPATH", "")])
     suite = [sys.executable, "-m", "unittest", *PYTHON_TESTS, "-q"]
-    return run(suite, env=env)
+    try:
+      result = subprocess.run(suite, cwd=ROOT, env=env, capture_output=True, text=True,
+                              check=False, timeout=900)
+    except (OSError, subprocess.TimeoutExpired):
+      print("canonical Python suite failed or timed out", file=sys.stderr)
+      return 124
+    if result.stdout:
+      print(result.stdout, end="")
+    if result.stderr:
+      print(result.stderr, end="", file=sys.stderr)
+    summary = re.search(r"\bRan (\d+) tests? in ", result.stdout + result.stderr)
+    if result.returncode == 0 and (not summary or int(summary.group(1)) == 0):
+      print("canonical Python suite reported no executed tests", file=sys.stderr)
+      return 2
+    return result.returncode
 
 
 def compile_sources() -> int:

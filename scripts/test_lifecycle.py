@@ -91,9 +91,13 @@ class LifecycleCliTest(unittest.TestCase):
 
   def test_python_suite_fetches_hash_locked_wheels_then_installs_offline(self):
     with mock.patch.object(lifecycle, "run", return_value=0) as run, \
-        mock.patch.object(lifecycle, "extract_verified_wheelhouse", return_value=0) as extract:
+        mock.patch.object(lifecycle, "extract_verified_wheelhouse", return_value=0) as extract, \
+        mock.patch.object(lifecycle.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 0, "Ran 21 tests in 0.5s\\n", "")) as suite_run:
       self.assertEqual(0, lifecycle.run_python_tests())
 
+    self.assertEqual([sys.executable, "-m", "unittest", *lifecycle.PYTHON_TESTS, "-q"],
+                     suite_run.call_args.args[0])
     calls = run.call_args_list
     commands = [call.args[0] for call in calls]
     source_fetch = next(command for command in commands if "--materialize-sources" in command)
@@ -120,6 +124,36 @@ class LifecycleCliTest(unittest.TestCase):
     self.assertLess(commands.index(oidc_download), commands.index(oidc_install))
     self.assertEqual(1, extract.call_count)
     self.assertFalse(any("resolver-wheelhouse.tar.gz" in str(path) for path in ROOT.rglob("resolver-wheelhouse.tar.gz")))
+
+  def test_python_suite_timeout_fails_closed_and_cleans_temp(self):
+    created = []
+    timeout_values = []
+    original_temporary_directory = tempfile.TemporaryDirectory
+
+    def track_temporary_directory(*args, **kwargs):
+      temporary = original_temporary_directory(*args, **kwargs)
+      created.append(Path(temporary.name))
+      return temporary
+
+    def timeout_suite(command, **kwargs):
+      timeout_values.append(kwargs.get("timeout"))
+      raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+    with (
+        mock.patch.object(lifecycle, "run", return_value=0),
+        mock.patch.object(lifecycle, "extract_verified_wheelhouse", return_value=0),
+        mock.patch.object(lifecycle.tempfile, "TemporaryDirectory", side_effect=track_temporary_directory),
+        mock.patch.object(lifecycle.subprocess, "run", side_effect=timeout_suite),
+    ):
+      try:
+        result = lifecycle.run_python_tests()
+      except subprocess.TimeoutExpired:
+        result = "raised"
+
+    self.assertEqual(124, result)
+    self.assertEqual([900], timeout_values)
+    self.assertEqual(1, len(created))
+    self.assertFalse(created[0].exists())
 
   def test_java_21_detection_accepts_any_java_21_patch_and_rejects_other_majors(self):
     self.assertTrue(lifecycle.java_21_runtime("openjdk version \"21.0.13\" 2026-10-20\n"))

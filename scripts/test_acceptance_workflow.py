@@ -53,13 +53,20 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     local_checks = readme.split("## Build and verify locally", 1)[1].split(
         "## Build an installable local image", 1)[0]
 
-    self.assertIn("python3.11 scripts/lifecycle.py run offline", local_checks)
+    self.assertIn("./keycloakctl acceptance --profile offline", local_checks)
     self.assertNotIn("podman build ", local_checks)
+  def test_acceptance_job_does_not_set_up_an_unused_container_engine(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+
+    self.assertNotIn("docker/setup-buildx-action", workflow)
+    self.assertNotIn("CONTAINER_ENGINE:", workflow)
+    self.assertIn("- name: Run keycloakctl acceptance stages", workflow)
+
   def test_acceptance_workflow_uses_the_shared_ci_profile(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
 
-    self.assertIn("run: python scripts/lifecycle.py run ci", workflow)
+    self.assertIn("run: ./keycloakctl acceptance --profile ci", workflow)
     self.assertIn('"scripts.test_lifecycle"', lifecycle)
     self.assertIn("python-tests", lifecycle)
     self.assertIn("python-compile", lifecycle)

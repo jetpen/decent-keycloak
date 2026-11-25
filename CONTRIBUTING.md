@@ -14,16 +14,16 @@ Install the tools below before running `scripts/lifecycle.py`. Versions are the 
 | Apache Maven | Installed and on `PATH`; **version not pinned by the lifecycle** | Used for `mvn clean package` and Surefire. |
 | Git | Installed and on `PATH`; **version not pinned by the lifecycle** | Required for source fingerprints, diff checks, and version control. |
 | Podman | Installed, daemon/service available; **version not pinned by the lifecycle** | Default local container engine. Pinned base images must already be present; local build uses `--pull=never`. |
-| Docker Engine + Buildx | Installed and available; **versions not pinned by the lifecycle** | Alternative container path; Buildx must be enabled. CI uses Buildx on `ubuntu-24.04`. |
+| Docker Engine + Buildx | Installed and available; **versions not pinned by the lifecycle** | Alternative local container path for compatibility image builds; the current PR CI slice does not use Buildx. |
 | OpenSSL | Installed; **version not pinned** | Required only for opt-in live profiles. |
 
-You need one supported container path: Podman, or Docker with Buildx. The normal offline lifecycle needs network access to materialize pinned Identity/Registry source checkouts, hash-locked Python package/RPM inputs, and Maven dependencies. Install the acceptance OIDC validator into the Python environment used for tests with `python3.11 -m pip install --require-hashes -r requirements/issue8-oidc.lock`. The binary dependency inventory in [`container/resolver-binary-dependencies.lock.json`](container/resolver-binary-dependencies.lock.json) records each package version, upstream distribution URL, and SHA-256. The lifecycle downloads these artifacts into a run-scoped temporary build context, verifies each artifact against its package/version requirement hashes and RPM identity, and removes the context during teardown; dependency binaries are not stored in Git. Update the inventory and its digest in `container/resolver-runtime.lock.json` whenever a bundled dependency changes. Podman's image build does not pull base images by default; arrange the pinned base images before running it or explicitly use the documented `--pull-base-images` option. Docker Buildx pulls the digest-pinned bases. Dockerfile `RUN` steps remain network-isolated.
+The current `keycloakctl acceptance` stages require Python 3.11.13, Java 21, Maven, Git, and the hash-locked OIDC dependency. The canonical Python suite materializes pinned Identity/Registry sources, locked resolver artifacts, and locked PyPI wheels in temporary directories, so network access is required; it does not contact the Registry or use a container engine. The remaining compatibility lifecycle image-build/smoke flows require Podman or Docker with Buildx and pinned base images. The binary dependency inventory in [`container/resolver-binary-dependencies.lock.json`](container/resolver-binary-dependencies.lock.json) records each package version, upstream distribution URL, and SHA-256. Do not treat the current keycloakctl acceptance stages as full offline lifecycle parity.
 
 ## Local development workflow
 
 Work from a clean branch based on the current default branch, and keep each change limited to its requested scope. Before coding, read the relevant source, tests, and acceptance/support docs. For implementation changes, add or update the owning tests; run focused tests while iterating.
 
-Check available lifecycle commands and the offline plan:
+Inspect the remaining compatibility lifecycle capabilities and the offline profile plan; these are still legacy-owned:
 
 ```bash
 python3.11 scripts/lifecycle.py --help
@@ -31,15 +31,13 @@ python3.11 scripts/lifecycle.py profiles
 python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-Before committing or pushing, run the complete offline acceptance lifecycle from the working tree:
+Run the current keycloakctl acceptance stages from the worktree before publishing the PR or treating the migrated local/CI slice as verified:
 
 ```bash
-python3.11 scripts/lifecycle.py run offline
+./keycloakctl acceptance --profile offline
 ```
 
-Read the sanitized receipt in `target/lifecycle/evidence/` and confirm each required stage passed. The lifecycle runs Maven/Surefire, the canonical Python suite, Python compilation, pinned resolver-source materialization and verification, provider SPI registration, the runtime image build and version smoke, whitespace checks, evidence retention, and bounded teardown. The run-owned image is removed by default. `--retain-image` keeps it only by explicit opt-in, with the receipt recording its immutable ID and retention status. PR CI runs the same named lifecycle as independent verification; it is not a substitute for completing local acceptance before publishing the PR.
-
-The [offline `keycloakctl` foundation](docs/acceptance/keycloakctl-foundation.md) supports configuration validation and local run setup/build/test. `./keycloakctl acceptance --profile offline|ci` delegates to the unchanged legacy lifecycle and validates its durable local receipt; it does not migrate the canonical CI call or replace the remaining legacy lifecycle capabilities.
+Read the receipt in `target/keycloakctl/acceptance/` and confirm each required stage passed. This bounded entry point runs Maven `package` without `clean`, validates nonempty passing Surefire reports, verifies provider service registration, runs the canonical Python suite, compiles Python sources, and checks the PR base plus staged, unstaged, and untracked changes for whitespace. It does not build/smoke images or run live qualification. The PR migration deliberately narrows the previous `scripts/lifecycle.py run ci` workflow: PR CI no longer runs the legacy image build/smoke and lifecycle cleanup gates. Those remain open and need a separate migration; a passing keycloakctl CI job is not equivalent to the former full offline CI profile or full Issue #74 acceptance. See the migration map for open legacy capabilities; do not interpret this receipt as full offline lifecycle parity. The same `keycloakctl acceptance --profile offline|ci` command is used locally and in PR CI; its Surefire validator and ordered durable receipt are keycloakctl-owned. Local preflight, dedicated resolver-input receipts, image build/smoke, and full teardown remain open. Preserve the lifecycle module for its remaining callers and gates.
 
 The canonical runtime image is named `localhost/decent-keycloak/wallet-provider`; its labels include the source revision and canonical lifecycle image-input fingerprints. The documented isolated fault-test builds pass a source revision too. Use the runtime receipt's immutable image ID for consumers. To run a periodic local age sweep, use `python3.11 scripts/image_lifecycle.py cleanup`. The default age is three days and can be configured with `DECENT_IMAGE_RETENTION_DAYS` or `--max-age-days`. The command only considers images carrying all exact repository/component/role labels, never prunes bases or builder caches, checks active containers, and verifies ownership and absence around removal. Protect a consumer image indefinitely with `scripts/image_lifecycle.py pin <image-or-id> <name>`; use `extend <image-or-id> <days>` for a bounded expiry, and `unpin` to release it. See the README's image-lifecycle section for remote policy and GHCR verification limits.
 

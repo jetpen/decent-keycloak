@@ -12,21 +12,21 @@ The provider supports explicit `login` and, when enabled by the realm, `signup` 
 
 ## Build and verify locally
 
-The repository's lifecycle command is the canonical build and offline-acceptance entry point. Start with a narrow test while developing, then complete the offline lifecycle before treating an artifact as an install candidate:
+The `keycloakctl` acceptance entry point is used locally and by pull-request CI. Start with a narrow test while developing, then run the offline profile before treating an artifact as an install candidate:
 
 ```bash
-python3.11 scripts/lifecycle.py run offline
+./keycloakctl acceptance --profile offline
 ```
 
-The lifecycle checks prerequisites, runs Maven/Surefire and the canonical Python acceptance suite, compiles Python sources, verifies pinned resolver sources and every recorded binary dependency provenance entry, checks provider registration, builds and smoke-tests the Keycloak image, checks whitespace, writes a sanitized receipt under `target/lifecycle/evidence/`, and removes its run-owned image tag. Use `--retain-image` only when a workflow explicitly requires the local immutable image; the default remains cleanup. Inspect the receipt; a successful offline run is not live Registry or wallet qualification. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and the contributor workflow.
+The current command runs Maven `package` without `clean`, verifies nonempty passing Surefire reports, checks provider service registration, runs the canonical Python acceptance suite, compiles Python sources, and checks whitespace. Its durable receipt records the ordered stage outcomes under `target/keycloakctl/acceptance/`. This remains partial: local preflight, dedicated resolver-input receipts, image build/smoke, full teardown, and live qualification are not part of this command. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
 
-To inspect the steps without running them:
+The full offline lifecycle plan is still exposed by the compatibility runner and has not been fully migrated:
 
 ```bash
 python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-CI invokes the same lifecycle with `ci` on pull requests. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
+The PR workflow invokes `./keycloakctl acceptance --profile ci`, using the same caller as the local `offline` entry point. This deliberately narrows the prior `scripts/lifecycle.py run ci` workflow: PR CI no longer runs its legacy image build/smoke or lifecycle cleanup gates. Those gates remain open for separate migration, so a green job is not full offline lifecycle parity. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
 
 ```bash
 python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live
@@ -51,7 +51,7 @@ Repository-built image inventory:
 | `issue6-callback-gate-test-runtime` / `wallet-provider-issue6-callback-gate-test` | Isolated Issue #6 callback-gate fault provider. | Temporary test artifact; never a release role. |
 | `resolver-builder`, `keycloak-with-resolver` / intermediate roles | Build intermediates only. | Run-owned intermediates are removed by bounded lifecycle teardown; never promotion targets. |
 
-`container/Dockerfile` pins upstream UBI and Keycloak bases by digest. They are not this repository's artifacts and are excluded from the local age cleaner; builder caches are also out of scope. The only tracked CI workflow is `.github/workflows/acceptance.yml`: it runs the canonical offline lifecycle for pull requests, and neither publishes images nor grants package-write permissions. The `decent-integration-test` repository currently documents Identity CLI integration tests rather than consuming this Keycloak image; no remote image consumer is verified.
+`container/Dockerfile` pins upstream UBI and Keycloak bases by digest. They are not this repository's artifacts and are excluded from the local age cleaner; builder caches are also out of scope. The only tracked CI workflow is `.github/workflows/acceptance.yml`: for pull requests it runs keycloakctl's Maven/Surefire, provider service-registration, canonical Python, compilation, and whitespace acceptance stages; it does not prepare an image engine, build or smoke images, publish images, or grant package-write permissions. The `decent-integration-test` repository currently documents Identity CLI integration tests rather than consuming this Keycloak image; no remote image consumer is verified.
 
 ## Build and retain a local image
 
