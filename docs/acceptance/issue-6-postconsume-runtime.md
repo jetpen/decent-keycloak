@@ -57,8 +57,8 @@ The test-image target and the receipt-failure profile have already been run once
 ```bash
 mvn -q -o -DskipTests test-compile
 python3.11 scripts/build_issue6_postconsume_provider.py
-IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-postconsume-test-runtime --field image_source_sha256)"
-IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-postconsume-test-runtime --field image_artifacts_sha256)"
+IMAGE_SOURCE_SHA256="$(./keycloakctl image-fingerprints --target issue6-postconsume-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(./keycloakctl image-fingerprints --target issue6-postconsume-test-runtime --field image_artifacts_sha256)"
 podman build --target issue6-postconsume-test-runtime \
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
   --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \
@@ -82,8 +82,8 @@ After a successful Java 21 offline Maven package, build the fault-injector JAR a
 ```bash
 mvn -q -o clean package
 python3.11 scripts/build_issue6_callback_gate_provider.py
-IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-callback-gate-test-runtime --field image_source_sha256)"
-IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue6-callback-gate-test-runtime --field image_artifacts_sha256)"
+IMAGE_SOURCE_SHA256="$(./keycloakctl image-fingerprints --target issue6-callback-gate-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(./keycloakctl image-fingerprints --target issue6-callback-gate-test-runtime --field image_artifacts_sha256)"
 podman build --no-cache --pull=never --network=none \\
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \\
   --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \\

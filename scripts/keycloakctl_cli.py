@@ -35,6 +35,13 @@ PLANS = {
 }
 LIVE_PHASES = {"publish", "deploy", "configure", "integration-test", "verify readiness", "teardown"}
 TEST_STEPS = ("java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check")
+IMAGE_FINGERPRINT_TARGETS = (
+  "issue6-callback-gate-test-runtime",
+  "issue6-postconsume-test-runtime",
+  "issue7-store-recovery-test-runtime",
+  "issue7-user-readback-test-runtime",
+  "runtime",
+)
 PHASE_HELP = {
   "preflight": "check local toolchain/engine or remote target prerequisites without changes",
   "build": "package the provider, fetch and verify locked resolver inputs, then build the provider and test RP images",
@@ -1112,6 +1119,30 @@ The `acceptance --profile offline|ci` command runs Maven `package` without `clea
       command.add_argument("--receipt", required=True, help="reviewed promotion receipt")
       command.add_argument("--allow-publish", action="store_true", help="required on this invocation")
       command.add_argument("--destination", required=True, help="explicit docker:// registry/repository:rc-tag")
+  fingerprints = commands.add_parser(
+      "image-fingerprints", help="print image source/artifact fingerprints",
+      description="print image source/artifact fingerprints", allow_abbrev=False)
+  fingerprints.add_argument("--target", choices=IMAGE_FINGERPRINT_TARGETS, required=True)
+  fingerprints.add_argument("--field", choices=("image_source_sha256", "image_artifacts_sha256"),
+                            required=True)
+  images = commands.add_parser(
+      "images", help="manage local image retention", description="manage local image retention",
+      allow_abbrev=False)
+  images.add_argument("--engine", choices=("podman", "docker"),
+                      help="container engine (default: CONTAINER_ENGINE, then Podman/Docker)")
+  image_actions = images.add_subparsers(dest="image_action", required=True)
+  cleanup = image_actions.add_parser(
+      "cleanup", help="remove expired, inactive repository-built images only", allow_abbrev=False)
+  cleanup.add_argument("--max-age-days", type=int, help="retention age in days")
+  for action in ("pin", "unpin"):
+    pin = image_actions.add_parser(action, help=f"{action} a named local image retention tag",
+                                   allow_abbrev=False)
+    pin.add_argument("image")
+    pin.add_argument("name")
+  extend = image_actions.add_parser(
+      "extend", help="extend local image retention for a bounded number of days", allow_abbrev=False)
+  extend.add_argument("image")
+  extend.add_argument("days", type=int)
   return parser
 
 
@@ -1312,10 +1343,59 @@ def run_acceptance(profile: str) -> int:
   return 0
 
 
+def run_image_fingerprints(target: str, field: str) -> int:
+  """Print one validated fingerprint for an image target and its build inputs."""
+  from scripts.lifecycle import IMAGE_BUILD_ARTIFACTS_BY_TARGET, fingerprint_source
+  if target not in IMAGE_BUILD_ARTIFACTS_BY_TARGET:
+    raise Rejected("unknown image target")
+  if field not in ("image_source_sha256", "image_artifacts_sha256"):
+    raise Rejected("unknown image fingerprint field")
+  try:
+    fingerprints = fingerprint_source(include_build_artifacts=True, image_target=target)
+  except (OSError, RuntimeError, ValueError):
+    raise Rejected("image fingerprint failed") from None
+  value = fingerprints.get(field)
+  if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+    raise Rejected("image fingerprint result is invalid")
+  print(value)
+  return 0
+
+
+def run_image_lifecycle(args: argparse.Namespace) -> int:
+  """Run a public local image-retention operation through the shared helpers."""
+  from scripts import image_lifecycle
+  try:
+    engine = image_lifecycle.selected_engine(args.engine)
+    if args.image_action == "cleanup":
+      max_age_days = args.max_age_days
+      if max_age_days is None:
+        max_age_days = int(os.environ.get(
+            "DECENT_IMAGE_RETENTION_DAYS", str(image_lifecycle.DEFAULT_RETENTION_DAYS)))
+      result = image_lifecycle.cleanup_images(engine, max_age_days=max_age_days)
+      print(json.dumps({"status": "pass", **result}, sort_keys=True))
+    elif args.image_action == "pin":
+      image_lifecycle.pin_image(engine, args.image, args.name)
+      print("pin=created")
+    elif args.image_action == "unpin":
+      image_lifecycle.unpin_image(engine, args.image, args.name)
+      print("pin=removed")
+    else:
+      image_lifecycle.extend_image(engine, args.image, args.days)
+      print("retention=extended")
+    return 0
+  except (OSError, RuntimeError, ValueError) as error:
+    print(f"image lifecycle failed: {type(error).__name__}: {error}", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
   parser = make_parser()
   args = parser.parse_args(argv)
   try:
+    if args.command == "image-fingerprints":
+      return run_image_fingerprints(args.target, args.field)
+    if args.command == "images":
+      return run_image_lifecycle(args)
     if args.command == "acceptance":
       return run_acceptance(args.profile)
     elif args.command == "validate-config":

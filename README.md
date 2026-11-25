@@ -73,11 +73,11 @@ Repository-built images carry repository/component/role and source-revision labe
 Run the safe cleanup command periodically (for example, from a user-owned scheduled job). It removes only images with all exact `io.decent.image.*` repository/component/role labels that are older than three days, and only after read-back confirms the same image ID/labels and no container uses it. It never runs `image prune`, and never selects upstream bases, builder caches, unlabeled images, recent images, pinned images, or active-container images.
 
 ```bash
-python3.11 scripts/image_lifecycle.py cleanup
-DECENT_IMAGE_RETENTION_DAYS=7 python3.11 scripts/image_lifecycle.py cleanup
-python3.11 scripts/image_lifecycle.py pin sha256:<immutable-image-id> integration-test
-python3.11 scripts/image_lifecycle.py extend sha256:<immutable-image-id> 14
-python3.11 scripts/image_lifecycle.py unpin sha256:<immutable-image-id> integration-test
+./keycloakctl images cleanup
+DECENT_IMAGE_RETENTION_DAYS=7 ./keycloakctl images cleanup
+./keycloakctl images pin sha256:<immutable-image-id> integration-test
+./keycloakctl images extend sha256:<immutable-image-id> 14
+./keycloakctl images unpin sha256:<immutable-image-id> integration-test
 ```
 
 The `pin-*` tag protects an image indefinitely until removed with `unpin`; `retain-until-<UTC timestamp>` tags created by `extend` protect it until that expiry. Extension days are bounded to 1–3650. Cleanup checks active containers both before selection and immediately before removal, and fails closed if inventory, ownership readback, or removal verification is inconclusive.

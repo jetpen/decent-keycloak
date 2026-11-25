@@ -103,8 +103,8 @@ First run Java 21 offline `mvn -o clean package`, then:
 
 ```bash
 python3.11 scripts/build_issue7_fault_provider.py
-IMAGE_SOURCE_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue7-store-recovery-test-runtime --field image_source_sha256)"
-IMAGE_ARTIFACTS_SHA256="$(python3.11 scripts/lifecycle.py image-fingerprints --target issue7-store-recovery-test-runtime --field image_artifacts_sha256)"
+IMAGE_SOURCE_SHA256="$(./keycloakctl image-fingerprints --target issue7-store-recovery-test-runtime --field image_source_sha256)"
+IMAGE_ARTIFACTS_SHA256="$(./keycloakctl image-fingerprints --target issue7-store-recovery-test-runtime --field image_artifacts_sha256)"
 podman build --no-cache --pull=never --network=none \
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
   --build-arg IMAGE_SOURCE_SHA256="$IMAGE_SOURCE_SHA256" \

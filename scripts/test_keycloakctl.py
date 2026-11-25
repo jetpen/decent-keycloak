@@ -1,7 +1,9 @@
 """Offline contract tests through the executable, in isolated scratch repositories."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from hashlib import sha256
+import io
 import json
 import os
 from pathlib import Path
@@ -435,6 +437,79 @@ class KeycloakctlTest(unittest.TestCase):
       self.assertEqual("", result.stdout)
       self.assertIn("invalid arguments", result.stderr)
 
+  def test_image_retention_commands_use_keycloakctl_dispatch(self):
+    from unittest.mock import call
+    commands = (
+        (("cleanup",),),
+        (("--engine", "docker", "cleanup", "--max-age-days", "7"),),
+        (("pin", "sha256:" + "1" * 64, "integration-test"),),
+        (("unpin", "sha256:" + "1" * 64, "integration-test"),),
+        (("extend", "sha256:" + "1" * 64, "14"),),
+    )
+    with (patch("scripts.image_lifecycle.main", return_value=0) as legacy_main,
+          patch("scripts.image_lifecycle.selected_engine", return_value="docker") as selected_engine,
+          patch("scripts.image_lifecycle.cleanup_images", return_value={"removed": 0}) as cleanup_images,
+          patch("scripts.image_lifecycle.pin_image") as pin_image,
+          patch("scripts.image_lifecycle.unpin_image") as unpin_image,
+          patch("scripts.image_lifecycle.extend_image") as extend_image,
+          patch.dict(os.environ, {"DECENT_IMAGE_RETENTION_DAYS": "5"}),
+          redirect_stdout(io.StringIO())):
+      for (args,) in commands:
+        self.assertEqual(0, keycloakctl_cli.main(["images", *args]))
+    legacy_main.assert_not_called()
+    selected_engine.assert_has_calls([call(None), call("docker"), call(None), call(None), call(None)])
+    cleanup_images.assert_has_calls([
+        call("docker", max_age_days=5), call("docker", max_age_days=7)])
+    pin_image.assert_called_once_with("docker", "sha256:" + "1" * 64, "integration-test")
+    unpin_image.assert_called_once_with("docker", "sha256:" + "1" * 64, "integration-test")
+    extend_image.assert_called_once_with("docker", "sha256:" + "1" * 64, 14)
+
+  def test_image_fingerprints_is_available_on_public_cli(self):
+    self.assertEqual(tuple(sorted(lifecycle.IMAGE_BUILD_ARTIFACTS_BY_TARGET)),
+                     keycloakctl_cli.IMAGE_FINGERPRINT_TARGETS)
+    fingerprints = {"image_source_sha256": "a" * 64,
+                    "image_artifacts_sha256": "b" * 64}
+    for field, expected in (
+        ("image_source_sha256", fingerprints["image_source_sha256"]),
+        ("image_artifacts_sha256", fingerprints["image_artifacts_sha256"])):
+      output = io.StringIO()
+      with (patch.object(lifecycle, "fingerprint_source", return_value=fingerprints) as fingerprint,
+            redirect_stdout(output)):
+        result = keycloakctl_cli.main([
+            "image-fingerprints", "--target", "runtime", "--field", field])
+      self.assertEqual(0, result)
+      self.assertEqual(expected + "\n", output.getvalue())
+      fingerprint.assert_called_once_with(include_build_artifacts=True,
+                                          image_target="runtime")
+      fingerprint.reset_mock()
+
+  def test_issue74_migration_map_distinguishes_available_phases_from_acceptance_ci(self):
+    migration_map = (ROOT / "docs/acceptance/issue-74-offline-migration-map.md").read_text(
+        encoding="utf-8")
+    self.assertIn("`keycloakctl build`", migration_map)
+    self.assertIn("`keycloakctl test`", migration_map)
+    self.assertIn("`./keycloakctl image-fingerprints --target ... --field ...`", migration_map)
+    self.assertIn("`./keycloakctl images cleanup|pin|unpin|extend`", migration_map)
+    self.assertIn("not included in `acceptance` or PR CI", migration_map)
+    self.assertNotIn("no keycloakctl-owned build receipt", migration_map)
+    for relative in (
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs/acceptance/issue-26-image-lifecycle.md",
+    ):
+      docs = (ROOT / relative).read_text(encoding="utf-8")
+      self.assertIn("./keycloakctl images", docs, relative)
+      self.assertNotIn("scripts/image_lifecycle.py cleanup", docs, relative)
+    for relative in (
+        "docs/acceptance/issue-6-postconsume-runtime.md",
+        "docs/acceptance/issue-7-store-recovery.md",
+        "docs/acceptance/issue-7-user-readback-recovery-profile.md",
+        "docs/acceptance/issue-26-image-lifecycle.md",
+    ):
+      docs = (ROOT / relative).read_text(encoding="utf-8")
+      self.assertIn("keycloakctl image-fingerprints", docs, relative)
+      self.assertNotIn("scripts/lifecycle.py image-fingerprints", docs, relative)
+
   def test_local_setup_docs_pin_required_python_patch_version(self):
     docs = (ROOT / "docs/acceptance/keycloakctl-foundation.md").read_text(encoding="utf-8")
     self.assertIn("Run `./keycloakctl --help` with Python 3.11.13.", docs)
@@ -690,8 +765,8 @@ raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
     result = self.cli("--help")
     self.assertEqual(0, result.returncode, result.stderr)
     for text in ("build", "test", "publish", "setup", "preflight", "deploy", "configure", "integration-test",
-                 "verify readiness", "verify qualification", "teardown", "promote", "full",
-                 "dev", "ci", "--profile", "--allow-live", "--allow-publish", "--new-run", "--run-id",
+                 "verify readiness", "verify qualification", "teardown", "promote", "full", "images",
+                 "image-fingerprints", "dev", "ci", "--profile", "--allow-live", "--allow-publish", "--new-run", "--run-id",
                  "stage receipts"):
       with self.subTest(help=text):
         self.assertIn(text, result.stdout)
