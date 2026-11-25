@@ -62,11 +62,11 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertNotIn("CONTAINER_ENGINE:", workflow)
     self.assertIn("- name: Run keycloakctl acceptance stages", workflow)
 
-  def test_acceptance_workflow_uses_the_shared_ci_profile(self):
+  def test_acceptance_workflow_uses_the_shared_offline_profile(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
 
-    self.assertIn("run: ./keycloakctl acceptance --profile ci", workflow)
+    self.assertIn("run: ./keycloakctl acceptance --profile offline", workflow)
     self.assertIn('"scripts.test_lifecycle"', lifecycle)
     self.assertIn("python-tests", lifecycle)
     self.assertIn("python-compile", lifecycle)
