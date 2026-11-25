@@ -18,7 +18,7 @@ The `keycloakctl` acceptance entry point is used locally and by pull-request CI.
 ./keycloakctl acceptance --profile offline
 ```
 
-The command runs local preflight, Maven/Surefire and canonical Python suites, compiles Python sources, builds both provider and test-only RP fixture images, runs their offline smokes, checks whitespace, writes a sanitized source-bound receipt, and removes only run-owned images after readback. The RP fixture smoke imports its module; it is not an RP server or browser flow. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
+The command runs local preflight, Maven/Surefire and canonical Python suites, compiles Python sources, builds both provider and test-only RP fixture images, runs their offline smokes, checks whitespace, and writes a sanitized source-bound receipt. Offline acceptance retains its built images and records cleanup as `not_run`; remove eligible repository images only through the separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke imports its module; it is not an RP server or browser flow. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
 
 The full offline lifecycle plan is still exposed by the compatibility runner and has not been fully migrated:
 
@@ -26,7 +26,7 @@ The full offline lifecycle plan is still exposed by the compatibility runner and
 python3.11 scripts/lifecycle.py run offline --plan
 ```
 
-The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. This restores the bounded local/CI image-build, smoke, and run-owned cleanup gates; remote transfer, readiness deployment, qualification, and Registry promotion remain outside this profile. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
+The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. This restores bounded local/CI image-build and smoke gates while retaining the resulting local images; cleanup is a separate explicit action. Remote transfer, readiness deployment, qualification, and Registry promotion remain outside this profile. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
 
 ```bash
 python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live

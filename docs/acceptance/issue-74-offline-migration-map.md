@@ -1,6 +1,6 @@
 # Issue #74 lifecycle migration status: offline/local/CI
 
-This is a bounded offline/CI acceptance parity slice, not completion of Issue #74. Local instructions and PR workflow invoke the same `keycloakctl acceptance --profile offline` profile. It performs local preflight, repository suites, provider and test-RP image build/smokes, source-bound sanitized receipt, whitespace checks, and exact run-owned image cleanup. The RP smoke is a fixture-module import, not RP server/browser qualification. Dedicated resolver-provenance receipts and the remaining remote/live lifecycle gates remain open. No live, remote, or qualification operation was run. Keep all 10 Issue #74 acceptance criteria open until their specific gates are verified.
+This is a bounded offline/CI acceptance parity slice, not completion of Issue #74. Local instructions and PR workflow invoke the same `keycloakctl acceptance --profile offline` profile. It performs local preflight, repository suites, provider and test-RP image build/smokes, source-bound sanitized receipt, and whitespace checks; offline acceptance retains built images and records cleanup as `not_run`. Image retention cleanup is a separate explicit `keycloakctl images cleanup` action. The RP smoke is a fixture-module import, not RP server/browser qualification. Dedicated resolver-provenance receipts and the remaining remote/live lifecycle gates remain open. No live, remote, or qualification operation was run. Keep all 10 Issue #74 acceptance criteria open until their specific gates are verified.
 
 The crosswalk below distinguishes changed command entry points from phase ownership; a row marked **open** is not claimed migrated.
 
@@ -18,7 +18,7 @@ The crosswalk below distinguishes changed command entry points from phase owners
 | provider-image build | `keycloakctl build` within acceptance builds provider image and records immutable identity | Included in the local acceptance run. Actual engine execution is reported only when the full command succeeds. |
 | image-smoke | `keycloakctl test` within acceptance smokes provider image | Included in the local acceptance run; no production/runtime qualification implied. |
 | RP fixture image build/smoke | Build/test stages include the test-only RP fixture image | Included; smoke imports fixture module only, no RP server/browser flow. |
-| offline/CI profile and receipt | Local docs and PR CI use `keycloakctl acceptance --profile offline` | Unified profile records ordered bounded stages and cleanup result; receipt does not close Issue #74. |
+| offline/CI profile and receipt | Local docs and PR CI use `keycloakctl acceptance --profile offline` | Unified profile records executed gate outcomes and cleanup as `not_run`; built images remain available until explicit image cleanup; receipt does not close Issue #74. |
 | wallet-login-qualification | Preserved on `scripts/lifecycle.py` behind `--allow-live` | Open; not invoked. |
 | remote-test-host | Preserved on `scripts/lifecycle.py` behind `--allow-live` | Open; not invoked. |
 | image-fingerprints | `./keycloakctl image-fingerprints --target ... --field ...` | Public CLI migrated; `scripts/lifecycle.py` no longer exposes this command, while keycloakctl reuses its fingerprint computation helper. |

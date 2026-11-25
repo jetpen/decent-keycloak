@@ -1087,7 +1087,7 @@ profiles check the host toolchain and selected local engine, while live profiles
 check the configured remote target; no deployment or qualification phase is
 implemented here.
 
-The `acceptance --profile offline` command runs local preflight, repository suites, provider and RP fixture image builds/smokes, whitespace checks, a sanitized source-bound receipt, and ownership-checked cleanup. CI invokes this same profile. The RP smoke imports the fixture module; it does not start a relying-party server or browser flow. Live qualification, remote host lifecycle, and publication remain separate and gated.
+The `acceptance --profile offline` command runs local preflight, repository suites, provider and RP fixture image builds/smokes, whitespace checks, and writes a sanitized source-bound receipt. It retains its built local images and records cleanup as `not_run`; image retention cleanup is separate and explicit via `keycloakctl images cleanup`. CI invokes this same profile. The RP smoke imports the fixture module; it does not start a relying-party server or browser flow. Live qualification, remote host lifecycle, and publication remain separate and gated.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1327,17 +1327,13 @@ def run_acceptance(profile: str) -> int:
 
 
 def acceptance_run_stages(profile: str, receipt: dict) -> int:
-  """Execute the offline local gates and remove only this run's images."""
-  from scripts.lifecycle import _cleanup_owned_images, _image_inventory
+  """Execute offline local gates and retain their run-scoped images."""
   engine = "docker" if os.environ.get("CI", "").lower() == "true" else "podman"
   config = {"version": 1, "profile": "dev", "engine": engine}
   state = create_run(config)
   receipt["run_id"] = state["run_id"]
   write_acceptance_receipt(receipt)
   engine = config["engine"]
-  baseline: set[str] = set()
-  baseline_captured = False
-  build_started = False
   failed = False
   def record(name: str, status: str) -> None:
     receipt["stages"].append({"name": name, "status": status})
@@ -1355,35 +1351,19 @@ def acceptance_run_stages(profile: str, receipt: dict) -> int:
   try:
     if not stage("preflight", lambda: perform_local_preflight(config, "dev")):
       return 2
-    baseline = _image_inventory(engine)
-    baseline_captured = True
     before = surefire_report_snapshot()
     if not stage("java-tests", lambda: require_zero(run_acceptance_command("maven", before))): return 2
     if not stage("surefire", lambda: require_zero(verify_surefire_reports(before))): return 2
     if not stage("provider-service-registration", lambda: require_zero(verify_provider_registration())): return 2
     if not stage("python-tests", lambda: require_zero(run_acceptance_command("python-tests"))): return 2
     if not stage("python-compile", lambda: require_zero(run_acceptance_command("python-compile"))): return 2
-    build_started = True
     if not stage("provider-image-build", lambda: perform_build(state, config)): return 2
     record("rp-fixture-image-build", "pass")
     if not stage("image-smoke", lambda: perform_test(state, config)): return 2
     record("rp-fixture-smoke", "pass")
     if not stage("diff-check", lambda: require_zero(verify_diff_check())): return 2
   finally:
-    try:
-      cleanup_attempted = build_started and baseline_captured
-      if cleanup_attempted:
-        bundle = read_build_bundle(state)
-        owned = {record["image_id"] for record in bundle["records"].values()} if bundle else set()
-        result = _cleanup_owned_images(engine, baseline, state["run_id"], known_owned_ids=owned)
-        if result.get("status") != "pass" or result.get("inconclusive_image_count"):
-          raise RuntimeError("cleanup readback failed")
-        record("cleanup", "pass")
-      else:
-        record("cleanup", "not_run")
-    except Exception:
-      record("cleanup", "fail")
-      failed = True
+    record("cleanup", "not_run")
   return 2 if failed else 0
 
 
