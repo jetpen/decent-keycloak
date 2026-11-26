@@ -1,0 +1,516 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:decent-keycloak:issue-73:artifact-schema-proposal:v1",
+  "title": "Issue 73 environment and run artifact proposal",
+  "description": "Proposal schema for bounded offline artifact validation; not an owner-adopted runtime contract.",
+  "oneOf": [
+    {"$ref": "#/$defs/environmentBaseline"},
+    {"$ref": "#/$defs/caseInventoryProjection"},
+    {"$ref": "#/$defs/runIntent"},
+    {"$ref": "#/$defs/lifecycleEvent"}
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reference": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque reference in the restricted owner-controlled store; never a secret value."
+    },
+    "caseId": {
+      "type": "string",
+      "enum": [
+        "LOGIN-01",
+        "TLS-01",
+        "TLS-02",
+        "NEG-01",
+        "NEG-02",
+        "NEG-03",
+        "NEG-04",
+        "NEG-05",
+        "NEG-06",
+        "NEG-07"
+      ]
+    },
+    "caseIdList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/caseId"}
+    },
+    "requiredCaseIds": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "LOGIN-01"},
+        {"const": "TLS-01"},
+        {"const": "TLS-02"},
+        {"const": "NEG-01"},
+        {"const": "NEG-02"},
+        {"const": "NEG-03"},
+        {"const": "NEG-04"},
+        {"const": "NEG-05"},
+        {"const": "NEG-06"},
+        {"const": "NEG-07"}
+      ],
+      "items": false,
+      "minItems": 10,
+      "maxItems": 10,
+      "uniqueItems": true
+    },
+    "hashReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "artifact_ref"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_ref": {"$ref": "#/$defs/reference"}
+      }
+    },
+    "baselinePointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline_id", "revision", "sha256"],
+      "properties": {
+        "baseline_id": {"$ref": "#/$defs/nonEmpty"},
+        "revision": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "sourceIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "url", "source_snapshot"],
+      "properties": {
+        "number": {"const": 66},
+        "url": {"const": "https://github.com/jetpen/decent-keycloak/issues/66"},
+        "source_snapshot": {"$ref": "#/$defs/hashReference"}
+      }
+    },
+    "profilePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readiness_state", "plan_ref", "plan_sha256"],
+      "properties": {
+        "readiness_state": {
+          "enum": ["pending", "ready", "blocked", "unknown"]
+        },
+        "plan_ref": {"$ref": "#/$defs/reference"},
+        "plan_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "environmentBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "baseline_id",
+        "revision",
+        "created_at",
+        "supersedes",
+        "runtime_config",
+        "case_inventory",
+        "target",
+        "access_policy",
+        "route",
+        "software_constraints",
+        "profiles",
+        "secret_roles",
+        "clock_policy",
+        "retention_seconds",
+        "resource_policy",
+        "owner_review_ref"
+      ],
+      "properties": {
+        "document_type": {"const": "environment-baseline"},
+        "schema_version": {"const": 1},
+        "baseline_id": {"$ref": "#/$defs/nonEmpty"},
+        "revision": {"type": "integer", "minimum": 1},
+        "created_at": {"type": "string", "format": "date-time"},
+        "supersedes": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/baselinePointer"}
+          ]
+        },
+        "runtime_config": {"$ref": "#/$defs/hashReference"},
+        "case_inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "artifact_ref", "case_ids"],
+          "properties": {
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "artifact_ref": {"$ref": "#/$defs/reference"},
+            "case_ids": {
+              "$ref": "#/$defs/requiredCaseIds"
+            }
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tailscale_node_id", "dns_name", "os_account"],
+          "properties": {
+            "tailscale_node_id": {"$ref": "#/$defs/nonEmpty"},
+            "dns_name": {"$ref": "#/$defs/nonEmpty"},
+            "ip_address": {
+              "anyOf": [
+                {"type": "string", "format": "ipv4"},
+                {"type": "string", "format": "ipv6"}
+              ]
+            },
+            "os_account": {"$ref": "#/$defs/nonEmpty"}
+          }
+        },
+        "access_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["caller_principals", "ssh_acl_attestation", "operator_scope_ref"],
+          "properties": {
+            "caller_principals": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/nonEmpty"}
+            },
+            "ssh_acl_attestation": {"$ref": "#/$defs/hashReference"},
+            "operator_scope_ref": {"$ref": "#/$defs/reference"}
+          }
+        },
+        "route": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "route_id",
+            "configuration_sha256",
+            "public_origin",
+            "forwarded_header_contract_sha256",
+            "owner_attestation_ref"
+          ],
+          "properties": {
+            "route_id": {"$ref": "#/$defs/nonEmpty"},
+            "configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "public_origin": {"type": "string", "format": "uri"},
+            "forwarded_header_contract_sha256": {"$ref": "#/$defs/sha256"},
+            "owner_attestation_ref": {"$ref": "#/$defs/reference"},
+            "listener_bindings": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/nonEmpty"}
+            },
+            "tls_policy_ref": {"$ref": "#/$defs/reference"}
+          }
+        },
+        "software_constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["keycloak_source_ref", "rp_fixture_source_ref", "realm_config_sha256", "oidc_client_config_sha256"],
+          "properties": {
+            "keycloak_source_ref": {"$ref": "#/$defs/reference"},
+            "rp_fixture_source_ref": {"$ref": "#/$defs/reference"},
+            "realm_config_sha256": {"$ref": "#/$defs/sha256"},
+            "oidc_client_config_sha256": {"$ref": "#/$defs/sha256"},
+            "browser_version": {"$ref": "#/$defs/nonEmpty"},
+            "wallet_package_name": {"$ref": "#/$defs/nonEmpty"},
+            "wallet_signer_sha256": {"$ref": "#/$defs/sha256"},
+            "android_target": {"$ref": "#/$defs/nonEmpty"}
+          }
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["readiness", "qualification"],
+          "properties": {
+            "readiness": {"$ref": "#/$defs/profilePlan"},
+            "qualification": {"$ref": "#/$defs/profilePlan"}
+          }
+        },
+        "secret_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "custodian"],
+            "properties": {
+              "role": {"$ref": "#/$defs/nonEmpty"},
+              "custodian": {"$ref": "#/$defs/nonEmpty"}
+            }
+          }
+        },
+        "clock_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "require_os_sync", "max_drift_seconds"],
+          "properties": {
+            "source": {"const": "host-os-utc"},
+            "require_os_sync": {"const": true},
+            "max_drift_seconds": {"type": "integer", "minimum": 0}
+          }
+        },
+        "retention_seconds": {"type": "integer", "minimum": 1},
+        "resource_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fresh_disposable_identity", "teardown_policy"],
+          "properties": {
+            "fresh_disposable_identity": {"const": true},
+            "teardown_policy": {"$ref": "#/$defs/hashReference"}
+          }
+        },
+        "owner_review_ref": {"$ref": "#/$defs/reference"}
+      }
+    },
+    "caseInventoryProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_type", "schema_version", "canonicalization", "source_issue", "case_ids", "cases"],
+      "properties": {
+        "document_type": {"const": "case-inventory-projection"},
+        "schema_version": {"const": 1},
+        "canonicalization": {"const": "RFC8785-JCS-UTF8-no-BOM-no-trailing-newline"},
+        "source_issue": {"$ref": "#/$defs/sourceIssue"},
+        "case_ids": {"$ref": "#/$defs/requiredCaseIds"},
+        "cases": {"$ref": "#/$defs/casesById"}
+      }
+    },
+    "caseProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition_projection", "expected_observations"],
+      "properties": {
+        "definition_projection": {"$ref": "#/$defs/nonEmpty"},
+        "expected_observations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/nonEmpty"}
+        }
+      }
+    },
+    "casesById": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "LOGIN-01",
+        "TLS-01",
+        "TLS-02",
+        "NEG-01",
+        "NEG-02",
+        "NEG-03",
+        "NEG-04",
+        "NEG-05",
+        "NEG-06",
+        "NEG-07"
+      ],
+      "properties": {
+        "LOGIN-01": {"$ref": "#/$defs/caseProjection"},
+        "TLS-01": {"$ref": "#/$defs/caseProjection"},
+        "TLS-02": {"$ref": "#/$defs/caseProjection"},
+        "NEG-01": {"$ref": "#/$defs/caseProjection"},
+        "NEG-02": {"$ref": "#/$defs/caseProjection"},
+        "NEG-03": {"$ref": "#/$defs/caseProjection"},
+        "NEG-04": {"$ref": "#/$defs/caseProjection"},
+        "NEG-05": {"$ref": "#/$defs/caseProjection"},
+        "NEG-06": {"$ref": "#/$defs/caseProjection"},
+        "NEG-07": {"$ref": "#/$defs/caseProjection"}
+      }
+    },
+    "runIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "run_id",
+        "created_at",
+        "profile",
+        "baseline",
+        "runtime_config_sha256",
+        "case_inventory_sha256",
+        "local_receipts",
+        "source_identity",
+        "observer",
+        "images",
+        "target",
+        "operations",
+        "case_ids",
+        "operators",
+        "disposable_handles",
+        "route_bindings",
+        "windows"
+      ],
+      "properties": {
+        "document_type": {"const": "run-intent"},
+        "schema_version": {"const": 1},
+        "run_id": {"$ref": "#/$defs/nonEmpty"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "profile": {"enum": ["readiness", "qualification"]},
+        "baseline": {"$ref": "#/$defs/baselinePointer"},
+        "runtime_config_sha256": {"$ref": "#/$defs/sha256"},
+        "case_inventory_sha256": {"$ref": "#/$defs/sha256"},
+        "local_receipts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["build", "test"],
+          "properties": {
+            "build": {"$ref": "#/$defs/hashReference"},
+            "test": {"$ref": "#/$defs/hashReference"}
+          }
+        },
+        "source_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "commit", "worktree_state", "source_bundle", "image_source_sha256", "keycloakctl_build_sha256"],
+          "properties": {
+            "repository": {"$ref": "#/$defs/nonEmpty"},
+            "commit": {"$ref": "#/$defs/nonEmpty"},
+            "worktree_state": {"enum": ["clean", "dirty"]},
+            "source_bundle": {"$ref": "#/$defs/hashReference"},
+            "image_source_sha256": {"$ref": "#/$defs/sha256"},
+            "keycloakctl_build_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "observer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "sha256"],
+          "properties": {
+            "version": {"$ref": "#/$defs/nonEmpty"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["keycloak", "rp_fixture"],
+          "properties": {
+            "keycloak": {"$ref": "#/$defs/imageDigest"},
+            "rp_fixture": {"$ref": "#/$defs/imageDigest"}
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tailscale_node_id", "dns_name", "os_account"],
+          "properties": {
+            "tailscale_node_id": {"$ref": "#/$defs/nonEmpty"},
+            "dns_name": {"$ref": "#/$defs/nonEmpty"},
+            "ip_address": {
+              "anyOf": [
+                {"type": "string", "format": "ipv4"},
+                {"type": "string", "format": "ipv6"}
+              ]
+            },
+            "os_account": {"$ref": "#/$defs/nonEmpty"}
+          }
+        },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonEmpty"}
+        },
+        "case_ids": {
+          "$ref": "#/$defs/caseIdList"
+        },
+        "operators": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonEmpty"}
+        },
+        "disposable_handles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonEmpty"}
+        },
+        "route_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonEmpty"}
+        },
+        "windows": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["normal", "cleanup_grace"],
+          "properties": {
+            "normal": {"$ref": "#/$defs/timeWindow"},
+            "cleanup_grace": {"$ref": "#/$defs/timeWindow"}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"profile": {"const": "readiness"}}},
+          "then": {"properties": {"case_ids": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"profile": {"const": "qualification"}}},
+          "then": {"properties": {"case_ids": {"$ref": "#/$defs/requiredCaseIds"}}}
+        }
+      ]
+    },
+    "imageDigest": {
+      "oneOf": [
+        {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"}
+      ]
+    },
+    "timeWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["starts_at", "ends_at"],
+      "properties": {
+        "starts_at": {"type": "string", "format": "date-time"},
+        "ends_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "lifecycleEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "schema_version",
+        "event_id",
+        "artifact_type",
+        "artifact_sha256",
+        "event",
+        "recorded_at",
+        "actor",
+        "reason",
+        "previous_event_sha256"
+      ],
+      "properties": {
+        "document_type": {"const": "lifecycle-event"},
+        "schema_version": {"const": 1},
+        "event_id": {"$ref": "#/$defs/nonEmpty"},
+        "artifact_type": {"enum": ["environment-baseline", "run-approval"]},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "event": {"enum": ["activated", "superseded", "revoked", "expired"]},
+        "recorded_at": {"type": "string", "format": "date-time"},
+        "actor": {"$ref": "#/$defs/nonEmpty"},
+        "reason": {"$ref": "#/$defs/nonEmpty"},
+        "previous_event_sha256": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/sha256"}
+          ]
+        },
+        "replacement_artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "owner_record_ref": {"$ref": "#/$defs/reference"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"event": {"const": "superseded"}}},
+          "then": {"required": ["replacement_artifact_sha256"]}
+        }
+      ]
+    }
+  }
+}
