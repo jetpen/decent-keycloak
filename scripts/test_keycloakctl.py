@@ -345,7 +345,8 @@ class FullLocalOnlyTest(unittest.TestCase):
         (root / ".gitignore").write_text("target/\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
-        subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=test@example.invalid",
+                        "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
         state = keycloakctl_cli.create_run(config, config_raw=config_raw)
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
                  "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
@@ -413,7 +414,8 @@ class FullLocalOnlyTest(unittest.TestCase):
         (root / ".gitignore").write_text("target/\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
-        subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=test@example.invalid",
+                        "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
         state = keycloakctl_cli.create_run(config, config_raw=config_raw)
         build_record = {"version": 1, "run_id": state["run_id"], "status": "complete",
                         "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
