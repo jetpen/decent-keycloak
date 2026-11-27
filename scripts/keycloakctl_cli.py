@@ -1150,26 +1150,46 @@ def make_parser() -> Parser:
   historical_plans = "\n".join(
       f"  {profile}: {' -> '.join(PLANS[profile])}" for profile in LIVE_PROFILES)
   help_text = f"""\
-Profiles: dev and ci are local. `full` accepts only these profiles and performs
-local preflight, build, test, and seals a local run-intent receipt. It has no
-live-operation flag and cannot contact or mutate a remote target.
+Profiles: dev and ci are local; readiness and qualification are remote-live
+profiles currently deferred/unavailable in this candidate. `setup` accepts all
+four profiles; `full` accepts only dev and ci. `full --new-run` allocates a new,
+unique run ID; `full --run-id RUN_ID` resumes only that existing run. Both forms
+run local preflight, build, test, seal local run-intent, and stop before remote
+mutations. `full` has no live-operation flag.
 {local_plans}
 
 Historical, deferred profile plans (not supported by this candidate):
 {historical_plans}
 
-Issue #74 remains incomplete; remote lifecycle, qualification, and publication
-are deferred. The offline acceptance profile runs provider and RP fixture image
-builds/smokes, retains local images, and records cleanup as not run. Legacy
-`--allow-live` is not owner approval.
+Remote-live commands are `publish`, `deploy`, `configure`, `integration-test`,
+`verify readiness`, `verify qualification`, and `teardown`. For every such
+invocation the operator must verify current owner approval out of band, bound
+to the exact artifact hashes, target, operations/cases, and windows. `--allow-live`
+is an additional per-invocation guard, not approval. A hash or reference is not
+authentication. This candidate does not implement those remote operations.
+`promote` is a separate existing publication gate using `--allow-publish`, not
+the environment owner-approval gate; promotion is unavailable in this candidate.
+
+The offline acceptance profile runs provider and RP fixture image builds/smokes,
+retains local images, and records cleanup as not run.
+Issue #74 remains incomplete.
+No remote or live operation is authorized by this CLI help.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
+  authorization_help = (" Remote-live work is deferred here. Before each invocation, the operator must "
+                        "verify current owner approval out of band, bound to the exact artifact hashes, target, "
+                        "operations/cases, and windows; `--allow-live` is an additional guard for each "
+                        "invocation, not approval. A hash or reference is not authentication.")
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
                   "validate-artifacts": "validate adopted-design baseline/projection artifacts offline",
                   "acceptance": "run local acceptance stages and write a durable receipt",
-                  **PHASE_HELP, "full": "run local preflight/build/test and seal a local run intent"}
+                  **{name: description + (authorization_help if name in LIVE_PHASES or name == "verify" else "")
+                     for name, description in PHASE_HELP.items()},
+                  "full": "run local preflight/build/test, seal local run-intent, and stop before remote mutations"}
+  descriptions["promote"] = PHASE_HELP["promote"] + (
+      "; a separate existing publication gate requiring --allow-publish, not environment owner approval")
   for name, description in descriptions.items():
     command = commands.add_parser(name, help=description, description=description, allow_abbrev=False)
     if name not in ("acceptance", "validate-artifacts"):

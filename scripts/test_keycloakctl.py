@@ -1292,6 +1292,46 @@ with patch.object(cli, 'ROOT', root), \
     self.assertNotIn("runtime/isolated-test lock remains blocked", migration_map)
     self.assertNotIn("isolated canonical test path do not have it", migration_map)
 
+  def test_public_help_spells_out_command_and_authorization_contract(self):
+    top = self.cli("--help")
+    self.assertEqual(0, top.returncode, top.stderr)
+    for verb in ("setup", "validate-config", "validate-artifacts", "acceptance", "preflight", "build",
+                 "test", "publish", "deploy", "configure", "integration-test", "verify readiness",
+                 "verify qualification", "teardown", "promote", "full", "image-fingerprints", "images"):
+      with self.subTest(verb=verb):
+        self.assertIn(verb, top.stdout)
+    top_text = " ".join(top.stdout.split())
+    for text in ("Profiles: dev and ci are local", "readiness", "qualification", "full --new-run",
+                 "full --run-id RUN_ID", "For every such invocation the operator must verify current owner approval out of band",
+                 "exact artifact hashes, target, operations/cases, and windows",
+                 "`--allow-live` is an additional guard for each invocation, not approval",
+                 "A hash or reference is not authentication", "stop before remote mutations",
+                 "promote` is a separate existing publication gate using `--allow-publish`"):
+      with self.subTest(text=text):
+        self.assertIn(text, top_text)
+
+    for command in ("publish", "deploy", "configure", "integration-test", "teardown",
+                    "verify readiness", "verify qualification"):
+      result = self.cli(*command.split(), "--help")
+      help_text = " ".join(result.stdout.split())
+      with self.subTest(command=command):
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("current owner approval out of band", help_text)
+        self.assertIn("exact artifact hashes, target, operations/cases, and windows", help_text)
+        self.assertIn("`--allow-live` is an additional guard for each invocation, not approval", help_text)
+        self.assertIn("hash or reference is not authentication", help_text)
+    full = self.cli("full", "--help")
+    full_text = " ".join(full.stdout.split())
+    self.assertEqual(0, full.returncode, full.stderr)
+    self.assertIn("--new-run", full_text)
+    self.assertIn("--run-id RUN_ID", full_text)
+    self.assertIn("stop before remote mutations", full_text)
+    promote = self.cli("promote", "--help")
+    promote_text = " ".join(promote.stdout.split())
+    self.assertEqual(0, promote.returncode, promote.stderr)
+    self.assertIn("--allow-publish", promote_text)
+    self.assertIn("not environment owner approval", promote_text)
+
   def test_cli_help_labels_deferred_profile_plans_as_historical(self):
     result = self.cli("--help")
     self.assertEqual(0, result.returncode, result.stderr)
@@ -1303,8 +1343,7 @@ with patch.object(cli, 'ROOT', root), \
     for command in ("publish", "deploy", "configure", "integration-test", "verify", "teardown"):
       with self.subTest(command=command):
         self.assertIn(f"{command:<19} deferred/unavailable:", result.stdout)
-    self.assertIn("promote             deferred; publication is unavailable in this candidate",
-                  result.stdout)
+    self.assertIn("promote             deferred; publication is unavailable", result.stdout)
 
   def test_local_setup_docs_pin_required_python_patch_version(self):
     docs = (ROOT / "docs/acceptance/keycloakctl-foundation.md").read_text(encoding="utf-8")
