@@ -1177,6 +1177,7 @@ class KeycloakctlTest(unittest.TestCase):
   def test_acceptance_offline_profile_receipt_is_the_stage_inventory(self):
     # Assert the coordinator's real receipt, not a parallel helper's partial list.
     # Exercise argparse, the real coordinator and receipt writer; mock external stages.
+    receipt_marker = "issue74-receipt-env-marker-5e901a82d14f"
     code = """import json
 from pathlib import Path
 from unittest.mock import patch
@@ -1203,11 +1204,15 @@ with patch.object(cli, 'ROOT', root), \
   raise SystemExit(cli.main(['acceptance','--profile','offline']))
 """ % str(ROOT / "config/keycloakctl")
     result = subprocess.run([sys.executable, "-c", code], cwd=self.cwd,
-                            env={**self.env, "PYTHONPATH": str(ROOT)},
+                            env={**self.env, "PYTHONPATH": str(ROOT),
+                                 "KEYCLOAKCTL_TEST_SECRET": receipt_marker},
                             capture_output=True, text=True, timeout=10)
     self.assertEqual(0, result.returncode, result.stderr)
+    self.assertNotIn(receipt_marker, result.stdout)
+    self.assertNotIn(receipt_marker, result.stderr)
     self.assertIn("acceptance verified:", result.stdout)
     receipt_path = Path(result.stdout.strip().splitlines()[-1].removeprefix("acceptance verified: "))
+    self.assertNotIn(receipt_marker.encode(), receipt_path.read_bytes())
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     self.assertEqual("offline", receipt["profile"])
     self.assertEqual("complete", receipt["status"])
@@ -1648,6 +1653,29 @@ raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
                          (result.returncode, result.stdout, result.stderr))
     self.assertEqual({first, second}, {path.name for path in manifest.parent.parent.iterdir()})
     self.assertFalse((self.cwd / "outside").exists())
+
+  def test_valid_remote_setup_does_not_leak_accepted_config_sentinel_to_state_or_output(self):
+    for profile in ("readiness", "qualification"):
+      with self.subTest(profile=profile):
+        # This sentinel is a sink canary in an accepted non-secret config value,
+        # not a claimed credential field or a test of credential-provider integration.
+        sentinel = f"canary-{profile[:3]}-7f93c4b06c21"
+        config = json.loads((ROOT / f"config/keycloakctl/{profile}.json").read_text(
+            encoding="utf-8"))
+        config["remote"]["target_user"] = sentinel
+        config_path = self.config_file(config)
+
+        result = self.cli("setup", "--config", config_path)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertRegex(result.stdout, r"\A[0-9a-f]{32}\n\Z")
+        self.assertNotIn(sentinel, result.stdout)
+        self.assertNotIn(sentinel, result.stderr)
+
+        for state_root in (self.repo / "target", self.repo / ".keycloakctl"):
+          self.assertTrue(state_root.exists(), f"setup should create {state_root.name} state")
+          for path in state_root.rglob("*"):
+            if path.is_file():
+              self.assertNotIn(sentinel.encode(), path.read_bytes())
 
   def test_target_cleanup_removes_run_state_but_keeps_reservation(self):
     config_path = self.config_file(self.live_config(profile="readiness"))
