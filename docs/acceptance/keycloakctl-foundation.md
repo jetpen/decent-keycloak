@@ -30,9 +30,12 @@ dev_id=$(./keycloakctl setup --profile dev --config config/keycloakctl/dev.json)
 # Fetches locked prerequisites on the host; `--network=none` disables build-step networking, not base-image acquisition.
 ./keycloakctl build --run-id "$dev_id" --config config/keycloakctl/dev.json
 ./keycloakctl test --run-id "$dev_id" --config config/keycloakctl/dev.json
-./keycloakctl full --profile dev --new-run --config config/keycloakctl/dev.json
+# Set these to the access-controlled baseline/projection files supplied for this run.
+: "${BASELINE_FILE:?set to the access-controlled baseline JSON}"
+: "${PROJECTION_FILE:?set to the access-controlled case projection JSON}"
+./keycloakctl full --profile dev --new-run --config config/keycloakctl/dev.json --baseline "$BASELINE_FILE" --projection "$PROJECTION_FILE"
 # Set full_id to the ID printed by full --new-run.
-./keycloakctl full --profile dev --run-id "$full_id" --config config/keycloakctl/dev.json
+./keycloakctl full --profile dev --run-id "$full_id" --config config/keycloakctl/dev.json --baseline "$BASELINE_FILE" --projection "$PROJECTION_FILE"
 ```
 
 Use the ID printed by the corresponding setup or `full --new-run`. `setup` with
