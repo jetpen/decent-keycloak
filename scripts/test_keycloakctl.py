@@ -2607,6 +2607,37 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     self.assertFalse((self.repo / "target").exists())
     self.assertFalse((self.repo / ".keycloakctl").exists())
 
+  def test_public_setup_rejects_sensitive_unknown_fields_before_state_or_output(self):
+    examples = {profile: json.loads((self.repo / f"config/keycloakctl/{profile}.json").read_text())
+                for profile in ("dev", "ci", "readiness", "qualification")}
+    cases = []
+    for profile, example in examples.items():
+      cases.append((profile, "top-level", {**example, "password": f"marker-{profile}-password-8ce7"}))
+      cases.append((profile, "top-level", {**example, "client_secret": f"marker-{profile}-client-secret-a934"}))
+      if "remote" in example:
+        cases.append((profile, "nested", {**example, "remote": {
+            **example["remote"], "token": f"marker-{profile}-remote-token-53d1"}}))
+        cases.append((profile, "nested", {**example, "remote": {
+            **example["remote"], "api_key": f"marker-{profile}-remote-api-key-731c"}}))
+
+    for profile, field_group, config in cases:
+      with self.subTest(profile=profile, field_group=field_group, keys=set(config)):
+        marker_values = [value for key, value in config.items()
+                         if key in ("password", "client_secret")]
+        marker_values += [value for key, value in config.get("remote", {}).items()
+                          if key in ("token", "api_key")]
+        result = self.cli("setup", "--config", self.config_file(config))
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("error: invalid configuration\n", result.stderr)
+        for marker in marker_values:
+          self.assertNotIn(marker, result.stdout + result.stderr)
+        self.assertFalse((self.repo / "target/keycloakctl/runs").exists())
+        self.assertFalse((self.repo / "target/keycloakctl/acceptance").exists())
+        self.assertFalse((self.repo / ".keycloakctl/run-ids").exists())
+        self.assertFalse((self.repo / "target").exists())
+        self.assertFalse((self.repo / ".keycloakctl").exists())
+
   def test_remote_preflight_rejects_missing_or_placeholder_operator_inputs(self):
     config = self.live_config()
     for remote in ({}, {**config["remote"], "route_attested": False},
