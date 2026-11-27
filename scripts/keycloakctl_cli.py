@@ -43,16 +43,16 @@ IMAGE_FINGERPRINT_TARGETS = (
   "runtime",
 )
 PHASE_HELP = {
-  "preflight": "check local toolchain/engine or remote target prerequisites without changes",
+  "preflight": "check local toolchain/engine prerequisites; remote target checks are deferred",
   "build": "package the provider, fetch and verify locked resolver inputs, then build the provider and test RP images",
   "test": "run acceptance checks and image smokes; Python checks fetch pinned prerequisites",
-  "publish": "transfer exact run images over Tailscale SSH, not to a registry",
-  "deploy": "start exact run-owned services",
-  "configure": "configure the run's isolated realm and test RP",
-  "integration-test": "execute the qualification cases after the manual Android checkpoint",
-  "verify": "verify readiness or qualification; the outputs are not interchangeable",
-  "teardown": "remove only exact run-owned deployment resources",
-  "promote": "publish a separately authorized, verified image to a registry",
+  "publish": "deferred/unavailable: remote image transfer is not supported by this candidate",
+  "deploy": "deferred/unavailable: remote services are not started by this candidate",
+  "configure": "deferred/unavailable: remote realm and test RP setup is not supported",
+  "integration-test": "deferred/unavailable: qualification cases are not run by this candidate",
+  "verify": "deferred/unavailable: readiness and qualification are not verified by this candidate",
+  "teardown": "deferred/unavailable: remote deployment resources are not removed by this candidate",
+  "promote": "deferred; publication is unavailable in this candidate",
 }
 
 
@@ -160,13 +160,18 @@ def validate_config(value, profile: str | None) -> None:
       raise ValueError
 
 
-def load_config(path: str, profile: str | None) -> dict:
+def load_config_source(path: str, profile: str | None) -> tuple[dict, bytes]:
   try:
-    value = parse_json(read_regular(path))
+    raw = read_regular(path)
+    value = parse_json(raw)
     validate_config(value, profile)
-    return value
+    return value, raw
   except (OSError, ValueError, RecursionError):
     raise Rejected("invalid configuration") from None
+
+
+def load_config(path: str, profile: str | None) -> dict:
+  return load_config_source(path, profile)[0]
 
 
 def canonical_json(value: dict) -> bytes:
@@ -232,10 +237,11 @@ def read_run(run_id: str) -> dict:
     raise Rejected("run readback conflict") from None
 
 
-def create_run(config: dict) -> dict:
+def create_run(config: dict, *, config_raw: bytes | None = None) -> dict:
   run_id = uuid4().hex
+  config_bytes = canonical_json(config) if config_raw is None else config_raw
   state = {"version": 1, "run_id": run_id, "profile": config["profile"],
-           "config_sha256": sha256(canonical_json(config)).hexdigest(), "completed": ["setup"]}
+           "config_sha256": sha256(config_bytes).hexdigest(), "completed": ["setup"]}
   raw = canonical_json(state)
   try:
     # Reserve first, outside Maven's target directory. Never remove a claim,
@@ -262,18 +268,29 @@ def checked_run(args) -> tuple[dict, dict | None]:
   profile = getattr(args, "profile", None)
   if profile is not None and profile != state["profile"]:
     raise Rejected("run profile does not match")
-  config = load_config(args.config, state["profile"]) if args.config is not None else None
-  if config is not None and sha256(canonical_json(config)).hexdigest() != state["config_sha256"]:
-    raise Rejected("run configuration readback conflict")
+  config = None
+  if args.config is not None:
+    if getattr(args, "command", None) == "full":
+      config, config_raw = load_config_source(args.config, state["profile"])
+      config_digest = sha256(config_raw).hexdigest()
+    else:
+      config = load_config(args.config, state["profile"])
+      config_digest = sha256(canonical_json(config)).hexdigest()
+    if config_digest != state["config_sha256"]:
+      raise Rejected("run configuration readback conflict")
   return state, config
 
 
 def new_run(args) -> tuple[dict, dict]:
+  config_raw = None
   if args.config is not None:
-    config = load_config(args.config, args.profile)
+    config, config_raw = load_config_source(args.config, args.profile)
   else:
     profile = args.profile or "dev"
     config = {"version": 1, "profile": profile, "engine": "docker" if profile == "ci" else "podman"}
+    config_raw = canonical_json(config)
+  if getattr(args, "command", None) == "full":
+    return create_run(config, config_raw=config_raw), config
   return create_run(config), config
 
 
@@ -1022,17 +1039,14 @@ def perform_test(state: dict, config: dict | None) -> None:
     raise Unavailable("provider image smoke failed")
 
   fixture_image_id = records["rp-fixture"]["image_id"]
-  fixture_smoke_command = [engine, "run", "--rm", "--network=none", "--entrypoint",
-      "python3.11", fixture_image_id, "-c",
-      "import sys; sys.path.insert(0, '/opt/rp-fixture'); "
-      "import oidc_rp_fixture; print('RP fixture import ok')"]
+  fixture_smoke_command = [engine, "run", "--rm", "--network=none", fixture_image_id, "--smoke"]
   try:
     fixture_smoke = subprocess.run(fixture_smoke_command, cwd=ROOT, capture_output=True,
         text=True, check=False, timeout=120)
   except (OSError, subprocess.TimeoutExpired):
     record_test_failure(state, "rp-fixture-smoke")
     raise Unavailable("RP fixture image smoke failed") from None
-  if fixture_smoke.returncode or fixture_smoke.stdout.strip() != "RP fixture import ok":
+  if fixture_smoke.returncode or fixture_smoke.stdout.strip() != "RP fixture smoke passed":
     record_test_failure(state, "rp-fixture-smoke")
     raise Unavailable("RP fixture image smoke failed")
 
@@ -1068,43 +1082,40 @@ def perform_test(state: dict, config: dict | None) -> None:
 
 
 def make_parser() -> Parser:
-  help_text = """\
-Profiles: dev and ci are local. Readiness is non-qualifying; qualification
-is the separate 10-case path with a manual Android evidence checkpoint.
-""" + "\n".join(f"  {profile}: {' -> '.join(plan)}" for profile, plan in PLANS.items()) + """
-  Qualification teardown is explicit, not part of full.
+  local_plans = "\n".join(
+      f"  {profile}: {' -> '.join(PLANS[profile])}" for profile in LOCAL_PROFILES)
+  historical_plans = "\n".join(
+      f"  {profile}: {' -> '.join(PLANS[profile])}" for profile in LIVE_PROFILES)
+  help_text = f"""\
+Profiles: dev and ci are local. `full` accepts only these profiles and performs
+local preflight, build, test, and seals a local run-intent receipt. It has no
+live-operation flag and cannot contact or mutate a remote target.
+{local_plans}
 
-setup creates a new non-reusable ID unless --run-id reopens it. Other phases
-require --run-id (32 lowercase hex digits). full --profile readiness|qualification
-requires exactly one of --new-run or --run-id; resume never selects another run.
+Historical, deferred profile plans (not supported by this candidate):
+{historical_plans}
 
-Use --allow-live on each live invocation (publish, deploy, configure,
-integration-test, verify readiness, teardown, and full at a live step).
-verify qualification checks same-run evidence; promote requires --allow-publish
-and an explicit --destination, separately from publish. These flags do not
-replace scoped human approval. Preflight is repeatable and read-only: local
-profiles check the host toolchain and selected local engine, while live profiles
-check the configured remote target; no deployment or qualification phase is
-implemented here.
-
-The `acceptance --profile offline` command runs local preflight, repository suites, provider and RP fixture image builds/smokes, whitespace checks, and writes a sanitized source-bound receipt. It retains its built local images and records cleanup as `not_run`; image retention cleanup is separate and explicit via `keycloakctl images cleanup`. CI invokes this same profile. The RP smoke imports the fixture module; it does not start a relying-party server or browser flow. Live qualification, remote host lifecycle, and publication remain separate and gated.
+Issue #74 remains incomplete; remote lifecycle, qualification, and publication
+are deferred. The offline acceptance profile runs provider and RP fixture image
+builds/smokes, retains local images, and records cleanup as not run. Legacy
+`--allow-live` is not owner approval.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
                   "acceptance": "run local acceptance stages and write a durable receipt",
-                  **PHASE_HELP, "full": "create or resume one readiness or qualification run"}
+                  **PHASE_HELP, "full": "run local preflight/build/test and seal a local run intent"}
   for name, description in descriptions.items():
     command = commands.add_parser(name, help=description, description=description, allow_abbrev=False)
     if name != "acceptance":
-      command.add_argument("--config", required=name == "validate-config", metavar="FILE",
+      command.add_argument("--config", required=name in ("validate-config", "full"), metavar="FILE",
                            help="non-secret JSON file, relative to the caller if not absolute")
     if name == "acceptance":
       command.add_argument("--profile", choices=("offline",), required=True)
     elif name in ("setup", "validate-config", "full"):
       profile_choices = config_fields()["profile"]["enum"] if name == "validate-config" else (
-          LIVE_PROFILES if name == "full" else PROFILES)
+          LOCAL_PROFILES if name == "full" else PROFILES)
       command.add_argument("--profile", choices=profile_choices,
                            required=name == "full")
     if name == "full":
@@ -1113,7 +1124,7 @@ The `acceptance --profile offline` command runs local preflight, repository suit
       selection.add_argument("--run-id")
     elif name not in ("validate-config", "acceptance"):
       command.add_argument("--run-id", required=name not in ("setup", "promote"))
-    if name in LIVE_PHASES or name in ("verify", "full"):
+    if name in LIVE_PHASES or name == "verify":
       command.add_argument("--allow-live", action="store_true", help="required on each live invocation")
     if name == "verify":
       command.add_argument("scope", choices=LIVE_PROFILES)
@@ -1421,6 +1432,60 @@ def run_image_lifecycle(args: argparse.Namespace) -> int:
     return 2
 
 
+def validate_run_intent_inputs(config: dict, profile: str, *, config_raw: bytes) -> None:
+  """Validate the exact local configuration bytes before full starts work."""
+  parsed = parse_json(config_raw)
+  if type(parsed) is not dict or parsed != config or parsed.get("profile") != profile:
+    raise ValueError("run intent configuration mismatch")
+  if type(parsed.get("version")) is not int or parsed["version"] != 1:
+    raise ValueError("run intent configuration version invalid")
+
+
+def validate_full_intent_input_selection(args: argparse.Namespace, state: dict,
+    config: dict, *, config_raw: bytes) -> None:
+  """Validate selected local run inputs before preflight/build/test side effects."""
+  if state["profile"] not in LOCAL_PROFILES or args.profile != state["profile"]:
+    raise Rejected("full supports only local profiles")
+  if sha256(config_raw).hexdigest() != state["config_sha256"]:
+    raise Rejected("run configuration readback conflict")
+  try:
+    validate_run_intent_inputs(config, state["profile"], config_raw=config_raw)
+  except (UnicodeError, ValueError, TypeError, RecursionError):
+    raise Rejected("run-intent inputs or bindings invalid") from None
+
+
+def seal_local_run_intent(state: dict) -> None:
+  """Bind the local-only full run to its verified build and test receipts."""
+  bundle = read_build_bundle(state)
+  if bundle is None:
+    raise Rejected("verified local build required before run-intent")
+  test_receipt = read_test_receipt(state, bundle)
+  if test_receipt is None:
+    raise Rejected("verified local test required before run-intent")
+  intent = {
+      "version": 1,
+      "run_id": state["run_id"],
+      "profile": state["profile"],
+      "config_sha256": state["config_sha256"],
+      "build_sha256": sha256(canonical_json(bundle)).hexdigest(),
+      "test_source_sha256": test_receipt["test_source_sha256"],
+      "status": "verified",
+      "scope": "local-only",
+  }
+  raw = canonical_json(intent)
+  try:
+    with open_directory((*RUNS, state["run_id"])) as directory:
+      try:
+        write_exclusive(directory, "run-intent.json", raw)
+      except FileExistsError:
+        if read_regular("run-intent.json", dir_fd=directory) != raw:
+          raise Rejected("run-intent readback conflict") from None
+      if read_regular("run-intent.json", dir_fd=directory) != raw:
+        raise Rejected("run-intent readback conflict")
+  except OSError:
+    raise Rejected("run-intent storage unavailable") from None
+
+
 def main(argv: list[str] | None = None) -> int:
   parser = make_parser()
   args = parser.parse_args(argv)
@@ -1439,13 +1504,19 @@ def main(argv: list[str] | None = None) -> int:
       print(state["run_id"])
     elif args.command == "full":
       state, config = new_run(args) if args.new_run else checked_run(args)
+      if state["profile"] not in LOCAL_PROFILES:
+        raise Rejected("full supports only local profiles")
       if args.new_run:
         print(state["run_id"], flush=True)
-      phase = next_phase(state)
-      if phase is None:
-        raise Rejected("run has no pending phases")
-      authorize(phase, args)
-      attempt_phase(phase, state, config)
+      if config is None:
+        raise Rejected("full requires --config")
+      config, config_raw = load_config_source(args.config, state["profile"])
+      validate_full_intent_input_selection(args, state, config, config_raw=config_raw)
+      perform_local_preflight(config, state["profile"])
+      perform_build(state, config)
+      perform_test(state, config)
+      seal_local_run_intent(state)
+      print("full verified; local run-intent sealed; no remote operations performed")
     elif args.command == "promote":
       authorize("promote", args)
       raise Unavailable("promote unavailable in the offline foundation")

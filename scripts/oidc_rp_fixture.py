@@ -1,15 +1,18 @@
 """Test-only relying party for offline OIDC Authorization Code + PKCE tests."""
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import re
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
+import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -104,6 +107,19 @@ class RPFixture:
     self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
     self._thread.start()
     return self._server
+
+  def smoke_request(self) -> None:
+    if self._server is None:
+      raise RuntimeError("RP fixture is not running")
+    connection = http.client.HTTPConnection("127.0.0.1", self._server.server_port, timeout=2)
+    try:
+      connection.request("GET", "/not-a-route")
+      response = connection.getresponse()
+      body = response.read(1024)
+      if response.status != 400 or body != b"request rejected":
+        raise RuntimeError("RP fixture startup smoke failed")
+    finally:
+      connection.close()
 
   def close(self):
     if self._server is not None:
@@ -304,4 +320,26 @@ class RPFixture:
     self._sessions = {key: deadline for key, deadline in self._sessions.items() if deadline > now}
 
 
-__all__ = ["FixtureConfig", "RPFixture"]
+def main(argv: list[str] | None = None) -> int:
+  parser = argparse.ArgumentParser(description="Test-only relying-party fixture startup smoke")
+  parser.add_argument("--smoke", action="store_true", required=True,
+                      help="start, probe, and stop a loopback listener without issuer access")
+  args = parser.parse_args(argv)
+  fixture = RPFixture(FixtureConfig("http://127.0.0.1:1/issuer", "local-smoke"))
+  try:
+    fixture.start()
+    fixture.smoke_request()
+  except Exception:
+    print("RP fixture smoke failed", file=sys.stderr)
+    return 1
+  finally:
+    fixture.close()
+  print("RP fixture smoke passed")
+  return 0
+
+
+__all__ = ["FixtureConfig", "RPFixture", "main"]
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

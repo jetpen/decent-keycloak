@@ -1,5 +1,7 @@
 # `keycloakctl` offline foundation
 
+> **Historical foundation reference, not the current Issue #74 CLI contract.** The readiness/qualification examples and remote-phase descriptions below document an earlier mixed-scope design. The current Issue #74 checkpoint is local-only: `full` accepts `dev`/`ci`, runs local preparation/build/test, and seals only a local-only run-intent receipt. It does not implement readiness/qualification phases or the proposed #73 owner-approved qualification intent. See [the current offline/local migration map](issue-74-offline-migration-map.md) for this candidate's contract.
+
 **This PR is an offline-foundation checkpoint for Issue #74, not completion of
 that issue.** It adds the local setup/build/test path and a bounded read-only
 preflight slice. Issue #74 must remain open. Still remaining: complete lifecycle
@@ -14,7 +16,7 @@ its own location, including when invoked outside the checkout. Explicit `--confi
 paths are relative to the caller. [`scripts/lifecycle.py`](../../scripts/lifecycle.py)
 remains for stages not yet migrated. `keycloakctl` provides local setup/build/test and `acceptance` owns the ordered Maven package, Surefire validation, provider-service-registration, Python-test, Python-compile, and diff-check stages used locally and by PR CI. The Surefire report validator is keycloakctl-owned. Acceptance writes a keycloakctl-owned durable receipt; this is partial phase-ownership parity.
 
-The `acceptance --profile offline` command is the shared local/CI entry point. It performs local preflight, Maven/Surefire and canonical Python checks, provider registration, both local image builds and smokes, diff-check, and sanitized source-bound receipt writing. It retains the built local images and records cleanup as `not_run`; image retention cleanup is a separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke only imports the fixture module; it is not an RP server or browser flow. The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. Resolver provenance receipts and live/remote phases remain open; this does not complete Issue #74.
+The `acceptance --profile offline` command is the shared local/CI entry point. It performs local preflight, Maven/Surefire and canonical Python checks, provider registration, both local image builds and smokes, diff-check, and sanitized source-bound receipt writing. It retains the built local images and records cleanup as `not_run`; image retention cleanup is a separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke runs the configured image entrypoint, starts a loopback listener on an ephemeral port, checks a fixed rejection response, and shuts down without issuer access. This is startup evidence, not an RP server/browser flow or qualification. The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. Resolver provenance receipts and live/remote phases remain open; this does not complete Issue #74.
 
 ## Local commands
 
@@ -28,9 +30,9 @@ dev_id=$(./keycloakctl setup --profile dev --config config/keycloakctl/dev.json)
 # Fetches locked prerequisites on the host; `--network=none` disables build-step networking, not base-image acquisition.
 ./keycloakctl build --run-id "$dev_id" --config config/keycloakctl/dev.json
 ./keycloakctl test --run-id "$dev_id" --config config/keycloakctl/dev.json
-./keycloakctl full --profile readiness --new-run --config config/keycloakctl/readiness.json
-# Set readiness_id to the ID printed by full --new-run.
-./keycloakctl full --profile readiness --run-id "$readiness_id" --config config/keycloakctl/readiness.json
+./keycloakctl full --profile dev --new-run --config config/keycloakctl/dev.json
+# Set full_id to the ID printed by full --new-run.
+./keycloakctl full --profile dev --run-id "$full_id" --config config/keycloakctl/dev.json
 ```
 
 Use the ID printed by the corresponding setup or `full --new-run`. `setup` with
@@ -59,16 +61,17 @@ no build artifacts are added to Git. Resolver input fetching and Maven dependenc
 resolution require host network access; the engine may also fetch a missing `FROM`
 image. `--network=none` applies to build steps, not image acquisition.
 
-The local manifest records only the format version, run ID, profile, canonical
-config digest and completed `setup` phase. Its reservation binds the exact manifest
-bytes; missing or conflicting readback is rejected, not repaired, and never releases
-the ID. Verified `build.json` and `test.json` receipts provide the local phase cursor
-without rewriting the reserved manifest. Test evidence binds the test inputs, build
-receipt and provider image ID. This is a local consistency check, not protection
+The run manifest records format version, run ID, profile, config digest and
+completed `setup` phase. For runs created by `setup`, the digest is over canonical
+JSON; local-only `full --new-run` binds the exact supplied config bytes instead.
+Resume that `full` run with byte-identical config, including whitespace and member
+order, or start a new run. Reservations bind the exact manifest bytes; missing or
+conflicting readback is rejected, not repaired, and never releases the ID. Verified
+`build.json` and `test.json` receipts provide the local phase cursor without
+rewriting the reserved manifest. Test evidence binds test inputs, build receipt,
+config and provider image ID. This is a local consistency check, not protection
 against someone who can rewrite run data. Keep `target/keycloakctl/runs/` and
-`.keycloakctl/run-ids/` intact when preserving a run. Keep the original non-secret config separately and supply it
-for remote-profile `preflight` or `full` resume. Whitespace and member order may
-change; changes to values or members require a new run.
+`.keycloakctl/run-ids/` intact when preserving a run.
 
 [The closed schema](../../config/keycloakctl/config.schema.json) and the four
 examples cover `dev`, `ci`, `readiness`, and `qualification`. Without a config,
@@ -103,6 +106,10 @@ exactly `true`. Probe output is
 not printed, no images are built/pulled/run/removed, no Tailscale command is
 invoked, and no run state is written. Success prints only `preflight passed`.
 
+## Historical live-profile design reference (not implemented by this candidate)
+
+The following live-profile descriptions are retained as design history only. They are not supported by the current CLI: this candidate's `full` command accepts only local `dev`/`ci` profiles, performs local preparation/build/test, and stops with a local-only run-intent receipt. Remote readiness, qualification, publish, deploy, and teardown are deferred.
+
 For live readiness/qualification profiles preflight retains the existing local
 `tailscale version` and `podman --version` checks, then uses `tailscale ssh` with the configured target user and host.
 Tailscale SSH validates the destination host key against the node key advertised
@@ -134,11 +141,10 @@ activity, remain out of scope for this bounded local check.
 `keycloakctl test` runs the offline Java package tests, verifies nonempty passing
 Surefire reports, runs the canonical Python acceptance suite, then compiles the
 lifecycle Python sources. It next checks the provider image's Keycloak 26.8.0 /
-Java 21 version and imports the fixture module from the run-owned RP image, both
-with container networking disabled, then runs `diff-check`. The RP image uses the
-fixture's hash-locked Python dependencies from the verified wheelhouse; this smoke
-does not start an RP server, so service startup and browser flow remain unverified.
-Every stage must pass before a complete version-2 `test.json` is written. The
+Java 21 version and runs the RP fixture image entrypoint with container networking
+disabled. That smoke starts a loopback listener and checks a fixed rejection
+response; it is startup evidence only, not browser or live qualification. The RP image uses the
+fixture's hash-locked Python dependencies from the verified wheelhouse, then runs `diff-check`. Every stage must pass before a complete version-2 `test.json` is written. The
 receipt records the ordered steps and binds completion to the test inputs, build
 receipt, config, and provider image. Each failed stage stops later work and writes
 a durable `failure-*.json` step receipt; a failed attempt does not create
