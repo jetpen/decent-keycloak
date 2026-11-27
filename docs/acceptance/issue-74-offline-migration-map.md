@@ -38,7 +38,7 @@ The validator imports `jsonschema` (with `FormatChecker`) at invocation time. Th
 
 | #74 acceptance criterion | Evidence in this slice | Status |
 |---|---|---|
-| 1. CLI help/verbs/run IDs/auth/order | Adds one public validation verb only; tests exercise it. Existing broader CLI contract unchanged. | Open |
+| 1. CLI help/verbs/run IDs/auth/order | Public executable help names all agreed standalone verbs/scopes and four profiles; documents `full --new-run|--run-id`, readiness/qualification local-only preparation and stop-before-remote behavior, and truthful standalone `preflight` local checks vs existing read-only remote probes. Remote commands require separately verified out-of-band active approval plus the audit-only `--approval-ref REF`/`--approval-sha256 HASH` pair and per-invocation `--allow-live`; references are not authentication, persisted, or echoed. `promote --allow-publish` remains distinct. Existing unknown-config-field and invalid-phase-order assertions remain; remote execution/authentication is unavailable. | Partial (help/validation contract subclaims only) |
 | 2. Former lifecycle migration/legacy removal | None. | Open |
 | 3. Four config profiles/secret exclusion | Validates supplied config against the current closed non-secret schema; no profile-wide qualification. | Open |
 | 4. Full local build/test/image acceptance and CI no-remote-side-effect gates | The `./keycloakctl acceptance --profile offline` profile is the local build/test/image-smoke path; this row remains partial until its exact source-bound receipt and the PR CI side-effect boundary are independently verified. | Partial (offline candidate scope only) |
