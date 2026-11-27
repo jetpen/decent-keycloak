@@ -23,7 +23,8 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_PROFILES = ("dev", "ci")
 LIVE_PROFILES = ("readiness", "qualification")
-PROFILES = (*LOCAL_PROFILES, *LIVE_PROFILES)
+FULL_PROFILES = (*LOCAL_PROFILES, *LIVE_PROFILES)
+PROFILES = FULL_PROFILES
 MAX_JSON_BYTES = 8192
 RESERVATIONS = (".keycloakctl", "run-ids")
 RUNS = ("target", "keycloakctl", "runs")
@@ -44,7 +45,7 @@ IMAGE_FINGERPRINT_TARGETS = (
   "runtime",
 )
 PHASE_HELP = {
-  "preflight": "check local toolchain/engine prerequisites; remote target checks are deferred",
+  "preflight": "check local toolchain/engine prerequisites; readiness/qualification also have read-only remote target probes",
   "build": "package the provider, fetch and verify locked resolver inputs, then build the provider and test RP images",
   "test": "run acceptance checks and image smokes; Python checks fetch pinned prerequisites",
   "publish": "deferred/unavailable: remote image transfer is not supported by this candidate",
@@ -358,8 +359,13 @@ def new_run(args) -> tuple[dict, dict]:
 
 
 def authorize(phase: str, args) -> None:
-  if phase in LIVE_PHASES and not args.allow_live:
-    raise Rejected(f"{phase} requires --allow-live on this invocation")
+  if phase in LIVE_PHASES:
+    if not args.allow_live:
+      raise Rejected(f"{phase} requires --allow-live on this invocation")
+    reference = getattr(args, "approval_ref", None)
+    digest = getattr(args, "approval_sha256", None)
+    if (reference is None) != (digest is None) or not reference or re.fullmatch(r"[0-9a-fA-F]{64}", digest or "") is None:
+      raise Rejected(f"{phase} requires an approval reference and 64-character SHA-256")
   if phase == "promote" and not args.allow_publish:
     raise Rejected("promote requires --allow-publish on this invocation")
 
@@ -1150,25 +1156,36 @@ def make_parser() -> Parser:
   historical_plans = "\n".join(
       f"  {profile}: {' -> '.join(PLANS[profile])}" for profile in LIVE_PROFILES)
   help_text = f"""\
-Profiles: dev and ci are local; readiness and qualification are remote-live
-profiles currently deferred/unavailable in this candidate. `setup` accepts all
-four profiles; `full` accepts only dev and ci. `full --new-run` allocates a new,
-unique run ID; `full --run-id RUN_ID` resumes only that existing run. Both forms
-run local preflight, build, test, seal local run-intent, and stop before remote
-mutations. `full` has no live-operation flag.
+Profiles: `dev` and `ci` are local profiles; `readiness` and `qualification` are
+separate run profiles. `setup` and `full` accept all four. `full --new-run`
+allocates a unique run ID; `full --run-id RUN_ID` resumes only that existing
+run. Both forms perform local preflight/build/test, seal a local-only run-intent,
+and stop before publish or any other remote mutation. For readiness and
+qualification this is still local preparation only; it does not call the remote
+preflight adapter. `full` has no live-operation flag.
 {local_plans}
 
-Historical, deferred profile plans (not supported by this candidate):
+Profile plans available in the phase model (not all phases are implemented):
 {historical_plans}
 
-Remote-live commands are `publish`, `deploy`, `configure`, `integration-test`,
-`verify readiness`, `verify qualification`, and `teardown`. For every such
-invocation the operator must verify current owner approval out of band, bound
-to the exact artifact hashes, target, operations/cases, and windows. `--allow-live`
-is an additional per-invocation guard, not approval. A hash or reference is not
-authentication. This candidate does not implement those remote operations.
-`promote` is a separate existing publication gate using `--allow-publish`, not
-the environment owner-approval gate; promotion is unavailable in this candidate.
+`preflight` performs local tool/engine checks for local profiles. For readiness
+and qualification, standalone preflight additionally performs existing
+read-only remote target probes after required operator inputs/route attestation;
+it does not mutate remote state and is not approval. `full` does not invoke
+those remote probes.
+
+Remote-mutating/resuming commands are `publish`, `deploy`, `configure`,
+`integration-test`, `verify readiness`, `verify qualification`, and `teardown`.
+They remain unavailable in this candidate. Before any such invocation, an
+operator must verify current active owner approval out of band for the exact
+artifact hashes, target, operations/cases, and windows, and supply
+`--approval-ref REF` plus `--approval-sha256 HASH` (64 hexadecimal characters)
+and `--allow-live`. The reference and hash are opaque audit references only:
+they are not authentication or scope verification; no approval is inferred
+from their values. The pair is not persisted or echoed. `--allow-live` is an
+additional per-invocation gate, not owner approval.
+`promote --allow-publish` is a separate existing registry publication gate,
+not environment approval.
 
 The offline acceptance profile runs provider and RP fixture image builds/smokes,
 retains local images, and records cleanup as not run.
@@ -1178,10 +1195,10 @@ No remote or live operation is authorized by this CLI help.
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
-  authorization_help = (" Remote-live work is deferred here. Before each invocation, the operator must "
-                        "verify current owner approval out of band, bound to the exact artifact hashes, target, "
-                        "operations/cases, and windows; `--allow-live` is an additional guard for each "
-                        "invocation, not approval. A hash or reference is not authentication.")
+  authorization_help = (" Remote-live work is deferred here. Before each invocation, verify active owner approval "
+                        "out of band for exact artifact hashes, target, operations/cases, and windows, then supply "
+                        "--approval-ref REF, --approval-sha256 HASH, and --allow-live. References are audit-only, "
+                        "not authentication; values are not persisted or echoed.")
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
                   "validate-artifacts": "validate adopted-design baseline/projection artifacts offline",
                   "acceptance": "run local acceptance stages and write a durable receipt",
@@ -1209,7 +1226,7 @@ No remote or live operation is authorized by this CLI help.
       command.add_argument("--profile", choices=("offline",), required=True)
     elif name in ("setup", "validate-config", "full"):
       profile_choices = config_fields()["profile"]["enum"] if name == "validate-config" else (
-          LOCAL_PROFILES if name == "full" else PROFILES)
+          FULL_PROFILES if name == "full" else PROFILES)
       command.add_argument("--profile", choices=profile_choices,
                            required=name == "full")
     if name == "full":
@@ -1220,6 +1237,10 @@ No remote or live operation is authorized by this CLI help.
       command.add_argument("--run-id", required=name not in ("setup", "promote"))
     if name in LIVE_PHASES or name == "verify":
       command.add_argument("--allow-live", action="store_true", help="required on each live invocation")
+      command.add_argument("--approval-ref", metavar="REF",
+                           help="opaque out-of-band approval reference; audit only, not authentication")
+      command.add_argument("--approval-sha256", metavar="HASH",
+                           help="SHA-256 of the referenced approval; audit only, not authentication")
     if name == "verify":
       command.add_argument("scope", choices=LIVE_PROFILES)
     if name == "promote":
@@ -1619,8 +1640,8 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
 def validate_full_intent_input_selection(args: argparse.Namespace, state: dict,
     config: dict, *, config_raw: bytes) -> dict[str, str]:
   """Validate selected local run inputs before preflight/build/test side effects."""
-  if state["profile"] not in LOCAL_PROFILES or args.profile != state["profile"]:
-    raise Rejected("full supports only local profiles")
+  if state["profile"] not in FULL_PROFILES or args.profile != state["profile"]:
+    raise Rejected("full profile does not match")
   if sha256(config_raw).hexdigest() != state["config_sha256"]:
     raise Rejected("run configuration readback conflict")
   if (getattr(args, "baseline", None) is None) != (getattr(args, "projection", None) is None):
@@ -1865,8 +1886,8 @@ def main(argv: list[str] | None = None) -> int:
         print(state["run_id"], flush=True)
       else:
         state, config = checked_run(args)
-        if state["profile"] not in LOCAL_PROFILES:
-          raise Rejected("full supports only local profiles")
+        if state["profile"] not in FULL_PROFILES:
+          raise Rejected("full profile does not match")
         if config is None:
           raise Rejected("full requires --config")
         config, config_raw = load_config_source(args.config, state["profile"])
@@ -1874,8 +1895,8 @@ def main(argv: list[str] | None = None) -> int:
             args, state, config, config_raw=config_raw)
         validate_persisted_full_intent(state, artifact_hashes)
         source_manifest_raw = capture_source_manifest()
-      if state["profile"] not in LOCAL_PROFILES:
-        raise Rejected("full supports only local profiles")
+      if state["profile"] not in FULL_PROFILES:
+        raise Rejected("full profile does not match")
       perform_local_preflight(config, state["profile"])
       perform_build(state, config)
       perform_test(state, config)
