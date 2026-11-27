@@ -18,59 +18,43 @@ The `keycloakctl` acceptance entry point is used locally and by pull-request CI.
 ./keycloakctl acceptance --profile offline
 ```
 
-The command runs local preflight, Maven/Surefire and canonical Python suites, compiles Python sources, builds both provider and test-only RP fixture images, runs their offline smokes, checks whitespace, and writes a sanitized source-bound receipt. Offline acceptance retains its built images and records cleanup as `not_run`; remove eligible repository images only through the separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke imports its module; it is not an RP server or browser flow. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
+The command runs local preflight, Maven/Surefire and canonical Python suites, compiles Python sources, builds both provider and test-only RP fixture images, runs their offline smokes, checks whitespace, and writes a sanitized source-bound receipt. Offline acceptance retains its built images and records cleanup as `not_run`; remove eligible repository images only through the separate explicit `./keycloakctl images cleanup` action. The RP fixture smoke executes the image entrypoint, starts a loopback listener on an ephemeral port, checks a fixed safe response, and shuts down without issuer access. This is local startup evidence only, not browser/Keycloak or live qualification. See [CONTRIBUTING.md](CONTRIBUTING.md) and the migration map.
 
-The full offline lifecycle plan is still exposed by the compatibility runner and has not been fully migrated:
+Issue #74 is incomplete. This candidate covers local preparation/build/test, a **local-only run-intent receipt** (not the proposed #73 owner-approved qualification intent), and offline acceptance; remote lifecycle, qualification, manual evidence, and publication are deferred. Legacy `scripts/lifecycle.py` options such as `--allow-live` are not owner approval and do not authorize remote operations. Do not infer authorization from the flag or from this offline acceptance receipt. See [CONTRIBUTING.md](CONTRIBUTING.md) for the local contributor path.
 
-```bash
-python3.11 scripts/lifecycle.py run offline --plan
-```
-
-The PR workflow invokes the same `./keycloakctl acceptance --profile offline` command. This restores bounded local/CI image-build and smoke gates while retaining the resulting local images; cleanup is a separate explicit action. Remote transfer, readiness deployment, qualification, and Registry promotion remain outside this profile. `wallet-login-qualification` is the opt-in live wallet-login qualification profile. It requires explicit authorization plus `--allow-live`; it is not part of normal development or CI:
-
-```bash
-python3.11 scripts/lifecycle.py run wallet-login-qualification --allow-live
-```
-
-`remote-test-host` runs the offline build/test lifecycle, transfers the exact built image, then performs a tailnet-only Keycloak/OIDC discovery smoke on the configured test host (defaults to `ben-x260`). Override the target with `REMOTE_TEST_HOST` and `REMOTE_TEST_USER`. It requires `--allow-live`; follow [`docs/acceptance/remote-test-host.md`](docs/acceptance/remote-test-host.md) for the one-time Tailscale SSH/operator setup and target preflight requirements. The lifecycle never enables Funnel and cleans its run-scoped image aliases without changing `decent-keycloak:latest`. That document also covers the ownership and teardown contract:
-
-```bash
-python3.11 scripts/lifecycle.py run remote-test-host --allow-live
-```
-
-Live loopback evidence does not prove production Registry behavior, real TLS, or wallet/browser interoperability. Never treat 503/unavailable as an Identity miss or policy denial. The offline lifecycle downloads the resolver's hash-locked Python/RPM artifacts and commit-pinned source repositories into run-scoped temporary build contexts; it does not contact the Registry. Retaining a local image is a separate opt-in (`--retain-image`) and does not publish it. Registry promotion is a separate command that requires a successful, fully gated `wallet-login-qualification` receipt, the retained image's exact immutable ID, an explicit release-candidate destination, and `--allow-publish`; it pushes and reads back the registry manifest before reporting success. No destination or publication is configured by default.
-
-Repository-built image inventory:
+This inventory describes repository-built images used by existing local and legacy lifecycle helpers. This Issue #74 candidate changes only local preparation/build/test and a local-only run-intent receipt, plus offline acceptance; it does not add or qualify the live lifecycle described below.
 
 | Dockerfile target / role | Purpose and consumers | Lifecycle |
 |---|---|---|
-| `runtime` / `wallet-provider` | Installable Keycloak 26.8.0 provider image; offline lifecycle smoke and opt-in local/live acceptance profiles consume the exact immutable ID. | Run-scoped tagged build, removed by default; explicit `--retain-image` for local consumers or trusted promotion. |
+| `runtime` / `wallet-provider` | Installable Keycloak 26.8.0 provider image; consumed by existing local lifecycle helpers. | Legacy run-scoped tagged build; Issue #74 local-only candidate does not add or qualify live profiles or trusted promotion. |
 | `issue7-user-readback-test-runtime` / `wallet-provider-issue7-user-readback-test` | Isolated Issue #7 fault-injection provider for its recovery profile and tests. | Temporary test artifact; never a release role. |
 | `issue7-store-recovery-test-runtime` / `wallet-provider-issue7-store-recovery-test` | Isolated Issue #7 datastore-fault provider. | Temporary test artifact; never a release role. |
 | `issue6-postconsume-test-runtime` / `wallet-provider-issue6-postconsume-test` | Isolated Issue #6 post-consume receipt-failure provider. | Temporary test artifact; never a release role. |
 | `issue6-callback-gate-test-runtime` / `wallet-provider-issue6-callback-gate-test` | Isolated Issue #6 callback-gate fault provider. | Temporary test artifact; never a release role. |
 | `resolver-builder`, `keycloak-with-resolver` / intermediate roles | Build intermediates only. | Run-owned intermediates are removed by bounded lifecycle teardown; never promotion targets. |
 
-`container/Dockerfile` pins upstream UBI and Keycloak bases by digest. They are not this repository's artifacts and are excluded from the local age cleaner; builder caches are also out of scope. The only tracked CI workflow is `.github/workflows/acceptance.yml`: for pull requests it runs keycloakctl's Maven/Surefire, provider service-registration, canonical Python, compilation, and whitespace acceptance stages; it does not prepare an image engine, build or smoke images, publish images, or grant package-write permissions. The `decent-integration-test` repository currently documents Identity CLI integration tests rather than consuming this Keycloak image; no remote image consumer is verified.
+`container/Dockerfile` pins upstream UBI and Keycloak bases by digest. They are not this repository's artifacts and are excluded from the local age cleaner; builder caches are also out of scope. For pull requests, `.github/workflows/acceptance.yml` runs keycloakctl's Maven/Surefire, provider service-registration, canonical Python, compilation, whitespace, provider-image build/smoke, and test-only RP fixture image build/smoke stages using the offline profile. It does not publish images, contact a remote target, or grant package-write permissions. The `decent-integration-test` repository currently documents Identity CLI integration tests rather than consuming this Keycloak image; no remote image consumer is verified. The PR workflow's image build/smoke does not exercise `keycloakctl full`; that path remains separately covered by focused tests.
 
-## Build and retain a local image
+## Legacy local image lifecycle (outside this Issue #74 candidate)
 
-The canonical lifecycle builds the component-and-role image `localhost/decent-keycloak/wallet-provider`, labels it with the source revision and source/artifact fingerprints, and writes the exact immutable image ID to its sanitized receipt. The lifecycle's run tag is unique; use the receipt's `image.immutable_id` for same-machine consumers rather than resolving a mutable tag later. Podman consumers in this and other checkouts share the same per-user local image store; no local registry or remote push is needed.
+The existing canonical lifecycle builds the component-and-role image `localhost/decent-keycloak/wallet-provider`, labels it with the source revision and source/artifact fingerprints, and writes the exact immutable image ID to its sanitized receipt. The lifecycle's run tag is unique; use the receipt's `image.immutable_id` for same-machine consumers rather than resolving a mutable tag later. Podman consumers in this and other checkouts share the same per-user local image store; no local registry or remote push is needed. This existing helper is not exercised by the Issue #74 local-only `full` command.
+
+Build and retain a local image with the existing canonical lifecycle by using its legacy offline run with `--retain-image`; this is separate from keycloakctl acceptance and Issue #74's local-only candidate.
 
 ```bash
-python3.11 scripts/lifecycle.py run offline --retain-image
+python3.11 scripts/lifecycle.py run offline --retain-image  # legacy helper; not keycloakctl acceptance or full
 # Read image.immutable_id and image.run_owned_tag from target/lifecycle/evidence/<run-id>.json
 podman run --rm --entrypoint /opt/keycloak/bin/kc.sh \
   "sha256:<immutable-image-id>" --version
 ```
 
-The default lifecycle removes its run-owned image after smoke testing. `--retain-image` is explicit and is not a publication action. The `offline` and `ci` profiles never publish. The PR workflow is pull-request-only, has `contents: read`, and contains no login, push, or package-publication step. Trusted release promotion is a separate manual `scripts/lifecycle.py promote` action and requires a successful gated receipt, a retained immutable source image, an explicit destination, `--allow-publish`, and a source commit already merged into `origin/main`; the command rejects unmerged PR revisions. Publishing does not itself qualify provider/Registry behavior. Consumers of a published image must pin the returned registry manifest digest (`registry/repository@sha256:…`), not its mutable tag.
+The offline acceptance profile is pull-request-only and does not publish or contact a remote target. PR CI retains local build images; local image cleanup is a separate explicit action. This bounded acceptance is not a qualification or release decision.
 
 Repository-built images carry repository/component/role and source-revision labels. The canonical runtime lifecycle additionally labels its image-source and compiled-artifact fingerprints; its temporary tag includes the `lifecycle-<run-id>`. See [Issue #26 lifecycle evidence](docs/acceptance/issue-26-image-lifecycle.md) for the target inventory and verified provenance details.
 
 ## Local image retention and cleanup
 
-Run the safe cleanup command periodically (for example, from a user-owned scheduled job). It removes only images with all exact `io.decent.image.*` repository/component/role labels that are older than three days, and only after read-back confirms the same image ID/labels and no container uses it. It never runs `image prune`, and never selects upstream bases, builder caches, unlabeled images, recent images, pinned images, or active-container images.
+Run the safe cleanup command periodically (for example, every 3 days from a user-owned scheduled job). It removes only images with all exact `io.decent.image.*` repository/component/role labels that are older than three days, and only after read-back confirms the same image ID/labels and no container uses it. It never runs `image prune`, and never selects upstream bases, builder caches, unlabeled images, recent images, pinned images, or active-container images.
 
 ```bash
 ./keycloakctl images cleanup
@@ -82,11 +66,7 @@ DECENT_IMAGE_RETENTION_DAYS=7 ./keycloakctl images cleanup
 
 The `pin-*` tag protects an image indefinitely until removed with `unpin`; `retain-until-<UTC timestamp>` tags created by `extend` protect it until that expiry. Extension days are bounded to 1–3650. Cleanup checks active containers both before selection and immediately before removal, and fails closed if inventory, ownership readback, or removal verification is inconclusive.
 
-## Remote promotion and retention policy
-
-Local builds and PR CI do not publish. Remote promotion is a separate, explicit maintainer action that requires a passing gated receipt, a retained immutable source image, a trusted source commit, an explicit destination, and `--allow-publish`. Published consumers must use the returned manifest digest, not a mutable release-candidate tag. The current verification limits and approved expiry/release policy are recorded in [Issue #26 lifecycle evidence](docs/acceptance/issue-26-image-lifecycle.md).
-
-Before publishing to any registry, verify its package permissions and retention behavior; do not treat a mutable tag as image identity or assume that the registry enforces expiry. Remote consumers use immutable manifest digests. Review registered consumers and digest pins every 3 days; retire an unconsumed candidate by day 7 only after confirming no consumer references its digest. Never delete an active dependency without migration; any time-bounded retention exception must name an owner, reason, and next review date. See the [Issue #26 lifecycle evidence](docs/acceptance/issue-26-image-lifecycle.md) for current registry/package status and the manual release procedure.
+For any future explicitly published release candidate, the owner-approved manual policy is to check named consumers and pinned digests every 3 days, then retire an unconsumed candidate by day 7 only after confirming no consumer references it. Active consumers require a named, time-bounded exception; this remote policy is not a registry-enforced TTL and is outside the Issue #74 local-only candidate.
 
 The image is an experimental Keycloak 26.8.0 runtime and is not production-ready. Building or publishing it is not wallet-login or Registry acceptance qualification. For local prerequisites and lifecycle details, see [CONTRIBUTING.md](CONTRIBUTING.md).
 

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -16,7 +17,8 @@ import tempfile
 from pathlib import Path
 import unittest
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -147,6 +149,28 @@ class FakeIssuer:
     self.httpd.shutdown()
     self.httpd.server_close()
     self.thread.join(timeout=3)
+
+
+class RPFixtureLocalStartupSmokeTest(unittest.TestCase):
+  def test_fixture_binds_ephemeral_loopback_listener_and_serves_safe_rejection(self):
+    fixture = RPFixture(FixtureConfig("http://127.0.0.1:1/issuer", "smoke-client"))
+    server = fixture.start()
+    try:
+      connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+      connection.request("GET", "/not-a-route")
+      response = connection.getresponse()
+      body = response.read()
+      connection.close()
+      self.assertEqual((400, b"request rejected"), (response.status, body))
+      self.assertEqual(0, fixture.session_count)
+    finally:
+      fixture.close()
+    self.assertIsNone(fixture._server)
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/oidc_rp_fixture.py"), "--smoke"],
+        cwd=ROOT, capture_output=True, text=True, timeout=8, check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    self.assertEqual((0, "RP fixture smoke passed\n", ""),
+                     (result.returncode, result.stdout, result.stderr))
 
 
 class RPFixtureContractTest(unittest.TestCase):
