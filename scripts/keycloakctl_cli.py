@@ -8,6 +8,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import stat
@@ -92,19 +93,26 @@ def parse_json(raw: bytes):
                     parse_constant=reject_number, parse_float=reject_number)
 
 
-def read_regular(path: Path | str, *, dir_fd: int | None = None) -> bytes:
+def read_regular(path: Path | str, *, dir_fd: int | None = None,
+                 max_bytes: int = MAX_JSON_BYTES,
+                 expected_mode: int | None = None) -> bytes:
   fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
   with os.fdopen(fd, "rb", buffering=0) as source:
     info = os.fstat(source.fileno())
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_JSON_BYTES:
+    if (not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes
+        or (expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode)):
       raise ValueError
     raw = bytearray()
-    while len(raw) <= MAX_JSON_BYTES:
-      chunk = source.read(MAX_JSON_BYTES + 1 - len(raw))
+    while len(raw) <= max_bytes:
+      chunk = source.read(max_bytes + 1 - len(raw))
       if not chunk:
         return bytes(raw)
       raw.extend(chunk)
     raise ValueError
+
+
+def read_bounded_regular(path: Path | str, limit: int, *, dir_fd: int | None = None) -> bytes:
+  return read_regular(path, dir_fd=dir_fd, max_bytes=limit)
 
 
 def config_schema():
@@ -158,6 +166,61 @@ def validate_config(value, profile: str | None) -> None:
     elif (type(entry) is not str or len(entry) > rule.get("maxLength", 253)
           or re.fullmatch(rule["pattern"], entry) is None):
       raise ValueError
+
+
+def validate_artifact_bytes(baseline_raw: bytes, projection_raw: bytes,
+                            config_raw: bytes) -> dict[str, str]:
+  """Validate strict artifact schemas and cross-bindings from the supplied bytes."""
+  try:
+    import jsonschema
+
+    schema = parse_json(read_bounded_regular(
+        ROOT / "config/keycloakctl/issue74-artifact.schema.json", 65536))
+    config_validation_schema = parse_json(read_bounded_regular(
+        ROOT / "config/keycloakctl/config.schema.json", 65536))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.Draft202012Validator.check_schema(config_validation_schema)
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.FormatChecker())
+    config_validator = jsonschema.Draft202012Validator(
+        config_validation_schema, format_checker=jsonschema.FormatChecker())
+
+    baseline = parse_json(baseline_raw)
+    projection = parse_json(projection_raw)
+    config = parse_json(config_raw)
+    if (list(validator.iter_errors(baseline))
+        or list(validator.iter_errors(projection))
+        or list(config_validator.iter_errors(config))):
+      raise ValueError
+    case_ids = ["LOGIN-01", "TLS-01", "TLS-02", *(f"NEG-{number:02d}" for number in range(1, 8))]
+    canonical_projection = json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False).encode("utf-8")
+    if (projection_raw != canonical_projection
+        or sha256(config_raw).hexdigest() != baseline["runtime_config"]["sha256"]
+        or sha256(projection_raw).hexdigest() != baseline["case_inventory"]["sha256"]
+        or baseline["case_inventory"]["case_ids"] != case_ids
+        or projection["case_ids"] != case_ids
+        or set(projection["cases"]) != set(case_ids)):
+      raise ValueError
+    return {"baseline_sha256": sha256(baseline_raw).hexdigest(),
+            "projection_sha256": sha256(projection_raw).hexdigest()}
+  except Rejected:
+    raise
+  except Exception:
+    # Do not surface paths, raw artifact values, schema diagnostics, or exception context.
+    raise Rejected("invalid artifacts or bindings") from None
+
+
+def validate_artifact_inputs(baseline_path: str, projection_path: str, config_path: str) -> None:
+  """Strictly validate adopted-design artifact shapes and exact-byte cross-bindings."""
+  try:
+    baseline_raw = read_bounded_regular(baseline_path, 65536)
+    projection_raw = read_bounded_regular(projection_path, 65536)
+    config_raw = read_regular(config_path)
+  except Exception:
+    raise Rejected("invalid artifacts or bindings") from None
+  validate_artifact_bytes(baseline_raw, projection_raw, config_raw)
 
 
 def load_config_source(path: str, profile: str | None) -> tuple[dict, bytes]:
@@ -1104,13 +1167,24 @@ builds/smokes, retains local images, and records cleanup as not run. Legacy
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
+                  "validate-artifacts": "validate adopted-design baseline/projection artifacts offline",
                   "acceptance": "run local acceptance stages and write a durable receipt",
                   **PHASE_HELP, "full": "run local preflight/build/test and seal a local run intent"}
   for name, description in descriptions.items():
     command = commands.add_parser(name, help=description, description=description, allow_abbrev=False)
-    if name != "acceptance":
+    if name not in ("acceptance", "validate-artifacts"):
       command.add_argument("--config", required=name in ("validate-config", "full"), metavar="FILE",
                            help="non-secret JSON file, relative to the caller if not absolute")
+    if name == "validate-artifacts":
+      command.add_argument("--baseline", required=True, metavar="FILE")
+      command.add_argument("--projection", required=True, metavar="FILE")
+      command.add_argument("--config", required=True, metavar="FILE",
+                           help="exact non-secret runtime configuration bytes")
+    if name == "full":
+      command.add_argument("--baseline", required=True, metavar="FILE",
+                           help="exact adopted-design environment-baseline bytes")
+      command.add_argument("--projection", required=True, metavar="FILE",
+                           help="exact adopted-design case-projection bytes")
     if name == "acceptance":
       command.add_argument("--profile", choices=("offline",), required=True)
     elif name in ("setup", "validate-config", "full"):
@@ -1122,7 +1196,7 @@ builds/smokes, retains local images, and records cleanup as not run. Legacy
       selection = command.add_mutually_exclusive_group(required=True)
       selection.add_argument("--new-run", action="store_true")
       selection.add_argument("--run-id")
-    elif name not in ("validate-config", "acceptance"):
+    elif name not in ("validate-config", "validate-artifacts", "acceptance"):
       command.add_argument("--run-id", required=name not in ("setup", "promote"))
     if name in LIVE_PHASES or name == "verify":
       command.add_argument("--allow-live", action="store_true", help="required on each live invocation")
@@ -1441,40 +1515,268 @@ def validate_run_intent_inputs(config: dict, profile: str, *, config_raw: bytes)
     raise ValueError("run intent configuration version invalid")
 
 
+def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str]) -> None:
+  """Fail closed on an existing sealed source/artifact binding before local work."""
+  try:
+    with open_directory((*RUNS, state["run_id"])) as directory:
+      try:
+        intent_raw = read_regular("run-intent.json", dir_fd=directory, expected_mode=0o600)
+      except FileNotFoundError:
+        intent_raw = None
+      try:
+        source_raw = read_regular("source-manifest.json", dir_fd=directory,
+                                  max_bytes=SOURCE_MANIFEST_MAX_RAW, expected_mode=0o600)
+      except FileNotFoundError:
+        source_raw = None
+      if intent_raw is None and source_raw is None:
+        return
+      if source_raw is None:
+        raise ValueError
+      source = parse_json(source_raw)
+      if (type(source) is not dict or source.keys() != {"version", "files"}
+          or type(source["version"]) is not int or source["version"] != 1
+          or type(source["files"]) is not list
+          or canonical_json(source) != source_raw
+          or capture_source_manifest() != source_raw):
+        raise ValueError
+      if intent_raw is None:
+        # The source manifest is durably installed before the intent; a crash
+        # here is safe to resume only while the exact captured inputs still match.
+        return
+      intent = parse_json(intent_raw)
+      expected_keys = {"version", "run_id", "profile", "config_sha256", "baseline_sha256",
+                       "projection_sha256", "build_sha256", "test_source_sha256",
+                       "source_manifest_sha256", "source_manifest_count", "status", "scope"}
+      if (type(intent) is not dict or intent.keys() != expected_keys
+          or type(intent["version"]) is not int or intent["version"] != 1
+          or intent["run_id"] != state["run_id"] or intent["profile"] != state["profile"]
+          or intent["config_sha256"] != state["config_sha256"]
+          or intent["baseline_sha256"] != artifact_hashes["baseline_sha256"]
+          or intent["projection_sha256"] != artifact_hashes["projection_sha256"]
+          or any(type(intent[field]) is not str
+                 or re.fullmatch(r"[0-9a-f]{64}", intent[field]) is None
+                 for field in ("build_sha256", "test_source_sha256"))
+          or intent["status"] != "verified" or intent["scope"] != "local-only"
+          or intent["source_manifest_sha256"] != sha256(source_raw).hexdigest()
+          or type(intent["source_manifest_count"]) is not int
+          or intent["source_manifest_count"] != len(source["files"])
+          ):
+        raise ValueError
+      if canonical_json(intent) != intent_raw:
+        raise ValueError
+      bundle = read_build_bundle(state)
+      test_receipt = None if bundle is None else read_test_receipt(state, bundle)
+      if (bundle is None or test_receipt is None
+          or sha256(canonical_json(bundle)).hexdigest() != intent["build_sha256"]
+          or test_receipt["test_source_sha256"] != intent["test_source_sha256"]):
+        raise ValueError
+  except Rejected:
+    raise Rejected("run-intent readback conflict") from None
+  except (OSError, ValueError, TypeError, RecursionError):
+    raise Rejected("run-intent readback conflict") from None
+
+
 def validate_full_intent_input_selection(args: argparse.Namespace, state: dict,
-    config: dict, *, config_raw: bytes) -> None:
+    config: dict, *, config_raw: bytes) -> dict[str, str]:
   """Validate selected local run inputs before preflight/build/test side effects."""
   if state["profile"] not in LOCAL_PROFILES or args.profile != state["profile"]:
     raise Rejected("full supports only local profiles")
   if sha256(config_raw).hexdigest() != state["config_sha256"]:
     raise Rejected("run configuration readback conflict")
+  if (getattr(args, "baseline", None) is None) != (getattr(args, "projection", None) is None):
+    raise Rejected("full requires both baseline and projection")
+  if getattr(args, "baseline", None) is None:
+    raise Rejected("full requires baseline and projection for intent sealing")
   try:
     validate_run_intent_inputs(config, state["profile"], config_raw=config_raw)
-  except (UnicodeError, ValueError, TypeError, RecursionError):
-    raise Rejected("run-intent inputs or bindings invalid") from None
+    baseline_raw = read_bounded_regular(args.baseline, 65536)
+    projection_raw = read_bounded_regular(args.projection, 65536)
+    return validate_artifact_bytes(baseline_raw, projection_raw, config_raw)
+  except Rejected:
+    raise
+  except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+    raise Rejected("invalid artifacts or bindings") from None
 
 
-def seal_local_run_intent(state: dict) -> None:
-  """Bind the local-only full run to its verified build and test receipts."""
+SOURCE_MANIFEST_MAX_FILES = 100_000
+SOURCE_MANIFEST_MAX_BYTES = 2 * 1024 * 1024 * 1024
+SOURCE_MANIFEST_MAX_RAW = 32 * 1024 * 1024
+SOURCE_MANIFEST_EXCLUDED_PREFIXES = (
+    ".git/", ".keycloakctl/", "target/", "scripts/__pycache__/",
+    "container/__pycache__/", ".pytest_cache/", "container/.cache/resolver-downloads/",
+    "container/identity-src/", "container/registry-src/", "container/sources/",
+)
+
+
+def capture_source_manifest(root: Path | None = None) -> bytes:
+  """Hash tracked and untracked source files after explicit generated exclusions."""
+  root = ROOT if root is None else root
+  commands = (
+      ["git", "-C", str(root), "-c", "core.quotepath=false", "ls-files", "-z"],
+      ["git", "-C", str(root), "-c", "core.quotepath=false", "ls-files", "--others", "-z"],
+  )
+  paths: set[str] = set()
+  for command in commands:
+    try:
+      process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+      assert process.stdout is not None
+      try:
+        output = process.stdout.read(SOURCE_MANIFEST_MAX_RAW + 1)
+      finally:
+        process.stdout.close()
+      if len(output) > SOURCE_MANIFEST_MAX_RAW:
+        process.terminate()
+        process.wait()
+        raise Rejected("source manifest selection unavailable")
+      returncode = process.wait()
+    except Rejected:
+      raise
+    except OSError:
+      raise Rejected("source manifest selection unavailable") from None
+    if returncode:
+      raise Rejected("source manifest selection unavailable")
+    try:
+      paths.update(os.fsdecode(raw).encode("utf-8").decode("utf-8")
+                   for raw in output.split(b"\0") if raw)
+    except (UnicodeError, ValueError):
+      raise Rejected("source manifest path invalid") from None
+
+  excluded = lambda path: path.startswith(SOURCE_MANIFEST_EXCLUDED_PREFIXES)
+  selected = sorted((path for path in paths if not excluded(path)), key=lambda item: item.encode("utf-8"))
+  if len(selected) > SOURCE_MANIFEST_MAX_FILES:
+    raise Rejected("source manifest exceeds bounds")
+  entries = []
+  total = 0
+  processed: set[str] = set()
+  index = 0
+  while index < len(selected):
+    relative = selected[index]
+    index += 1
+    if relative in processed:
+      continue
+    processed.add(relative)
+    parts = relative.split("/")
+    if (not relative or relative.startswith("/") or "\\\\" in relative
+        or any(part in ("", ".", "..") for part in parts)):
+      raise Rejected("source manifest path invalid")
+    try:
+      with ExitStack() as opened:
+        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        opened.callback(os.close, directory_fd)
+        for part in parts[:-1]:
+          directory_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+          opened.callback(os.close, directory_fd)
+        before = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode):
+          target = os.readlink(parts[-1], dir_fd=directory_fd)
+          after_link = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+          if ((before.st_dev, before.st_ino, before.st_mode, before.st_mtime_ns, before.st_ctime_ns) !=
+              (after_link.st_dev, after_link.st_ino, after_link.st_mode, after_link.st_mtime_ns, after_link.st_ctime_ns)):
+            raise Rejected("source manifest changed during capture")
+          if not target or target.startswith("/") or "\\\\" in target:
+            raise Rejected("source manifest contains unsupported symlink")
+          target_relative = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
+          if target_relative in (".", "..") or target_relative.startswith("../") or excluded(target_relative):
+            raise Rejected("source manifest contains unsupported symlink")
+          target_parts = target_relative.split("/")
+          target_directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+          opened.callback(os.close, target_directory_fd)
+          for target_part in target_parts[:-1]:
+            target_directory_fd = os.open(target_part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                           dir_fd=target_directory_fd)
+            opened.callback(os.close, target_directory_fd)
+          target_info = os.stat(target_parts[-1], dir_fd=target_directory_fd,
+                                follow_symlinks=False)
+          if not stat.S_ISREG(target_info.st_mode):
+            raise Rejected("source manifest contains unsupported symlink target")
+          if target_relative not in processed and target_relative not in selected[index:]:
+            selected.append(target_relative)
+          entries.append({"path": relative, "mode": format(stat.S_IMODE(before.st_mode), "04o"),
+                          "sha256": sha256(os.fsencode(target)).hexdigest(),
+                          "type": "symlink", "target": target})
+          continue
+        if not stat.S_ISREG(before.st_mode):
+          raise Rejected("source manifest contains unsupported entry")
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        try:
+          opened_info = os.fstat(fd)
+          if not stat.S_ISREG(opened_info.st_mode) or (before.st_dev, before.st_ino) != (opened_info.st_dev, opened_info.st_ino):
+            raise Rejected("source manifest contains unsupported entry")
+          digest = sha256()
+          size = 0
+          while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+              break
+            size += len(chunk)
+            total += len(chunk)
+            if total > SOURCE_MANIFEST_MAX_BYTES:
+              raise Rejected("source manifest exceeds bounds")
+            digest.update(chunk)
+          after = os.fstat(fd)
+          if ((opened_info.st_size, opened_info.st_mtime_ns, opened_info.st_ctime_ns) !=
+              (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+              or stat.S_IMODE(opened_info.st_mode) != stat.S_IMODE(after.st_mode) or size != after.st_size):
+            raise Rejected("source manifest changed during capture")
+        finally:
+          os.close(fd)
+    except Rejected:
+      raise
+    except (OSError, ValueError):
+      raise Rejected("source manifest input unavailable") from None
+    entries.append({"path": relative, "mode": format(stat.S_IMODE(before.st_mode), "04o"),
+                    "sha256": digest.hexdigest()})
+  entries.sort(key=lambda entry: entry["path"].encode("utf-8"))
+  if len(entries) > SOURCE_MANIFEST_MAX_FILES:
+    raise Rejected("source manifest exceeds bounds")
+  raw = canonical_json({"version": 1, "files": entries})
+  if len(raw) > SOURCE_MANIFEST_MAX_RAW:
+    raise Rejected("source manifest exceeds bounds")
+  return raw
+
+
+def seal_local_run_intent(state: dict, source_manifest_raw: bytes,
+                          artifact_hashes: dict[str, str]) -> None:
+  """Bind source and artifact inputs with read-back verified local build/test receipts."""
   bundle = read_build_bundle(state)
   if bundle is None:
     raise Rejected("verified local build required before run-intent")
   test_receipt = read_test_receipt(state, bundle)
   if test_receipt is None:
     raise Rejected("verified local test required before run-intent")
+  if capture_source_manifest() != source_manifest_raw:
+    raise Rejected("source inputs changed during full run")
+  source_manifest = parse_json(source_manifest_raw)
+  if type(source_manifest) is not dict or canonical_json(source_manifest) != source_manifest_raw:
+    raise Rejected("source manifest invalid")
+  source_sha256 = sha256(source_manifest_raw).hexdigest()
   intent = {
       "version": 1,
       "run_id": state["run_id"],
       "profile": state["profile"],
       "config_sha256": state["config_sha256"],
+      "baseline_sha256": artifact_hashes["baseline_sha256"],
+      "projection_sha256": artifact_hashes["projection_sha256"],
       "build_sha256": sha256(canonical_json(bundle)).hexdigest(),
       "test_source_sha256": test_receipt["test_source_sha256"],
+      "source_manifest_sha256": source_sha256,
+      "source_manifest_count": len(source_manifest["files"]),
       "status": "verified",
       "scope": "local-only",
   }
   raw = canonical_json(intent)
   try:
     with open_directory((*RUNS, state["run_id"])) as directory:
+      try:
+        write_exclusive(directory, "source-manifest.json", source_manifest_raw)
+      except FileExistsError:
+        if read_regular("source-manifest.json", dir_fd=directory, max_bytes=SOURCE_MANIFEST_MAX_RAW) != source_manifest_raw:
+          raise Rejected("source manifest readback conflict") from None
+      if read_regular("source-manifest.json", dir_fd=directory, max_bytes=SOURCE_MANIFEST_MAX_RAW) != source_manifest_raw:
+        raise Rejected("source manifest readback conflict")
+      manifest_info = os.stat("source-manifest.json", dir_fd=directory, follow_symlinks=False)
+      if not stat.S_ISREG(manifest_info.st_mode) or stat.S_IMODE(manifest_info.st_mode) != 0o600:
+        raise Rejected("source manifest permissions invalid")
       try:
         write_exclusive(directory, "run-intent.json", raw)
       except FileExistsError:
@@ -1496,6 +1798,9 @@ def main(argv: list[str] | None = None) -> int:
       return run_image_lifecycle(args)
     if args.command == "acceptance":
       return run_acceptance(args.profile)
+    elif args.command == "validate-artifacts":
+      validate_artifact_inputs(args.baseline, args.projection, args.config)
+      print("artifacts valid")
     elif args.command == "validate-config":
       load_config(args.config, args.profile)
       print("configuration valid")
@@ -1503,19 +1808,33 @@ def main(argv: list[str] | None = None) -> int:
       state, _ = new_run(args) if args.run_id is None else checked_run(args)
       print(state["run_id"])
     elif args.command == "full":
-      state, config = new_run(args) if args.new_run else checked_run(args)
+      if args.new_run:
+        # Validate every fallible local input gate before claiming a run ID.
+        config, config_raw = load_config_source(args.config, args.profile)
+        provisional_state = {"profile": config["profile"],
+                             "config_sha256": sha256(config_raw).hexdigest()}
+        artifact_hashes = validate_full_intent_input_selection(
+            args, provisional_state, config, config_raw=config_raw)
+        source_manifest_raw = capture_source_manifest()
+        state = create_run(config, config_raw=config_raw)
+        print(state["run_id"], flush=True)
+      else:
+        state, config = checked_run(args)
+        if state["profile"] not in LOCAL_PROFILES:
+          raise Rejected("full supports only local profiles")
+        if config is None:
+          raise Rejected("full requires --config")
+        config, config_raw = load_config_source(args.config, state["profile"])
+        artifact_hashes = validate_full_intent_input_selection(
+            args, state, config, config_raw=config_raw)
+        validate_persisted_full_intent(state, artifact_hashes)
+        source_manifest_raw = capture_source_manifest()
       if state["profile"] not in LOCAL_PROFILES:
         raise Rejected("full supports only local profiles")
-      if args.new_run:
-        print(state["run_id"], flush=True)
-      if config is None:
-        raise Rejected("full requires --config")
-      config, config_raw = load_config_source(args.config, state["profile"])
-      validate_full_intent_input_selection(args, state, config, config_raw=config_raw)
       perform_local_preflight(config, state["profile"])
       perform_build(state, config)
       perform_test(state, config)
-      seal_local_run_intent(state)
+      seal_local_run_intent(state, source_manifest_raw, artifact_hashes)
       print("full verified; local run-intent sealed; no remote operations performed")
     elif args.command == "promote":
       authorize("promote", args)
