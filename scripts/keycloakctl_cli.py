@@ -35,7 +35,7 @@ PLANS = {
   "readiness": (*PREPARE, "verify readiness", "teardown"),
   "qualification": (*PREPARE, "manual Android evidence", "integration-test", "verify qualification"),
 }
-LIVE_PHASES = {"publish", "deploy", "configure", "integration-test", "verify readiness", "teardown"}
+LIVE_PHASES = {"publish", "deploy", "configure", "integration-test", "verify readiness", "verify qualification", "teardown"}
 TEST_STEPS = ("java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check")
 IMAGE_FINGERPRINT_TARGETS = (
   "issue6-callback-gate-test-runtime",
@@ -359,7 +359,7 @@ def new_run(args) -> tuple[dict, dict]:
 
 
 def authorize(phase: str, args) -> None:
-  if phase in LIVE_PHASES:
+  if phase in LIVE_PHASES or phase == "preflight":
     if not args.allow_live:
       raise Rejected(f"{phase} requires --allow-live on this invocation")
     reference = getattr(args, "approval_ref", None)
@@ -1195,14 +1195,14 @@ No remote or live operation is authorized by this CLI help.
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
-  authorization_help = (" Remote-live work is deferred here. Before each invocation, verify active owner approval "
-                        "out of band for exact artifact hashes, target, operations/cases, and windows, then supply "
+  authorization_help = (" Remote operations, including readiness/qualification preflight probes, require active owner approval "
+                        "verified out of band for exact artifact hashes, target, operations/cases, and windows, then supply "
                         "--approval-ref REF, --approval-sha256 HASH, and --allow-live. References are audit-only, "
                         "not authentication; values are not persisted or echoed.")
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
                   "validate-artifacts": "validate adopted-design baseline/projection artifacts offline",
                   "acceptance": "run local acceptance stages and write a durable receipt",
-                  **{name: description + (authorization_help if name in LIVE_PHASES or name == "verify" else "")
+                  **{name: description + (authorization_help if name in LIVE_PHASES or name in ("verify", "preflight") else "")
                      for name, description in PHASE_HELP.items()},
                   "full": "run local preflight/build/test, seal local run-intent, and stop before remote mutations"}
   descriptions["promote"] = PHASE_HELP["promote"] + (
@@ -1235,7 +1235,7 @@ No remote or live operation is authorized by this CLI help.
       selection.add_argument("--run-id")
     elif name not in ("validate-config", "validate-artifacts", "acceptance"):
       command.add_argument("--run-id", required=name not in ("setup", "promote"))
-    if name in LIVE_PHASES or name == "verify":
+    if name in LIVE_PHASES or name in ("verify", "preflight"):
       command.add_argument("--allow-live", action="store_true", help="required on each live invocation")
       command.add_argument("--approval-ref", metavar="REF",
                            help="opaque out-of-band approval reference; audit only, not authentication")
@@ -1909,6 +1909,8 @@ def main(argv: list[str] | None = None) -> int:
       phase = f"verify {args.scope}" if args.command == "verify" else args.command
       authorize(phase, args)
       state, config = checked_run(args)
+      if phase == "preflight" and state["profile"] in LIVE_PROFILES:
+        authorize("preflight", args)
       if phase == "build":
         guard_phase(phase, state, config)
         perform_build(state, config)
