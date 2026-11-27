@@ -164,6 +164,11 @@ class FullLocalOnlyTest(unittest.TestCase):
     fixture.baseline["runtime_config"]["sha256"] = sha256(config_raw).hexdigest()
     fixture.baseline["case_inventory"]["sha256"] = sha256(fixture.projection_bytes()).hexdigest()
     fixture.write_artifacts()
+    (root / "scripts").mkdir(exist_ok=True)
+    for relative in ("keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"):
+      path = root / relative
+      if not path.exists():
+        path.write_text(f"fixture:{relative}\\n", encoding="utf-8")
     return config, config_raw, fixture.baseline_path, fixture.projection_path
 
   def _run_full_with_artifacts(self, state, config_path, baseline_path, projection_path):
@@ -254,17 +259,25 @@ class FullLocalOnlyTest(unittest.TestCase):
                         "-c", "user.name=Test", "add", ".gitignore"], check=True)
         subprocess.run(["git", "-C", str(root), "-c", "user.email=test@example.invalid",
                         "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
-        state = keycloakctl_cli.create_run(config, config_raw=config_raw)
-        build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
-        test = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                "test_source_sha256": "a" * 64}
         write_exclusive = keycloakctl_cli.write_exclusive
 
         def interrupt_before_intent(directory, name, data):
           if name == "run-intent.json":
             raise OSError("simulated interruption before run-intent write")
           write_exclusive(directory, name, data)
+
+        (root / "scripts").mkdir(exist_ok=True)
+        for relative in ("keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"):
+          (root / relative).write_text(f"fixture:{relative}\\n", encoding="utf-8")
+        state = keycloakctl_cli.create_run(config, config_raw=config_raw)
+        build = {"version": 1, "run_id": state["run_id"], "status": "complete",
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
+        test = {"version": 1, "run_id": state["run_id"], "status": "complete",
+                "test_source_sha256": "a" * 64}
 
         with (patch.object(keycloakctl_cli, "perform_local_preflight"),
               patch.object(keycloakctl_cli, "perform_build"),
@@ -315,8 +328,31 @@ class FullLocalOnlyTest(unittest.TestCase):
         self.assertEqual(sha256(manifest_before).hexdigest(), intent["source_manifest_sha256"])
         self.assertEqual(sha256(keycloakctl_cli.canonical_json(build)).hexdigest(), intent["build_sha256"])
         self.assertEqual(test["test_source_sha256"], intent["test_source_sha256"])
+        self.assertEqual(build["records"]["provider"]["image_id"], intent["provider_image_id"])
+        self.assertEqual(build["records"]["rp-fixture"]["image_id"], intent["rp_fixture_image_id"])
+        self.assertEqual(sha256(keycloakctl_cli.canonical_json(build["receipt"])).hexdigest(),
+                         intent["build_receipt_sha256"])
+        self.assertEqual(sha256(keycloakctl_cli.canonical_json(test)).hexdigest(), intent["test_receipt_sha256"])
+        source_files = json.loads(manifest_before)["files"]
+        identity_paths = {"keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"}
+        identity = {entry["path"]: entry for entry in source_files if entry["path"] in identity_paths}
+        self.assertEqual(identity_paths, set(identity))
+        self.assertEqual(sha256(keycloakctl_cli.canonical_json(identity)).hexdigest(), intent["cli_helper_sha256"])
 
         intent_before = intent_path.read_bytes()
+        with (patch.object(keycloakctl_cli, "perform_local_preflight") as preflight,
+              patch.object(keycloakctl_cli, "perform_build") as build_phase,
+              patch.object(keycloakctl_cli, "perform_test") as test_phase,
+              patch.object(keycloakctl_cli, "read_build_bundle", return_value=build),
+              patch.object(keycloakctl_cli, "read_test_receipt", return_value=test),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as resume_errors):
+          resumed_again = self._run_full_with_artifacts(state, config_path, baseline_path, projection_path)
+        self.assertEqual(0, resumed_again, resume_errors.getvalue())
+        preflight.assert_called_once_with(config, "dev")
+        build_phase.assert_called_once_with(state, config)
+        test_phase.assert_called_once_with(state, config)
+        self.assertEqual(intent_before, intent_path.read_bytes())
+        self.assertEqual(manifest_before, manifest_path.read_bytes())
         intent_path.chmod(0o644)
         with (patch.object(keycloakctl_cli, "perform_local_preflight") as preflight,
               patch.object(keycloakctl_cli, "perform_build") as build_phase,
@@ -349,7 +385,11 @@ class FullLocalOnlyTest(unittest.TestCase):
                         "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
         state = keycloakctl_cli.create_run(config, config_raw=config_raw)
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                 "test_source_sha256": "a" * 64}
         baseline_raw = baseline_path.read_bytes()
@@ -418,7 +458,11 @@ class FullLocalOnlyTest(unittest.TestCase):
                         "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
         state = keycloakctl_cli.create_run(config, config_raw=config_raw)
         build_record = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                        "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                        "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test_record = {"version": 1, "run_id": state["run_id"], "status": "complete",
                        "test_source_sha256": "a" * 64}
         with (patch.object(keycloakctl_cli, "perform_local_preflight"),
@@ -476,7 +520,9 @@ class FullLocalOnlyTest(unittest.TestCase):
         self.assertEqual(prior_manifest, manifest_path.read_bytes())
 
   def test_public_full_rejects_tampered_sealed_hashes_before_local_phases(self):
-    for field in ("build_sha256", "test_source_sha256"):
+    fields = ("build_sha256", "test_source_sha256", "cli_helper_sha256", "build_receipt_sha256",
+              "test_receipt_sha256", "provider_image_id", "rp_fixture_image_id")
+    for field in fields:
       with self.subTest(field=field), tempfile.TemporaryDirectory(
           prefix="keycloakctl-full-intent-hash-") as temporary:
         root = Path(temporary)
@@ -494,7 +540,11 @@ class FullLocalOnlyTest(unittest.TestCase):
                           "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
           state = keycloakctl_cli.create_run(config, config_raw=config_raw)
           build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                   "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                   "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
           test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                   "test_source_sha256": "a" * 64}
           with (patch.object(keycloakctl_cli, "perform_local_preflight"),
@@ -510,12 +560,15 @@ class FullLocalOnlyTest(unittest.TestCase):
           intent_path, manifest_path = run_dir / "run-intent.json", run_dir / "source-manifest.json"
           original_intent = intent_path.read_bytes()
           manifest_before = manifest_path.read_bytes()
-          for tampered_value in ("not-a-lowercase-sha256", "b" * 64):
+          malformed = "not-a-sha256"
+          different_valid = ("sha256:" + "b" * 64 if field.endswith("image_id") else "b" * 64)
+          for tampered_value in (malformed, different_valid):
             with self.subTest(field=field, value=tampered_value):
               intent = json.loads(original_intent)
               intent[field] = tampered_value
-              if tampered_value == "b" * 64:
-                self.assertRegex(tampered_value, r"\A[0-9a-f]{64}\Z")
+              if tampered_value == different_valid:
+                pattern = r"\Asha256:[0-9a-f]{64}\Z" if field.endswith("image_id") else r"\A[0-9a-f]{64}\Z"
+                self.assertRegex(tampered_value, pattern)
                 self.assertNotEqual(original_intent, keycloakctl_cli.canonical_json(intent))
               tampered_intent = keycloakctl_cli.canonical_json(intent)
               intent_path.write_bytes(tampered_intent)
@@ -553,7 +606,11 @@ class FullLocalOnlyTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
         subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
         build = {"version": 1, "run_id": "", "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": "", "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": "", "status": "complete",
                 "test_source_sha256": "a" * 64}
         with (patch.object(keycloakctl_cli, "perform_local_preflight"),
@@ -601,7 +658,11 @@ class FullLocalOnlyTest(unittest.TestCase):
         untracked.write_bytes(b"build input sentinel bytes")
         state = keycloakctl_cli.create_run(config)
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                 "test_source_sha256": "a" * 64}
         calls = []
@@ -629,13 +690,14 @@ class FullLocalOnlyTest(unittest.TestCase):
         self.assertEqual("verified", receipt["status"])
         self.assertEqual(sha256(keycloakctl_cli.canonical_json(build)).hexdigest(), receipt["build_sha256"])
         self.assertEqual(test["test_source_sha256"], receipt["test_source_sha256"])
-        self.assertEqual(6, receipt["source_manifest_count"])
+        self.assertEqual(9, receipt["source_manifest_count"])
         with keycloakctl_cli.open_directory(("target", "keycloakctl", "runs", state["run_id"])) as run_directory:
           source_raw = keycloakctl_cli.read_regular("source-manifest.json", dir_fd=run_directory)
           source = keycloakctl_cli.parse_json(source_raw)
         self.assertEqual(receipt["source_manifest_sha256"], sha256(source_raw).hexdigest())
         files = {entry["path"]: entry for entry in source["files"]}
         self.assertEqual({".gitignore", "tracked-source.txt", "untracked-build-input.bin", "config.json",
+                          "keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py",
                           "config/keycloakctl/config.schema.json",
                           "config/keycloakctl/issue74-artifact.schema.json"}, set(files))
         self.assertEqual("0644", files["tracked-source.txt"]["mode"])
@@ -693,7 +755,11 @@ class FullLocalOnlyTest(unittest.TestCase):
         untracked = root / "input.txt"
         untracked.write_text("before\n", encoding="utf-8")
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                 "test_source_sha256": "a" * 64}
         def mutate_inputs(*_args):
@@ -1221,7 +1287,7 @@ with patch.object(cli, 'ROOT', root), \
     self.assertIn("Live operations were not performed", migration_map)
     self.assertIn("| 4. Full local build/test/image acceptance and CI no-remote-side-effect gates | The `./keycloakctl acceptance --profile offline` profile is the local build/test/image-smoke path; this row remains partial until its exact source-bound receipt and the PR CI side-effect boundary are independently verified. | Partial (offline candidate scope only) |",
                   migration_map)
-    self.assertIn("| 10. Ownership boundary and strict artifact validation | Artifact shapes/hashes and source-manifest capture/readback subclaims exercised; no owner authentication, approval enforcement, or remote-run gating. | Partial (bounded subclaims only) |",
+    self.assertIn("| 10. Ownership boundary and strict artifact validation | Strict baseline/projection validation remains input-only. This increment additionally proves closed persisted local run-intent validation for source/CLI-helper, image-ID, and complete same-run build/test receipt bindings before resumed local phases; it does not provision, authenticate approval, or implement target/operator/scope/window authorization. | Partial (bounded validation subclaims only) |",
                   migration_map)
     self.assertNotIn("runtime/isolated-test lock remains blocked", migration_map)
     self.assertNotIn("isolated canonical test path do not have it", migration_map)

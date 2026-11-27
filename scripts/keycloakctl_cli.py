@@ -1515,6 +1515,16 @@ def validate_run_intent_inputs(config: dict, profile: str, *, config_raw: bytes)
     raise ValueError("run intent configuration version invalid")
 
 
+def source_cli_helper_sha256(source: dict) -> str:
+  """Fingerprint the captured CLI entry point and its lifecycle helpers."""
+  paths = {"keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"}
+  entries = {entry["path"]: entry for entry in source["files"]
+             if type(entry) is dict and entry.get("path") in paths}
+  if entries.keys() != paths:
+    raise ValueError("CLI/helper identity missing from source manifest")
+  return sha256(canonical_json(entries)).hexdigest()
+
+
 def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str]) -> None:
   """Fail closed on an existing sealed source/artifact binding before local work."""
   try:
@@ -1546,7 +1556,9 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
       intent = parse_json(intent_raw)
       expected_keys = {"version", "run_id", "profile", "config_sha256", "baseline_sha256",
                        "projection_sha256", "build_sha256", "test_source_sha256",
-                       "source_manifest_sha256", "source_manifest_count", "status", "scope"}
+                       "source_manifest_sha256", "source_manifest_count", "cli_helper_sha256",
+                       "provider_image_id", "rp_fixture_image_id", "build_receipt_sha256",
+                       "test_receipt_sha256", "status", "scope"}
       if (type(intent) is not dict or intent.keys() != expected_keys
           or type(intent["version"]) is not int or intent["version"] != 1
           or intent["run_id"] != state["run_id"] or intent["profile"] != state["profile"]
@@ -1555,12 +1567,15 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
           or intent["projection_sha256"] != artifact_hashes["projection_sha256"]
           or any(type(intent[field]) is not str
                  or re.fullmatch(r"[0-9a-f]{64}", intent[field]) is None
-                 for field in ("build_sha256", "test_source_sha256"))
+                 for field in ("build_sha256", "test_source_sha256", "cli_helper_sha256",
+                               "build_receipt_sha256", "test_receipt_sha256"))
+          or any(type(intent[field]) is not str
+                 or re.fullmatch(r"sha256:[0-9a-f]{64}", intent[field]) is None
+                 for field in ("provider_image_id", "rp_fixture_image_id"))
           or intent["status"] != "verified" or intent["scope"] != "local-only"
           or intent["source_manifest_sha256"] != sha256(source_raw).hexdigest()
           or type(intent["source_manifest_count"]) is not int
-          or intent["source_manifest_count"] != len(source["files"])
-          ):
+          or intent["source_manifest_count"] != len(source["files"])):
         raise ValueError
       if canonical_json(intent) != intent_raw:
         raise ValueError
@@ -1568,7 +1583,12 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
       test_receipt = None if bundle is None else read_test_receipt(state, bundle)
       if (bundle is None or test_receipt is None
           or sha256(canonical_json(bundle)).hexdigest() != intent["build_sha256"]
-          or test_receipt["test_source_sha256"] != intent["test_source_sha256"]):
+          or test_receipt["test_source_sha256"] != intent["test_source_sha256"]
+          or sha256(canonical_json(bundle["receipt"])).hexdigest() != intent["build_receipt_sha256"]
+          or sha256(canonical_json(test_receipt)).hexdigest() != intent["test_receipt_sha256"]
+          or bundle["records"]["provider"]["image_id"] != intent["provider_image_id"]
+          or bundle["records"]["rp-fixture"]["image_id"] != intent["rp_fixture_image_id"]
+          or intent["cli_helper_sha256"] != source_cli_helper_sha256(source)):
         raise ValueError
   except Rejected:
     raise Rejected("run-intent readback conflict") from None
@@ -1761,6 +1781,11 @@ def seal_local_run_intent(state: dict, source_manifest_raw: bytes,
       "test_source_sha256": test_receipt["test_source_sha256"],
       "source_manifest_sha256": source_sha256,
       "source_manifest_count": len(source_manifest["files"]),
+      "cli_helper_sha256": source_cli_helper_sha256(source_manifest),
+      "provider_image_id": bundle["records"]["provider"]["image_id"],
+      "rp_fixture_image_id": bundle["records"]["rp-fixture"]["image_id"],
+      "build_receipt_sha256": sha256(canonical_json(bundle["receipt"])).hexdigest(),
+      "test_receipt_sha256": sha256(canonical_json(test_receipt)).hexdigest(),
       "status": "verified",
       "scope": "local-only",
   }
