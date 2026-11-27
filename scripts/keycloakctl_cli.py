@@ -1907,7 +1907,8 @@ def main(argv: list[str] | None = None) -> int:
       raise Unavailable("promote unavailable in the offline foundation")
     else:
       phase = f"verify {args.scope}" if args.command == "verify" else args.command
-      authorize(phase, args)
+      if phase != "preflight":
+        authorize(phase, args)
       state, config = checked_run(args)
       if phase == "preflight" and state["profile"] in LIVE_PROFILES:
         authorize("preflight", args)

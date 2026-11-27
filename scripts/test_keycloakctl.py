@@ -2240,8 +2240,7 @@ else: raise SystemExit(91)
         path = self.config_file({"version": 1, "profile": profile, "engine": engine})
         run_id = self.setup_run("--profile", profile, "--config", path)
         before = self.storage_snapshot()
-        result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
-                          "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
         self.assertEqual((0, "preflight passed\n", ""),
                          (result.returncode, result.stdout, result.stderr))
         self.assertEqual(before, self.storage_snapshot())
@@ -2291,8 +2290,7 @@ else: raise SystemExit(91)
         run_id = self.setup_run("--profile", profile, "--config", path)
         before = self.storage_snapshot()
 
-        result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
-                          "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
 
         self.assertEqual((0, "preflight passed\n", ""),
                          (result.returncode, result.stdout, result.stderr))
@@ -2315,8 +2313,7 @@ else: raise SystemExit(91)
         run_id = self.setup_run("--profile", profile, "--config", path)
         before = self.storage_snapshot()
 
-        result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
-                          "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
 
         self.assertEqual((2, "", "error: preflight local tool check failed\n"),
                          (result.returncode, result.stdout, result.stderr))
@@ -2344,8 +2341,7 @@ else: raise SystemExit(91)
         path = self.config_file({"version": 1, "profile": profile, "engine": selected_engine})
         run_id = self.setup_run("--profile", profile, "--config", path)
         before = self.storage_snapshot()
-        result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
-                          "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
         self.assertEqual((2, "", "error: preflight local tool check failed\n"),
                          (result.returncode, result.stdout, result.stderr))
         self.assertEqual(before, self.storage_snapshot())
@@ -2399,8 +2395,7 @@ else: raise SystemExit(91)
         path = self.config_file({"version": 1, "profile": profile, "engine": engine})
         run_id = self.setup_run("--profile", profile, "--config", path)
         before = self.storage_snapshot()
-        result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
-                          "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
+        result = self.cli("preflight", "--run-id", run_id, "--config", path)
         self.assertEqual((2, "", "error: preflight local tool check failed\n"),
                          (result.returncode, result.stdout, result.stderr))
         calls = log.read_text(encoding="utf-8").splitlines()
