@@ -23,7 +23,8 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_PROFILES = ("dev", "ci")
 LIVE_PROFILES = ("readiness", "qualification")
-PROFILES = (*LOCAL_PROFILES, *LIVE_PROFILES)
+FULL_PROFILES = (*LOCAL_PROFILES, *LIVE_PROFILES)
+PROFILES = FULL_PROFILES
 MAX_JSON_BYTES = 8192
 RESERVATIONS = (".keycloakctl", "run-ids")
 RUNS = ("target", "keycloakctl", "runs")
@@ -34,7 +35,7 @@ PLANS = {
   "readiness": (*PREPARE, "verify readiness", "teardown"),
   "qualification": (*PREPARE, "manual Android evidence", "integration-test", "verify qualification"),
 }
-LIVE_PHASES = {"publish", "deploy", "configure", "integration-test", "verify readiness", "teardown"}
+LIVE_PHASES = {"publish", "deploy", "configure", "integration-test", "verify readiness", "verify qualification", "teardown"}
 TEST_STEPS = ("java-tests", "surefire", "python-tests", "python-compile", "image-smoke", "rp-fixture-smoke", "diff-check")
 IMAGE_FINGERPRINT_TARGETS = (
   "issue6-callback-gate-test-runtime",
@@ -44,7 +45,7 @@ IMAGE_FINGERPRINT_TARGETS = (
   "runtime",
 )
 PHASE_HELP = {
-  "preflight": "check local toolchain/engine prerequisites; remote target checks are deferred",
+  "preflight": "check local toolchain/engine prerequisites; readiness/qualification also have read-only remote target probes",
   "build": "package the provider, fetch and verify locked resolver inputs, then build the provider and test RP images",
   "test": "run acceptance checks and image smokes; Python checks fetch pinned prerequisites",
   "publish": "deferred/unavailable: remote image transfer is not supported by this candidate",
@@ -358,8 +359,13 @@ def new_run(args) -> tuple[dict, dict]:
 
 
 def authorize(phase: str, args) -> None:
-  if phase in LIVE_PHASES and not args.allow_live:
-    raise Rejected(f"{phase} requires --allow-live on this invocation")
+  if phase in LIVE_PHASES or phase == "preflight":
+    if not args.allow_live:
+      raise Rejected(f"{phase} requires --allow-live on this invocation")
+    reference = getattr(args, "approval_ref", None)
+    digest = getattr(args, "approval_sha256", None)
+    if (reference is None) != (digest is None) or not reference or re.fullmatch(r"[0-9a-fA-F]{64}", digest or "") is None:
+      raise Rejected(f"{phase} requires an approval reference and 64-character SHA-256")
   if phase == "promote" and not args.allow_publish:
     raise Rejected("promote requires --allow-publish on this invocation")
 
@@ -1150,26 +1156,57 @@ def make_parser() -> Parser:
   historical_plans = "\n".join(
       f"  {profile}: {' -> '.join(PLANS[profile])}" for profile in LIVE_PROFILES)
   help_text = f"""\
-Profiles: dev and ci are local. `full` accepts only these profiles and performs
-local preflight, build, test, and seals a local run-intent receipt. It has no
-live-operation flag and cannot contact or mutate a remote target.
+Profiles: `dev` and `ci` are local profiles; `readiness` and `qualification` are
+separate run profiles. `setup` and `full` accept all four. `full --new-run`
+allocates a unique run ID; `full --run-id RUN_ID` resumes only that existing
+run. Both forms perform local preflight/build/test, seal a local-only run-intent,
+and stop before publish or any other remote mutation. For readiness and
+qualification this is still local preparation only; it does not call the remote
+preflight adapter. `full` has no live-operation flag.
 {local_plans}
 
-Historical, deferred profile plans (not supported by this candidate):
+Profile plans available in the phase model (not all phases are implemented):
 {historical_plans}
 
-Issue #74 remains incomplete; remote lifecycle, qualification, and publication
-are deferred. The offline acceptance profile runs provider and RP fixture image
-builds/smokes, retains local images, and records cleanup as not run. Legacy
-`--allow-live` is not owner approval.
+`preflight` performs local tool/engine checks for local profiles. For readiness
+and qualification, standalone preflight additionally performs existing
+read-only remote target probes after required operator inputs/route attestation;
+it does not mutate remote state and is not approval. `full` does not invoke
+those remote probes.
+
+Remote-mutating/resuming commands are `publish`, `deploy`, `configure`,
+`integration-test`, `verify readiness`, `verify qualification`, and `teardown`.
+They remain unavailable in this candidate. Before any such invocation, an
+operator must verify current active owner approval out of band for the exact
+artifact hashes, target, operations/cases, and windows, and supply
+`--approval-ref REF` plus `--approval-sha256 HASH` (64 hexadecimal characters)
+and `--allow-live`. The reference and hash are opaque audit references only:
+they are not authentication or scope verification; no approval is inferred
+from their values. The pair is not persisted or echoed. `--allow-live` is an
+additional per-invocation gate, not owner approval.
+`promote --allow-publish` is a separate existing registry publication gate,
+not environment approval.
+
+The offline acceptance profile runs provider and RP fixture image builds/smokes,
+retains local images, and records cleanup as not run.
+Issue #74 remains incomplete.
+No remote or live operation is authorized by this CLI help.
 """
   parser = Parser(prog="keycloakctl", description=__doc__, allow_abbrev=False, epilog=help_text,
                   formatter_class=argparse.RawDescriptionHelpFormatter)
   commands = parser.add_subparsers(dest="command", required=True)
+  authorization_help = (" Remote operations, including readiness/qualification preflight probes, require active owner approval "
+                        "verified out of band for exact artifact hashes, target, operations/cases, and windows, then supply "
+                        "--approval-ref REF, --approval-sha256 HASH, and --allow-live. References are audit-only, "
+                        "not authentication; values are not persisted or echoed.")
   descriptions = {"setup": "prepare or reopen a local run", "validate-config": "validate non-secret JSON offline",
                   "validate-artifacts": "validate adopted-design baseline/projection artifacts offline",
                   "acceptance": "run local acceptance stages and write a durable receipt",
-                  **PHASE_HELP, "full": "run local preflight/build/test and seal a local run intent"}
+                  **{name: description + (authorization_help if name in LIVE_PHASES or name in ("verify", "preflight") else "")
+                     for name, description in PHASE_HELP.items()},
+                  "full": "run local preflight/build/test, seal local run-intent, and stop before remote mutations"}
+  descriptions["promote"] = PHASE_HELP["promote"] + (
+      "; a separate existing publication gate requiring --allow-publish, not environment owner approval")
   for name, description in descriptions.items():
     command = commands.add_parser(name, help=description, description=description, allow_abbrev=False)
     if name not in ("acceptance", "validate-artifacts"):
@@ -1189,7 +1226,7 @@ builds/smokes, retains local images, and records cleanup as not run. Legacy
       command.add_argument("--profile", choices=("offline",), required=True)
     elif name in ("setup", "validate-config", "full"):
       profile_choices = config_fields()["profile"]["enum"] if name == "validate-config" else (
-          LOCAL_PROFILES if name == "full" else PROFILES)
+          FULL_PROFILES if name == "full" else PROFILES)
       command.add_argument("--profile", choices=profile_choices,
                            required=name == "full")
     if name == "full":
@@ -1198,8 +1235,12 @@ builds/smokes, retains local images, and records cleanup as not run. Legacy
       selection.add_argument("--run-id")
     elif name not in ("validate-config", "validate-artifacts", "acceptance"):
       command.add_argument("--run-id", required=name not in ("setup", "promote"))
-    if name in LIVE_PHASES or name == "verify":
+    if name in LIVE_PHASES or name in ("verify", "preflight"):
       command.add_argument("--allow-live", action="store_true", help="required on each live invocation")
+      command.add_argument("--approval-ref", metavar="REF",
+                           help="opaque out-of-band approval reference; audit only, not authentication")
+      command.add_argument("--approval-sha256", metavar="HASH",
+                           help="SHA-256 of the referenced approval; audit only, not authentication")
     if name == "verify":
       command.add_argument("scope", choices=LIVE_PROFILES)
     if name == "promote":
@@ -1515,6 +1556,16 @@ def validate_run_intent_inputs(config: dict, profile: str, *, config_raw: bytes)
     raise ValueError("run intent configuration version invalid")
 
 
+def source_cli_helper_sha256(source: dict) -> str:
+  """Fingerprint the captured CLI entry point and its lifecycle helpers."""
+  paths = {"keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"}
+  entries = {entry["path"]: entry for entry in source["files"]
+             if type(entry) is dict and entry.get("path") in paths}
+  if entries.keys() != paths:
+    raise ValueError("CLI/helper identity missing from source manifest")
+  return sha256(canonical_json(entries)).hexdigest()
+
+
 def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str]) -> None:
   """Fail closed on an existing sealed source/artifact binding before local work."""
   try:
@@ -1546,7 +1597,9 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
       intent = parse_json(intent_raw)
       expected_keys = {"version", "run_id", "profile", "config_sha256", "baseline_sha256",
                        "projection_sha256", "build_sha256", "test_source_sha256",
-                       "source_manifest_sha256", "source_manifest_count", "status", "scope"}
+                       "source_manifest_sha256", "source_manifest_count", "cli_helper_sha256",
+                       "provider_image_id", "rp_fixture_image_id", "build_receipt_sha256",
+                       "test_receipt_sha256", "status", "scope"}
       if (type(intent) is not dict or intent.keys() != expected_keys
           or type(intent["version"]) is not int or intent["version"] != 1
           or intent["run_id"] != state["run_id"] or intent["profile"] != state["profile"]
@@ -1555,12 +1608,15 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
           or intent["projection_sha256"] != artifact_hashes["projection_sha256"]
           or any(type(intent[field]) is not str
                  or re.fullmatch(r"[0-9a-f]{64}", intent[field]) is None
-                 for field in ("build_sha256", "test_source_sha256"))
+                 for field in ("build_sha256", "test_source_sha256", "cli_helper_sha256",
+                               "build_receipt_sha256", "test_receipt_sha256"))
+          or any(type(intent[field]) is not str
+                 or re.fullmatch(r"sha256:[0-9a-f]{64}", intent[field]) is None
+                 for field in ("provider_image_id", "rp_fixture_image_id"))
           or intent["status"] != "verified" or intent["scope"] != "local-only"
           or intent["source_manifest_sha256"] != sha256(source_raw).hexdigest()
           or type(intent["source_manifest_count"]) is not int
-          or intent["source_manifest_count"] != len(source["files"])
-          ):
+          or intent["source_manifest_count"] != len(source["files"])):
         raise ValueError
       if canonical_json(intent) != intent_raw:
         raise ValueError
@@ -1568,7 +1624,12 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
       test_receipt = None if bundle is None else read_test_receipt(state, bundle)
       if (bundle is None or test_receipt is None
           or sha256(canonical_json(bundle)).hexdigest() != intent["build_sha256"]
-          or test_receipt["test_source_sha256"] != intent["test_source_sha256"]):
+          or test_receipt["test_source_sha256"] != intent["test_source_sha256"]
+          or sha256(canonical_json(bundle["receipt"])).hexdigest() != intent["build_receipt_sha256"]
+          or sha256(canonical_json(test_receipt)).hexdigest() != intent["test_receipt_sha256"]
+          or bundle["records"]["provider"]["image_id"] != intent["provider_image_id"]
+          or bundle["records"]["rp-fixture"]["image_id"] != intent["rp_fixture_image_id"]
+          or intent["cli_helper_sha256"] != source_cli_helper_sha256(source)):
         raise ValueError
   except Rejected:
     raise Rejected("run-intent readback conflict") from None
@@ -1579,8 +1640,8 @@ def validate_persisted_full_intent(state: dict, artifact_hashes: dict[str, str])
 def validate_full_intent_input_selection(args: argparse.Namespace, state: dict,
     config: dict, *, config_raw: bytes) -> dict[str, str]:
   """Validate selected local run inputs before preflight/build/test side effects."""
-  if state["profile"] not in LOCAL_PROFILES or args.profile != state["profile"]:
-    raise Rejected("full supports only local profiles")
+  if state["profile"] not in FULL_PROFILES or args.profile != state["profile"]:
+    raise Rejected("full profile does not match")
   if sha256(config_raw).hexdigest() != state["config_sha256"]:
     raise Rejected("run configuration readback conflict")
   if (getattr(args, "baseline", None) is None) != (getattr(args, "projection", None) is None):
@@ -1761,6 +1822,11 @@ def seal_local_run_intent(state: dict, source_manifest_raw: bytes,
       "test_source_sha256": test_receipt["test_source_sha256"],
       "source_manifest_sha256": source_sha256,
       "source_manifest_count": len(source_manifest["files"]),
+      "cli_helper_sha256": source_cli_helper_sha256(source_manifest),
+      "provider_image_id": bundle["records"]["provider"]["image_id"],
+      "rp_fixture_image_id": bundle["records"]["rp-fixture"]["image_id"],
+      "build_receipt_sha256": sha256(canonical_json(bundle["receipt"])).hexdigest(),
+      "test_receipt_sha256": sha256(canonical_json(test_receipt)).hexdigest(),
       "status": "verified",
       "scope": "local-only",
   }
@@ -1820,8 +1886,8 @@ def main(argv: list[str] | None = None) -> int:
         print(state["run_id"], flush=True)
       else:
         state, config = checked_run(args)
-        if state["profile"] not in LOCAL_PROFILES:
-          raise Rejected("full supports only local profiles")
+        if state["profile"] not in FULL_PROFILES:
+          raise Rejected("full profile does not match")
         if config is None:
           raise Rejected("full requires --config")
         config, config_raw = load_config_source(args.config, state["profile"])
@@ -1829,8 +1895,8 @@ def main(argv: list[str] | None = None) -> int:
             args, state, config, config_raw=config_raw)
         validate_persisted_full_intent(state, artifact_hashes)
         source_manifest_raw = capture_source_manifest()
-      if state["profile"] not in LOCAL_PROFILES:
-        raise Rejected("full supports only local profiles")
+      if state["profile"] not in FULL_PROFILES:
+        raise Rejected("full profile does not match")
       perform_local_preflight(config, state["profile"])
       perform_build(state, config)
       perform_test(state, config)
@@ -1841,8 +1907,11 @@ def main(argv: list[str] | None = None) -> int:
       raise Unavailable("promote unavailable in the offline foundation")
     else:
       phase = f"verify {args.scope}" if args.command == "verify" else args.command
-      authorize(phase, args)
+      if phase != "preflight":
+        authorize(phase, args)
       state, config = checked_run(args)
+      if phase == "preflight" and state["profile"] in LIVE_PROFILES:
+        authorize("preflight", args)
       if phase == "build":
         guard_phase(phase, state, config)
         perform_build(state, config)

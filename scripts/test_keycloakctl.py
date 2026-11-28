@@ -148,7 +148,7 @@ class SourceManifestCaptureTest(unittest.TestCase):
 
 
 class FullLocalOnlyTest(unittest.TestCase):
-  def _full_artifact_fixture(self, root, config_raw=None):
+  def _full_artifact_fixture(self, root, config_raw=None, profile="dev"):
     schema_dir = root / "config/keycloakctl"
     schema_dir.mkdir(parents=True, exist_ok=True)
     for name in ("issue74-artifact.schema.json", "config.schema.json"):
@@ -156,7 +156,7 @@ class FullLocalOnlyTest(unittest.TestCase):
     fixture = ArtifactValidationCliTest()
     fixture.setUp()
     self.addCleanup(fixture.doCleanups)
-    config = {"version": 1, "profile": "dev", "engine": "podman"}
+    config = {"version": 1, "profile": profile, "engine": "podman"}
     config_raw = ((json.dumps(config, indent=2) + "\n").encode("ascii")
                   if config_raw is None else config_raw)
     fixture.config_raw = config_raw
@@ -164,13 +164,87 @@ class FullLocalOnlyTest(unittest.TestCase):
     fixture.baseline["runtime_config"]["sha256"] = sha256(config_raw).hexdigest()
     fixture.baseline["case_inventory"]["sha256"] = sha256(fixture.projection_bytes()).hexdigest()
     fixture.write_artifacts()
+    (root / "scripts").mkdir(exist_ok=True)
+    for relative in ("keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"):
+      path = root / relative
+      if not path.exists():
+        path.write_text(f"fixture:{relative}\\n", encoding="utf-8")
     return config, config_raw, fixture.baseline_path, fixture.projection_path
 
   def _run_full_with_artifacts(self, state, config_path, baseline_path, projection_path):
-    args = ["full", "--profile", "dev", "--run-id", state["run_id"],
+    args = ["full", "--profile", state["profile"], "--run-id", state["run_id"],
             "--config", str(config_path), "--baseline", str(baseline_path),
             "--projection", str(projection_path)]
     return keycloakctl_cli.main(args)
+
+  def test_full_readiness_and_qualification_seal_real_local_intent(self):
+    for profile in ("readiness", "qualification"):
+      with self.subTest(profile=profile), tempfile.TemporaryDirectory(prefix="full-profile-local-") as temporary:
+        root = Path(temporary)
+        with patch.object(keycloakctl_cli, "ROOT", root):
+          config, config_raw, baseline, projection = self._full_artifact_fixture(root, profile=profile)
+          config_path = root / "runtime.json"
+          config_path.write_bytes(config_raw)
+          (root / ".gitignore").write_text("target/\\n", encoding="utf-8")
+          subprocess.run(["git", "init", "-q", str(root)], check=True)
+          subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+          subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+          source = root / "tracked-source.txt"
+          source.write_text("local source\\n", encoding="utf-8")
+          subprocess.run(["git", "-C", str(root), "add", ".gitignore", "tracked-source.txt"], check=True)
+          subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+          events = []
+          def fake_build(state, _config):
+            events.append("build")
+            run_id = state["run_id"]
+            records = {name: {"version": 1, "run_id": run_id, "status": "verified",
+                "image_id": "sha256:" + ("1" if name == "provider" else "2") * 64,
+                "source_sha256": "c" * 64, "config_sha256": state["config_sha256"]}
+                for name in ("provider", "rp-fixture")}
+            receipt = {"version": 1, "run_id": run_id, "status": "complete", "images": records}
+            with keycloakctl_cli.open_directory(("target", "keycloakctl", "runs", run_id)) as directory:
+              for name, record in records.items():
+                keycloakctl_cli.write_exclusive(directory, f"{name}.json", keycloakctl_cli.canonical_json(record))
+              keycloakctl_cli.write_exclusive(directory, "build.json", keycloakctl_cli.canonical_json(receipt))
+          def fake_test(state, _config):
+            events.append("test")
+            with keycloakctl_cli.open_directory(("target", "keycloakctl", "runs", state["run_id"])) as directory:
+              bundle = keycloakctl_cli.read_build_bundle(state)
+              receipt = {"version": 2, "run_id": state["run_id"], "status": "complete",
+                  "build_sha256": bundle["digest"], "test_source_sha256": "a" * 64,
+                  "config_sha256": state["config_sha256"],
+                  "provider_image_id": bundle["records"]["provider"]["image_id"],
+                  "steps": [{"name": name, "status": "pass"} for name in keycloakctl_cli.TEST_STEPS]}
+              keycloakctl_cli.write_exclusive(directory, "test.json", keycloakctl_cli.canonical_json(receipt))
+          with (patch.object(keycloakctl_cli, "perform_local_preflight", side_effect=lambda *_: events.append("local-preflight")),
+                patch.object(keycloakctl_cli, "perform_build", side_effect=fake_build),
+                patch.object(keycloakctl_cli, "perform_test", side_effect=fake_test),
+                patch.object(keycloakctl_cli, "perform_preflight", side_effect=AssertionError("remote preflight reached")),
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            result = keycloakctl_cli.main(["full", "--profile", profile, "--new-run", "--config", str(config_path),
+                "--baseline", str(baseline), "--projection", str(projection)])
+          self.assertEqual(0, result, errors.getvalue())
+          self.assertEqual(["local-preflight", "build", "test"], events)
+          self.assertIn("no remote operations performed", output.getvalue())
+          run_id = output.getvalue().splitlines()[0]
+          run_dir = root / "target/keycloakctl/runs" / run_id
+          intent_raw = (run_dir / "run-intent.json").read_bytes()
+          intent = json.loads(intent_raw)
+          source_raw = (run_dir / "source-manifest.json").read_bytes()
+          self.assertEqual("local-only", intent["scope"])
+          self.assertEqual("verified", intent["status"])
+          self.assertEqual(sha256(source_raw).hexdigest(), intent["source_manifest_sha256"])
+          state_config_hash = sha256(config_raw).hexdigest()
+          verified_build = keycloakctl_cli.read_build_bundle({"run_id": run_id, "config_sha256": state_config_hash})
+          verified_test = keycloakctl_cli.read_test_receipt({"run_id": run_id, "config_sha256": state_config_hash}, verified_build)
+          self.assertIsNotNone(verified_build)
+          self.assertIsNotNone(verified_test)
+          self.assertEqual(sha256(keycloakctl_cli.canonical_json(verified_build)).hexdigest(), intent["build_sha256"])
+          self.assertEqual(sha256(keycloakctl_cli.canonical_json(verified_test)).hexdigest(), intent["test_receipt_sha256"])
+          keycloakctl_cli.validate_persisted_full_intent(
+              keycloakctl_cli.checked_run(type("Args", (), {"run_id": run_id, "config": str(config_path), "command": "full"})())[0],
+              {"baseline_sha256": intent["baseline_sha256"], "projection_sha256": intent["projection_sha256"]})
+          self.assertEqual(0o600, (run_dir / "run-intent.json").stat().st_mode & 0o777)
 
   def test_public_full_new_run_requires_artifacts_before_creating_run_state(self):
     with tempfile.TemporaryDirectory(prefix="keycloakctl-full-required-artifacts-") as temporary:
@@ -254,17 +328,25 @@ class FullLocalOnlyTest(unittest.TestCase):
                         "-c", "user.name=Test", "add", ".gitignore"], check=True)
         subprocess.run(["git", "-C", str(root), "-c", "user.email=test@example.invalid",
                         "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
-        state = keycloakctl_cli.create_run(config, config_raw=config_raw)
-        build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
-        test = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                "test_source_sha256": "a" * 64}
         write_exclusive = keycloakctl_cli.write_exclusive
 
         def interrupt_before_intent(directory, name, data):
           if name == "run-intent.json":
             raise OSError("simulated interruption before run-intent write")
           write_exclusive(directory, name, data)
+
+        (root / "scripts").mkdir(exist_ok=True)
+        for relative in ("keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"):
+          (root / relative).write_text(f"fixture:{relative}\\n", encoding="utf-8")
+        state = keycloakctl_cli.create_run(config, config_raw=config_raw)
+        build = {"version": 1, "run_id": state["run_id"], "status": "complete",
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
+        test = {"version": 1, "run_id": state["run_id"], "status": "complete",
+                "test_source_sha256": "a" * 64}
 
         with (patch.object(keycloakctl_cli, "perform_local_preflight"),
               patch.object(keycloakctl_cli, "perform_build"),
@@ -315,8 +397,31 @@ class FullLocalOnlyTest(unittest.TestCase):
         self.assertEqual(sha256(manifest_before).hexdigest(), intent["source_manifest_sha256"])
         self.assertEqual(sha256(keycloakctl_cli.canonical_json(build)).hexdigest(), intent["build_sha256"])
         self.assertEqual(test["test_source_sha256"], intent["test_source_sha256"])
+        self.assertEqual(build["records"]["provider"]["image_id"], intent["provider_image_id"])
+        self.assertEqual(build["records"]["rp-fixture"]["image_id"], intent["rp_fixture_image_id"])
+        self.assertEqual(sha256(keycloakctl_cli.canonical_json(build["receipt"])).hexdigest(),
+                         intent["build_receipt_sha256"])
+        self.assertEqual(sha256(keycloakctl_cli.canonical_json(test)).hexdigest(), intent["test_receipt_sha256"])
+        source_files = json.loads(manifest_before)["files"]
+        identity_paths = {"keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py"}
+        identity = {entry["path"]: entry for entry in source_files if entry["path"] in identity_paths}
+        self.assertEqual(identity_paths, set(identity))
+        self.assertEqual(sha256(keycloakctl_cli.canonical_json(identity)).hexdigest(), intent["cli_helper_sha256"])
 
         intent_before = intent_path.read_bytes()
+        with (patch.object(keycloakctl_cli, "perform_local_preflight") as preflight,
+              patch.object(keycloakctl_cli, "perform_build") as build_phase,
+              patch.object(keycloakctl_cli, "perform_test") as test_phase,
+              patch.object(keycloakctl_cli, "read_build_bundle", return_value=build),
+              patch.object(keycloakctl_cli, "read_test_receipt", return_value=test),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as resume_errors):
+          resumed_again = self._run_full_with_artifacts(state, config_path, baseline_path, projection_path)
+        self.assertEqual(0, resumed_again, resume_errors.getvalue())
+        preflight.assert_called_once_with(config, "dev")
+        build_phase.assert_called_once_with(state, config)
+        test_phase.assert_called_once_with(state, config)
+        self.assertEqual(intent_before, intent_path.read_bytes())
+        self.assertEqual(manifest_before, manifest_path.read_bytes())
         intent_path.chmod(0o644)
         with (patch.object(keycloakctl_cli, "perform_local_preflight") as preflight,
               patch.object(keycloakctl_cli, "perform_build") as build_phase,
@@ -349,7 +454,11 @@ class FullLocalOnlyTest(unittest.TestCase):
                         "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
         state = keycloakctl_cli.create_run(config, config_raw=config_raw)
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                 "test_source_sha256": "a" * 64}
         baseline_raw = baseline_path.read_bytes()
@@ -418,7 +527,11 @@ class FullLocalOnlyTest(unittest.TestCase):
                         "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
         state = keycloakctl_cli.create_run(config, config_raw=config_raw)
         build_record = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                        "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                        "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test_record = {"version": 1, "run_id": state["run_id"], "status": "complete",
                        "test_source_sha256": "a" * 64}
         with (patch.object(keycloakctl_cli, "perform_local_preflight"),
@@ -476,7 +589,9 @@ class FullLocalOnlyTest(unittest.TestCase):
         self.assertEqual(prior_manifest, manifest_path.read_bytes())
 
   def test_public_full_rejects_tampered_sealed_hashes_before_local_phases(self):
-    for field in ("build_sha256", "test_source_sha256"):
+    fields = ("build_sha256", "test_source_sha256", "cli_helper_sha256", "build_receipt_sha256",
+              "test_receipt_sha256", "provider_image_id", "rp_fixture_image_id")
+    for field in fields:
       with self.subTest(field=field), tempfile.TemporaryDirectory(
           prefix="keycloakctl-full-intent-hash-") as temporary:
         root = Path(temporary)
@@ -494,7 +609,11 @@ class FullLocalOnlyTest(unittest.TestCase):
                           "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
           state = keycloakctl_cli.create_run(config, config_raw=config_raw)
           build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                   "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                   "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
           test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                   "test_source_sha256": "a" * 64}
           with (patch.object(keycloakctl_cli, "perform_local_preflight"),
@@ -510,12 +629,15 @@ class FullLocalOnlyTest(unittest.TestCase):
           intent_path, manifest_path = run_dir / "run-intent.json", run_dir / "source-manifest.json"
           original_intent = intent_path.read_bytes()
           manifest_before = manifest_path.read_bytes()
-          for tampered_value in ("not-a-lowercase-sha256", "b" * 64):
+          malformed = "not-a-sha256"
+          different_valid = ("sha256:" + "b" * 64 if field.endswith("image_id") else "b" * 64)
+          for tampered_value in (malformed, different_valid):
             with self.subTest(field=field, value=tampered_value):
               intent = json.loads(original_intent)
               intent[field] = tampered_value
-              if tampered_value == "b" * 64:
-                self.assertRegex(tampered_value, r"\A[0-9a-f]{64}\Z")
+              if tampered_value == different_valid:
+                pattern = r"\Asha256:[0-9a-f]{64}\Z" if field.endswith("image_id") else r"\A[0-9a-f]{64}\Z"
+                self.assertRegex(tampered_value, pattern)
                 self.assertNotEqual(original_intent, keycloakctl_cli.canonical_json(intent))
               tampered_intent = keycloakctl_cli.canonical_json(intent)
               intent_path.write_bytes(tampered_intent)
@@ -553,7 +675,11 @@ class FullLocalOnlyTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
         subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
         build = {"version": 1, "run_id": "", "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": "", "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": "", "status": "complete",
                 "test_source_sha256": "a" * 64}
         with (patch.object(keycloakctl_cli, "perform_local_preflight"),
@@ -601,7 +727,11 @@ class FullLocalOnlyTest(unittest.TestCase):
         untracked.write_bytes(b"build input sentinel bytes")
         state = keycloakctl_cli.create_run(config)
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                 "test_source_sha256": "a" * 64}
         calls = []
@@ -629,13 +759,14 @@ class FullLocalOnlyTest(unittest.TestCase):
         self.assertEqual("verified", receipt["status"])
         self.assertEqual(sha256(keycloakctl_cli.canonical_json(build)).hexdigest(), receipt["build_sha256"])
         self.assertEqual(test["test_source_sha256"], receipt["test_source_sha256"])
-        self.assertEqual(6, receipt["source_manifest_count"])
+        self.assertEqual(9, receipt["source_manifest_count"])
         with keycloakctl_cli.open_directory(("target", "keycloakctl", "runs", state["run_id"])) as run_directory:
           source_raw = keycloakctl_cli.read_regular("source-manifest.json", dir_fd=run_directory)
           source = keycloakctl_cli.parse_json(source_raw)
         self.assertEqual(receipt["source_manifest_sha256"], sha256(source_raw).hexdigest())
         files = {entry["path"]: entry for entry in source["files"]}
         self.assertEqual({".gitignore", "tracked-source.txt", "untracked-build-input.bin", "config.json",
+                          "keycloakctl", "scripts/keycloakctl_cli.py", "scripts/lifecycle.py",
                           "config/keycloakctl/config.schema.json",
                           "config/keycloakctl/issue74-artifact.schema.json"}, set(files))
         self.assertEqual("0644", files["tracked-source.txt"]["mode"])
@@ -693,7 +824,11 @@ class FullLocalOnlyTest(unittest.TestCase):
         untracked = root / "input.txt"
         untracked.write_text("before\n", encoding="utf-8")
         build = {"version": 1, "run_id": state["run_id"], "status": "complete",
-                 "images": {"provider": {"image_id": "sha256:" + "1" * 64}}}
+                 "images": {"provider": {"image_id": "sha256:" + "1" * 64},
+                            "rp-fixture": {"image_id": "sha256:" + "2" * 64}},
+                 "receipt": {"version": 1, "run_id": state["run_id"], "status": "complete"},
+                 "records": {"provider": {"image_id": "sha256:" + "1" * 64},
+                             "rp-fixture": {"image_id": "sha256:" + "2" * 64}}}
         test = {"version": 1, "run_id": state["run_id"], "status": "complete",
                 "test_source_sha256": "a" * 64}
         def mutate_inputs(*_args):
@@ -1042,6 +1177,7 @@ class KeycloakctlTest(unittest.TestCase):
   def test_acceptance_offline_profile_receipt_is_the_stage_inventory(self):
     # Assert the coordinator's real receipt, not a parallel helper's partial list.
     # Exercise argparse, the real coordinator and receipt writer; mock external stages.
+    receipt_marker = "issue74-receipt-env-marker-5e901a82d14f"
     code = """import json
 from pathlib import Path
 from unittest.mock import patch
@@ -1068,11 +1204,15 @@ with patch.object(cli, 'ROOT', root), \
   raise SystemExit(cli.main(['acceptance','--profile','offline']))
 """ % str(ROOT / "config/keycloakctl")
     result = subprocess.run([sys.executable, "-c", code], cwd=self.cwd,
-                            env={**self.env, "PYTHONPATH": str(ROOT)},
+                            env={**self.env, "PYTHONPATH": str(ROOT),
+                                 "KEYCLOAKCTL_TEST_SECRET": receipt_marker},
                             capture_output=True, text=True, timeout=10)
     self.assertEqual(0, result.returncode, result.stderr)
+    self.assertNotIn(receipt_marker, result.stdout)
+    self.assertNotIn(receipt_marker, result.stderr)
     self.assertIn("acceptance verified:", result.stdout)
     receipt_path = Path(result.stdout.strip().splitlines()[-1].removeprefix("acceptance verified: "))
+    self.assertNotIn(receipt_marker.encode(), receipt_path.read_bytes())
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     self.assertEqual("offline", receipt["profile"])
     self.assertEqual("complete", receipt["status"])
@@ -1219,26 +1359,64 @@ with patch.object(cli, 'ROOT', root), \
     self.assertIn("Ignored-but-nonexcluded build inputs are included", migration_map)
     self.assertIn("The standalone legacy `scripts/lifecycle.py python-tests` command is distinct from", migration_map)
     self.assertIn("Live operations were not performed", migration_map)
-    self.assertIn("| 4. Full local build/test/image acceptance and CI no-remote-side-effect gates | The `./keycloakctl acceptance --profile offline` profile is the local build/test/image-smoke path; this row remains partial until its exact source-bound receipt and the PR CI side-effect boundary are independently verified. | Partial (offline candidate scope only) |",
+    self.assertIn("| 4. Full local build/test/image acceptance and CI no-remote-side-effect gates | At source revision `da7213ad3e9839da030812c13c4fda90b7865cd1`, the offline acceptance receipt `target/keycloakctl/acceptance/e678cf35aada4dacbdb19f161fcc328b.json` records all local stages passed and cleanup `not_run`. The source-level workflow guard now asserts read-only `contents` permission, checkout credentials disabled, no secret/token references, exactly the three expected SHA-pinned checkout/Java/Python setup actions, and exactly the hash-pinned dependency install plus `./keycloakctl acceptance --profile offline` run commands. This is configuration evidence, not proof of hosted CI execution; the broader criterion remains incomplete. | Partial (local acceptance and workflow configuration subclaims only) |",
                   migration_map)
-    self.assertIn("| 10. Ownership boundary and strict artifact validation | Artifact shapes/hashes and source-manifest capture/readback subclaims exercised; no owner authentication, approval enforcement, or remote-run gating. | Partial (bounded subclaims only) |",
+    self.assertIn("| 10. Ownership boundary and strict artifact validation | Strict baseline/projection validation remains input-only. This increment additionally proves closed persisted local run-intent validation for source/CLI-helper, image-ID, and complete same-run build/test receipt bindings before resumed local phases; it does not provision, authenticate approval, or implement target/operator/scope/window authorization. | Partial (bounded validation subclaims only) |",
                   migration_map)
     self.assertNotIn("runtime/isolated-test lock remains blocked", migration_map)
     self.assertNotIn("isolated canonical test path do not have it", migration_map)
+
+  def test_public_help_spells_out_command_and_authorization_contract(self):
+    top = self.cli("--help")
+    self.assertEqual(0, top.returncode, top.stderr)
+    for verb in ("setup", "validate-config", "validate-artifacts", "acceptance", "preflight", "build",
+                 "test", "publish", "deploy", "configure", "integration-test", "verify readiness",
+                 "verify qualification", "teardown", "promote", "full", "image-fingerprints", "images"):
+      with self.subTest(verb=verb):
+        self.assertIn(verb, top.stdout)
+    top_text = " ".join(top.stdout.split())
+    for text in ("Profiles: `dev` and `ci` are local profiles", "readiness", "qualification", "full --new-run",
+                 "full --run-id RUN_ID", "verify current active owner approval out of band",
+                 "exact artifact hashes, target, operations/cases, and windows",
+                 "--approval-ref REF", "--approval-sha256 HASH", "--allow-live",
+                 "audit references only", "not authentication or scope verification",
+                 "remote preflight adapter", "stop before publish",
+                 "separate existing registry publication gate"):
+      with self.subTest(text=text):
+        self.assertIn(text, top_text)
+
+    for command in ("publish", "deploy", "configure", "integration-test", "teardown",
+                    "verify readiness", "verify qualification"):
+      result = self.cli(*command.split(), "--help")
+      help_text = " ".join(result.stdout.split())
+      with self.subTest(command=command):
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("approval-ref REF", help_text)
+        self.assertIn("approval-sha256 HASH", help_text)
+        self.assertIn("not authentication", help_text)
+    full = self.cli("full", "--help")
+    full_text = " ".join(full.stdout.split())
+    self.assertEqual(0, full.returncode, full.stderr)
+    self.assertIn("--new-run", full_text)
+    self.assertIn("--run-id RUN_ID", full_text)
+    self.assertIn("stop before remote mutations", full_text)
+    promote = self.cli("promote", "--help")
+    promote_text = " ".join(promote.stdout.split())
+    self.assertEqual(0, promote.returncode, promote.stderr)
+    self.assertIn("--allow-publish", promote_text)
+    self.assertIn("not environment owner approval", promote_text)
 
   def test_cli_help_labels_deferred_profile_plans_as_historical(self):
     result = self.cli("--help")
     self.assertEqual(0, result.returncode, result.stderr)
     self.assertIn("dev: setup -> build -> test", result.stdout)
-    self.assertIn("Historical, deferred profile plans (not supported by this candidate):",
-                  result.stdout)
+    self.assertIn("Profile plans available in the phase model (not all phases are implemented):", result.stdout)
     self.assertIn("readiness: setup -> preflight", result.stdout)
     self.assertIn("qualification: setup -> preflight", result.stdout)
     for command in ("publish", "deploy", "configure", "integration-test", "verify", "teardown"):
       with self.subTest(command=command):
         self.assertIn(f"{command:<19} deferred/unavailable:", result.stdout)
-    self.assertIn("promote             deferred; publication is unavailable in this candidate",
-                  result.stdout)
+    self.assertIn("promote             deferred; publication is unavailable", result.stdout)
 
   def test_local_setup_docs_pin_required_python_patch_version(self):
     docs = (ROOT / "docs/acceptance/keycloakctl-foundation.md").read_text(encoding="utf-8")
@@ -1476,6 +1654,29 @@ raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
     self.assertEqual({first, second}, {path.name for path in manifest.parent.parent.iterdir()})
     self.assertFalse((self.cwd / "outside").exists())
 
+  def test_valid_remote_setup_does_not_leak_accepted_config_sentinel_to_state_or_output(self):
+    for profile in ("readiness", "qualification"):
+      with self.subTest(profile=profile):
+        # This sentinel is a sink canary in an accepted non-secret config value,
+        # not a claimed credential field or a test of credential-provider integration.
+        sentinel = f"canary-{profile[:3]}-7f93c4b06c21"
+        config = json.loads((ROOT / f"config/keycloakctl/{profile}.json").read_text(
+            encoding="utf-8"))
+        config["remote"]["target_user"] = sentinel
+        config_path = self.config_file(config)
+
+        result = self.cli("setup", "--config", config_path)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertRegex(result.stdout, r"\A[0-9a-f]{32}\n\Z")
+        self.assertNotIn(sentinel, result.stdout)
+        self.assertNotIn(sentinel, result.stderr)
+
+        for state_root in (self.repo / "target", self.repo / ".keycloakctl"):
+          self.assertTrue(state_root.exists(), f"setup should create {state_root.name} state")
+          for path in state_root.rglob("*"):
+            if path.is_file():
+              self.assertNotIn(sentinel.encode(), path.read_bytes())
+
   def test_target_cleanup_removes_run_state_but_keeps_reservation(self):
     config_path = self.config_file(self.live_config(profile="readiness"))
     run_id = self.setup_run("--config", config_path)
@@ -1509,7 +1710,8 @@ raise SystemExit(int(os.environ.get("MAVEN_BUILD_EXIT", "0")))
     dev = ("--run-id", run_id)
     original = (self.run_directory(run_id) / "manifest.json").read_bytes()
     self.rejection(2, "invalid phase order; next phase is build", "test", *dev)
-    self.rejection(2, "phase is not supported by run profile", "publish", *dev, "--allow-live")
+    auth = ("--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "b" * 64)
+    self.rejection(2, "phase is not supported by run profile", "publish", *dev, *auth)
     self.rejection(3, "provider build or image readback failed", "build", *dev)
     self.rejection(3, "provider build or image readback failed", "build", *dev)
     self.assertEqual(original, (self.run_directory(run_id) / "manifest.json").read_bytes())
@@ -1981,7 +2183,8 @@ else: raise SystemExit(91)
     self.install_preflight_adapters()
     original = self.storage_snapshot()
     for _ in range(2):
-      result = self.cli("preflight", "--run-id", run_id, "--config", path)
+      result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
+                      "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
       self.assertEqual((0, "preflight passed\n", ""),
                        (result.returncode, result.stdout, result.stderr))
     self.assertEqual(original, self.storage_snapshot())
@@ -2178,7 +2381,8 @@ else: raise SystemExit(91)
     path = self.config_file({"version": 1, "profile": "dev", "engine": "podman"})
     run_id = self.setup_run("--profile", "dev", "--config", path)
     before = self.storage_snapshot()
-    result = self.cli("preflight", "--run-id", run_id, "--config", path)
+    result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
+                      "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
     self.assertEqual((2, "", "error: preflight local tool check failed\n"),
                      (result.returncode, result.stdout, result.stderr))
     self.assertEqual(before, self.storage_snapshot())
@@ -2283,10 +2487,26 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
         self.install_preflight_adapters()
         self.env.update(overrides)
         before = self.storage_snapshot()
-        result = self.cli("preflight", "--run-id", run_id, "--config", path)
+        result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
+                          "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
         self.assertEqual((2, "", f"error: preflight {message}\n"),
                          (result.returncode, result.stdout, result.stderr))
         self.assertEqual(before, self.storage_snapshot())
+
+  def test_remote_preflight_requires_authorization_before_any_remote_probe(self):
+    config = self.live_config("qualification")
+    path = self.config_file(config)
+    run_id = self.setup_run("--config", path)
+    self.install_preflight_adapters()
+    for flags, expected in (
+        ((), "preflight requires --allow-live on this invocation"),
+        (("--allow-live",), "preflight requires an approval reference and 64-character SHA-256"),
+    ):
+      result = self.cli("preflight", "--run-id", run_id, "--config", path, *flags)
+      self.assertEqual((2, "", f"error: {expected}\n"),
+                       (result.returncode, result.stdout, result.stderr))
+      self.assertFalse((self.cwd / "tailscale.jsonl").exists())
+      self.assertFalse((self.cwd / "tool.jsonl").exists())
 
   def test_preflight_requires_an_explicit_expected_tailscale_dns_name(self):
     config = self.live_config()
@@ -2295,7 +2515,8 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     run_id = self.setup_run("--config", path)
     self.install_preflight_adapters()
 
-    result = self.cli("preflight", "--run-id", run_id, "--config", path)
+    result = self.cli("preflight", "--run-id", run_id, "--config", path, "--allow-live",
+                      "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
 
     self.assertEqual((2, "", "error: preflight requires matching operator inputs and route attestation\n"),
                      (result.returncode, result.stdout, result.stderr))
@@ -2308,7 +2529,7 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     artifact_args = ("--baseline", "baseline.json", "--projection", "projection.json")
     self.rejection(2, "unknown run ID", *base, "--run-id", unknown, "--config", str(self.cwd / "config.json"),
                    *artifact_args)
-    self.rejection(2, "invalid arguments; see --help", "full", "--profile", "readiness", "--new-run")
+    self.rejection(2, "invalid arguments; see --help", "full", "--profile", "invalid", "--new-run")
     self.rejection(2, "invalid arguments; see --help", *base, "--new-run", "--allow-live")
     self.assertFalse((self.repo / "target").exists())
     self.assertFalse((self.repo / ".keycloakctl").exists())
@@ -2336,26 +2557,57 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     self.assertFalse((self.repo / "target").exists())
     self.assertFalse((self.repo / ".keycloakctl").exists())
 
+  def test_live_approval_reference_and_digest_are_required_as_a_non_echoed_pair(self):
+    run_id = self.setup_run("--profile", "readiness")
+    prefix = ("deploy", "--run-id", run_id, "--allow-live")
+    self.rejection(2, "deploy requires an approval reference and 64-character SHA-256",
+                   *prefix, "--approval-ref", "marker-ref")
+    self.rejection(2, "deploy requires an approval reference and 64-character SHA-256",
+                   *prefix, "--approval-sha256", "a" * 64)
+    self.rejection(2, "deploy requires an approval reference and 64-character SHA-256",
+                   *prefix, "--approval-ref", "marker-ref", "--approval-sha256", "bad")
+    result = self.cli(*prefix, "--approval-ref", "marker-ref", "--approval-sha256", "e" * 64)
+    self.assertEqual(2, result.returncode)
+    self.assertIn("invalid phase order", result.stderr)
+    self.assertNotIn("marker-ref", result.stdout + result.stderr)
+    self.assertNotIn("e" * 64, result.stdout + result.stderr)
+
+  def test_full_profile_parser_accepts_readiness_and_qualification(self):
+    for profile in ("readiness", "qualification"):
+      with self.subTest(profile=profile):
+        parsed = keycloakctl_cli.make_parser().parse_args(
+            ["full", "--profile", profile, "--new-run", "--config", "runtime.json",
+             "--baseline", "baseline.json", "--projection", "cases.json"])
+        self.assertEqual(profile, parsed.profile)
+
   def test_live_and_publish_authorization_are_distinct_and_not_persisted(self):
     config = self.live_config("qualification")
     qual = ("--run-id", self.setup_run("--config", self.config_file(config)))
     ready = ("--run-id", self.setup_run("--profile", "readiness"))
     original = self.storage_snapshot()
     for command, run in (("publish", qual), ("deploy", qual), ("configure", qual),
-                         ("integration-test", qual), ("teardown", qual), ("verify readiness", ready)):
+                         ("integration-test", qual), ("teardown", qual),
+                         ("verify readiness", ready), ("verify qualification", qual)):
       with self.subTest(command=command):
         args = (*command.split(), *run)
         denied = f"{command} requires --allow-live on this invocation"
-        self.rejection(2, denied, *args)
+        self.rejection(2, f"{command} requires --allow-live on this invocation", *args)
+        self.rejection(2, f"{command} requires an approval reference and 64-character SHA-256",
+                       *args, "--allow-live")
         authorized = ("teardown requires exact run-owned deployment readback" if command == "teardown"
                       else "invalid phase order; next phase is preflight")
-        self.rejection(2, authorized, *args, "--allow-live")
-        self.rejection(2, denied, *args)
+        self.rejection(2, authorized, *args, "--allow-live", "--approval-ref", "audit-ref",
+                       "--approval-sha256", "a" * 64)
+        self.rejection(2, f"{command} requires --allow-live on this invocation", *args)
 
-    self.rejection(2, "phase is not supported by run profile", "verify", "readiness", *qual, "--allow-live")
-    self.rejection(2, "phase is not supported by run profile", "integration-test", *ready, "--allow-live")
-    self.rejection(2, "phase is not supported by run profile", "verify", "qualification", *ready)
-    self.rejection(2, "invalid phase order; next phase is preflight", "verify", "qualification", *qual)
+    self.rejection(2, "phase is not supported by run profile", "verify", "readiness", *qual,
+                   "--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "c" * 64)
+    self.rejection(2, "phase is not supported by run profile", "integration-test", *ready,
+                   "--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "c" * 64)
+    self.rejection(2, "phase is not supported by run profile", "verify", "qualification", *ready,
+                   "--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "c" * 64)
+    self.rejection(2, "invalid phase order; next phase is preflight", "verify", "qualification", *qual,
+                   "--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "c" * 64)
     promote = ("promote", "--receipt", str(self.cwd / "reviewed-receipt.json"),
                "--destination", "docker://registry.invalid/example:rc-test")
     self.rejection(2, "promote requires --allow-publish on this invocation", *promote)
@@ -2383,6 +2635,37 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     self.assertFalse((self.repo / "target").exists())
     self.assertFalse((self.repo / ".keycloakctl").exists())
 
+  def test_public_setup_rejects_sensitive_unknown_fields_before_state_or_output(self):
+    examples = {profile: json.loads((self.repo / f"config/keycloakctl/{profile}.json").read_text())
+                for profile in ("dev", "ci", "readiness", "qualification")}
+    cases = []
+    for profile, example in examples.items():
+      cases.append((profile, "top-level", {**example, "password": f"marker-{profile}-password-8ce7"}))
+      cases.append((profile, "top-level", {**example, "client_secret": f"marker-{profile}-client-secret-a934"}))
+      if "remote" in example:
+        cases.append((profile, "nested", {**example, "remote": {
+            **example["remote"], "token": f"marker-{profile}-remote-token-53d1"}}))
+        cases.append((profile, "nested", {**example, "remote": {
+            **example["remote"], "api_key": f"marker-{profile}-remote-api-key-731c"}}))
+
+    for profile, field_group, config in cases:
+      with self.subTest(profile=profile, field_group=field_group, keys=set(config)):
+        marker_values = [value for key, value in config.items()
+                         if key in ("password", "client_secret")]
+        marker_values += [value for key, value in config.get("remote", {}).items()
+                          if key in ("token", "api_key")]
+        result = self.cli("setup", "--config", self.config_file(config))
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("error: invalid configuration\n", result.stderr)
+        for marker in marker_values:
+          self.assertNotIn(marker, result.stdout + result.stderr)
+        self.assertFalse((self.repo / "target/keycloakctl/runs").exists())
+        self.assertFalse((self.repo / "target/keycloakctl/acceptance").exists())
+        self.assertFalse((self.repo / ".keycloakctl/run-ids").exists())
+        self.assertFalse((self.repo / "target").exists())
+        self.assertFalse((self.repo / ".keycloakctl").exists())
+
   def test_remote_preflight_rejects_missing_or_placeholder_operator_inputs(self):
     config = self.live_config()
     for remote in ({}, {**config["remote"], "route_attested": False},
@@ -2393,7 +2676,8 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
         run_id = self.setup_run("--config", path)
         original = self.storage_snapshot()
         self.rejection(2, "preflight requires matching operator inputs and route attestation",
-                       "preflight", "--run-id", run_id, "--config", path)
+                       "preflight", "--run-id", run_id, "--config", path, "--allow-live",
+                       "--approval-ref", "fixture-ref", "--approval-sha256", "a" * 64)
         self.assertEqual(original, self.storage_snapshot())
 
   def reservation(self, run_id):
@@ -2438,7 +2722,8 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     run_id = self.setup_run("--config", self.config_file(config))
     state_path = self.run_directory(run_id) / "manifest.json"
     original = state_path.read_bytes()
-    result = self.cli("teardown", "--run-id", run_id, "--allow-live")
+    auth = ("--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "d" * 64)
+    result = self.cli("teardown", "--run-id", run_id, *auth)
     self.assertEqual((2, "", "error: teardown requires exact run-owned deployment readback\n"),
                      (result.returncode, result.stdout, result.stderr))
     self.assertEqual(original, state_path.read_bytes())
@@ -2447,7 +2732,8 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
     raw = json.dumps(forged, separators=(",", ":")).encode() + b"\n"
     self.reservation(run_id).write_text(sha256(raw).hexdigest(), encoding="ascii")
     state_path.write_bytes(raw)
-    result = self.cli("teardown", "--run-id", run_id, "--allow-live")
+    auth = ("--allow-live", "--approval-ref", "opaque ref", "--approval-sha256", "d" * 64)
+    result = self.cli("teardown", "--run-id", run_id, *auth)
     self.assertEqual((2, "", "error: run readback conflict\n"),
                      (result.returncode, result.stdout, result.stderr))
     self.assertEqual(raw, state_path.read_bytes())

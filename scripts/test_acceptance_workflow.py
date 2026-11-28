@@ -16,6 +16,28 @@ class AcceptanceWorkflowTest(unittest.TestCase):
     self.assertIn("uses: actions/checkout@", checkout)
     self.assertIn("persist-credentials: false", checkout)
 
+  def test_workflow_is_limited_to_read_only_setup_and_offline_acceptance(self):
+    workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
+    lines = workflow.splitlines()
+    permissions = workflow.split("permissions:\n", 1)[1].split("\nconcurrency:", 1)[0]
+    self.assertEqual("  contents: read\n", permissions)
+
+    uses = [line.strip()[6:] for line in lines if line.strip().startswith("uses:")]
+    self.assertEqual([
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0",
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0",
+    ], uses)
+
+    run_commands = [line.strip()[5:] for line in lines if line.strip().startswith("run:")]
+    self.assertEqual([
+        "python -m pip install --require-hashes -r requirements/issue8-oidc.lock",
+        "./keycloakctl acceptance --profile offline",
+    ], run_commands)
+    self.assertIn("persist-credentials: false", workflow)
+    self.assertNotIn("secrets.", workflow)
+    self.assertNotIn("GITHUB_TOKEN", workflow)
+
   def test_pr_workflow_checks_commits_while_local_runs_check_the_worktree(self):
     workflow = (ROOT / ".github/workflows/acceptance.yml").read_text()
     lifecycle = (ROOT / "scripts/lifecycle.py").read_text()
