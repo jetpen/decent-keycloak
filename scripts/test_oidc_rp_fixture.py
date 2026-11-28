@@ -8,7 +8,9 @@ import http.client
 import io
 import json
 import os
+import select
 import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -16,6 +18,7 @@ import time
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -173,6 +176,41 @@ class RPFixtureLocalStartupSmokeTest(unittest.TestCase):
                      (result.returncode, result.stdout, result.stderr))
 
 
+  def test_serve_cli_binds_only_the_configured_loopback_listener_and_stops_cleanly(self):
+    command = [sys.executable, str(ROOT / "scripts/oidc_rp_fixture.py"), "--serve",
+        "--issuer", "https://benx1.tailca8b51.ts.net/realms/qualification",
+        "--client-id", "qualification-client", "--public-origin",
+        "https://ben-x260.tailca8b51.ts.net", "--route-prefix", "/rp",
+        "--bind-host", "127.0.0.1", "--port", "0"]
+    environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    process = subprocess.Popen(command, cwd=ROOT, env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    try:
+      stdout = process.stdout
+      assert stdout is not None
+      readable, _, _ = select.select([stdout], [], [], 5)
+      self.assertTrue(readable, "serve mode did not report readiness")
+      ready = stdout.readline().strip()
+      self.assertRegex(ready, r"RP fixture ready; port=[1-9][0-9]{0,4}\Z")
+      port = int(ready.rsplit("=", 1)[1])
+      connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+      connection.request("GET", "/rp/not-a-route")
+      response = connection.getresponse()
+      self.assertEqual((400, b"request rejected"), (response.status, response.read()))
+      connection.close()
+    finally:
+      if process.poll() is None:
+        process.send_signal(signal.SIGTERM)
+      process.wait(timeout=5)
+      if process.stdout:
+        process.stdout.close()
+      if process.stderr:
+        stderr = process.stderr.read()
+        process.stderr.close()
+        self.assertEqual("", stderr)
+    self.assertEqual(0, process.returncode)
+
+
 class RPFixtureContractTest(unittest.TestCase):
   def setUp(self):
     self.issuer = FakeIssuer()
@@ -226,13 +264,128 @@ class RPFixtureContractTest(unittest.TestCase):
     return self.request("GET", callback_parts.path + ("?" + urlsplit(callback).query if "?" in callback else ""),
         headers={"Cookie": cookie})
 
+  def test_listener_rejects_wildcard_non_tailnet_and_wrong_public_ports(self):
+    config = FixtureConfig(self.issuer.issuer, self.issuer.client_id,
+        public_origin="https://qualification.example.net", route_prefix="/rp")
+    fixture = RPFixture(config)
+    for host, port in (("0.0.0.0", 18081), ("192.0.2.10", 18081),
+                       ("100.64.12.100", 18080), ("localhost", 18081)):
+      with self.subTest(host=host, port=port), self.assertRaises(ValueError):
+        fixture.start(bind_host=host, bind_port=port)
+      self.assertIsNone(fixture._server)
+    with self.assertRaises(ValueError):
+      RPFixture(FixtureConfig(self.issuer.issuer, self.issuer.client_id)).start(
+          bind_host="100.64.12.100", bind_port=18081)
+
+  def test_public_origin_route_prefix_is_static_not_derived_from_request_headers(self):
+    config = FixtureConfig(
+        issuer=self.issuer.issuer, client_id=self.issuer.client_id,
+        redirect_path="/callback", session_ttl_seconds=60,
+        public_origin="https://qualification.example.net",
+        route_prefix="/rp")
+    fixture = RPFixture(config)
+    server = fixture.start()
+    self.issuer.redirect_uri = "https://qualification.example.net/rp/callback"
+    try:
+      connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+      connection.request("GET", "/rp/login", headers={
+          "Host": "attacker.example", "X-Forwarded-Host": "attacker.example",
+          "X-Forwarded-Proto": "http"})
+      response = connection.getresponse()
+      headers = dict(response.getheaders())
+      response.read()
+      connection.close()
+      self.assertEqual(302, response.status)
+      query = parse_qs(urlsplit(headers["Location"]).query, keep_blank_values=True)
+      self.assertEqual(["https://qualification.example.net/rp/callback"], query["redirect_uri"])
+      self.assertIn("; Secure", headers["Set-Cookie"])
+      self.assertIn("; Path=/rp", headers["Set-Cookie"])
+
+      for path in ("/login", "/rp/not-a-route"):
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", path, headers={"Host": "qualification.example.net"})
+        rejected = connection.getresponse()
+        self.assertEqual((400, b"request rejected"), (rejected.status, rejected.read()))
+        connection.close()
+    finally:
+      fixture.close()
+
+  def test_public_https_issuer_metadata_stays_on_exact_configured_issuer_origin(self):
+    issuer_url = "https://benx1.tailca8b51.ts.net/realms/qualification"
+    config = FixtureConfig(issuer_url, self.issuer.client_id,
+        public_origin="https://ben-x260.tailca8b51.ts.net", route_prefix="/rp")
+    fixture = RPFixture(config)
+    server = fixture.start()
+
+    class Response:
+      status = 200
+      def __init__(self, document):
+        self.document = json.dumps(document).encode("utf-8")
+      def __enter__(self):
+        return self
+      def __exit__(self, *_args):
+        pass
+      def read(self, _limit):
+        return self.document
+
+    metadata_url = issuer_url + "/.well-known/openid-configuration"
+    metadata = {"issuer": issuer_url,
+        "authorization_endpoint": issuer_url + "/protocol/openid-connect/auth",
+        "token_endpoint": issuer_url + "/protocol/openid-connect/token",
+        "jwks_uri": issuer_url + "/protocol/openid-connect/certs"}
+    try:
+      with patch("scripts.oidc_rp_fixture._open_issuer_request", return_value=Response(metadata)) as open_url:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", "/rp/login")
+        response = connection.getresponse()
+        headers = dict(response.getheaders())
+        response.read()
+        connection.close()
+        self.assertEqual(302, response.status)
+        open_url.assert_called_once()
+        self.assertEqual(metadata_url, open_url.call_args.args[0].full_url)
+        authorization = urlsplit(headers["Location"])
+        self.assertEqual(("https", "benx1.tailca8b51.ts.net",
+                          "/realms/qualification/protocol/openid-connect/auth"),
+                         (authorization.scheme, authorization.netloc, authorization.path))
+        query = parse_qs(authorization.query, keep_blank_values=True)
+        self.assertEqual(["https://ben-x260.tailca8b51.ts.net/rp/callback"],
+                         query["redirect_uri"])
+
+      foreign = {**metadata, "jwks_uri": "https://attacker.example/jwks"}
+      with patch("scripts.oidc_rp_fixture._open_issuer_request", return_value=Response(foreign)) as open_url:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", "/rp/login")
+        response = connection.getresponse()
+        self.assertEqual((400, b"request rejected"), (response.status, response.read()))
+        connection.close()
+        open_url.assert_called_once()
+    finally:
+      fixture.close()
+
+  def test_public_origin_and_route_prefix_reject_ambiguous_values(self):
+    for origin in (
+        "http://qualification.example.net", "https://qualification.example.net/rp",
+        "https://qualification.example.net?x=1", "https://user@qualification.example.net",
+        "https://qualification.example.net#fragment"):
+      with self.subTest(origin=origin), self.assertRaises(ValueError):
+        FixtureConfig(self.issuer.issuer, self.issuer.client_id, public_origin=origin)
+    with self.assertRaises(ValueError):
+      FixtureConfig(self.issuer.issuer, self.issuer.client_id,
+                    public_origin="https://qualification.example.net")
+    for prefix in ("rp", "//rp", "/rp/../admin", "/rp?x=1", "/rp#fragment"):
+      with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+        FixtureConfig(self.issuer.issuer, self.issuer.client_id, route_prefix=prefix)
+
   def test_fixture_and_fake_issuer_bind_only_to_loopback(self):
     self.assertEqual("127.0.0.1", self.server.server_address[0])
     self.assertEqual("127.0.0.1", self.issuer.httpd.server_address[0])
     with self.assertRaises(ValueError):
-      FixtureConfig("https://idp.example/realm", self.issuer.client_id)
+      FixtureConfig("http://idp.example/realm", self.issuer.client_id)
     with self.assertRaises(ValueError):
       FixtureConfig("http://192.0.2.10/realm", self.issuer.client_id)
+    self.assertEqual("https://idp.example/realm",
+        FixtureConfig("https://idp.example/realm", self.issuer.client_id).issuer)
     with self.assertRaises(ValueError):
       FixtureConfig(self.issuer.issuer, self.issuer.client_id, session_ttl_seconds=3601)
     with self.assertRaises(ValueError):
@@ -320,7 +473,7 @@ class RPFixtureContractTest(unittest.TestCase):
       os.environ["http_proxy"] = proxy_url
       import importlib
       import scripts.oidc_rp_fixture as rp_module
-      prior_opener = rp_module._LOCAL_HTTP
+      prior_opener = rp_module._ISSUER_OPENER
       try:
         importlib.reload(rp_module)
         status, headers, _body = self.request("GET", "/login")
@@ -328,7 +481,7 @@ class RPFixtureContractTest(unittest.TestCase):
         self.assertTrue(headers["Location"].startswith(self.issuer.base + "/authorize?"))
         self.assertEqual([], seen)
       finally:
-        rp_module._LOCAL_HTTP = prior_opener
+        rp_module._ISSUER_OPENER = prior_opener
     finally:
       for name, value in old_env.items():
         if value is None:

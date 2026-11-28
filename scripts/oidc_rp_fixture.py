@@ -1,4 +1,9 @@
-"""Test-only relying party for offline OIDC Authorization Code + PKCE tests."""
+"""Test-only RP fixture for offline OIDC and configured HTTPS route tests.
+
+The public-origin configuration is an explicit static redirect/origin input; it
+never trusts Host or forwarded headers and does not configure or qualify the
+external proxy, browser, TLS path, or live issuer.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,11 +12,13 @@ import base64
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import re
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -27,32 +34,67 @@ class _NoRedirect(HTTPRedirectHandler):
     return None
 
 
-_LOCAL_HTTP = build_opener(ProxyHandler({}), _NoRedirect())
+_ISSUER_OPENER = build_opener(ProxyHandler({}), _NoRedirect())
 
 
-def _open_local(request: Request, timeout: int):
-  return _LOCAL_HTTP.open(request, timeout=timeout)
+def _open_issuer_request(request: Request, timeout: int):
+  return _ISSUER_OPENER.open(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
 class FixtureConfig:
-  """Issuer/client settings; redirect is derived from the loopback listener."""
+  """Issuer/client settings; redirect uses configured public origin or loopback."""
   issuer: str
   client_id: str
   redirect_path: str = "/callback"
   session_ttl_seconds: int = 60
+  public_origin: str | None = None
+  route_prefix: str = ""
 
   def __post_init__(self):
     parts = urlsplit(self.issuer)
-    if (parts.scheme != "http" or parts.hostname not in ("127.0.0.1", "::1")
-        or not parts.netloc or parts.query or parts.fragment):
-      raise ValueError("test RP issuer must be an HTTP loopback URL")
+    try:
+      _ = parts.port
+    except ValueError:
+      raise ValueError("test RP issuer has an invalid port") from None
+    issuer_loopback = parts.scheme == "http" and parts.hostname in ("127.0.0.1", "::1")
+    issuer_public_https = parts.scheme == "https" and bool(parts.hostname)
+    if (not (issuer_loopback or issuer_public_https) or not parts.netloc
+        or parts.username is not None or parts.password is not None
+        or parts.query or parts.fragment):
+      raise ValueError("test RP issuer must be HTTP loopback or HTTPS")
     if (not self.client_id or len(self.client_id) > 128
         or not self.redirect_path.startswith("/") or self.redirect_path.startswith("//")
-        or "?" in self.redirect_path or "#" in self.redirect_path):
+        or "?" in self.redirect_path or "#" in self.redirect_path
+        or any(segment in (".", "..") for segment in self.redirect_path.split("/"))):
       raise ValueError("invalid test RP configuration")
+    if self.route_prefix:
+      if (not re.fullmatch(r"/(?:[A-Za-z0-9._~-]+)(?:/[A-Za-z0-9._~-]+)*", self.route_prefix)
+          or any(segment in (".", "..") for segment in self.route_prefix.split("/"))):
+        raise ValueError("invalid test RP route prefix")
+    if self.public_origin is not None:
+      if not self.route_prefix:
+        raise ValueError("public test RP requires a fixed route prefix")
+      try:
+        origin = urlsplit(self.public_origin)
+        _ = origin.port
+      except ValueError:
+        raise ValueError("invalid test RP public origin") from None
+      if (origin.scheme != "https" or not origin.hostname or not origin.netloc
+          or origin.username is not None or origin.password is not None
+          or origin.path or origin.query or origin.fragment
+          or self.public_origin != f"https://{origin.netloc}"):
+        raise ValueError("invalid test RP public origin")
     if type(self.session_ttl_seconds) is not int or not 1 <= self.session_ttl_seconds <= 3600:
       raise ValueError("invalid test RP session lifetime")
+
+  @property
+  def login_path(self) -> str:
+    return self.route_prefix + "/login"
+
+  @property
+  def callback_route(self) -> str:
+    return self.route_prefix + self.redirect_path
 
 
 class RPFixture:
@@ -71,9 +113,19 @@ class RPFixture:
       self._expire_sessions()
       return len(self._sessions)
 
-  def start(self) -> ThreadingHTTPServer:
+  def start(self, *, bind_host: str = "127.0.0.1", bind_port: int = 0) -> ThreadingHTTPServer:
     if self._server is not None:
       raise RuntimeError("test RP fixture is already running")
+    try:
+      address = ipaddress.ip_address(bind_host)
+    except ValueError:
+      raise ValueError("test RP listener must bind a literal address") from None
+    if address.is_loopback:
+      if type(bind_port) is not int or not 0 <= bind_port <= 65535:
+        raise ValueError("invalid loopback RP listener port")
+    elif (address.version != 4 or address not in ipaddress.ip_network("100.64.0.0/10")
+        or self.config.public_origin is None or bind_port != 18081):
+      raise ValueError("public RP listener must use the configured tailnet address and port")
     owner = self
 
     class Handler(BaseHTTPRequestHandler):
@@ -86,9 +138,9 @@ class RPFixture:
 
       def do_GET(self):
         request_path = urlsplit(self.path).path
-        if request_path == "/login":
+        if request_path == owner.config.login_path:
           owner._login(self)
-        elif request_path == owner.config.redirect_path:
+        elif request_path == owner.config.callback_route:
           owner._callback(self)
         else:
           self._reject()
@@ -102,16 +154,23 @@ class RPFixture:
         self.end_headers()
         self.wfile.write(body)
 
-    self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    self._server = ThreadingHTTPServer((str(address), bind_port), Handler)
     self._server.daemon_threads = True
     self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
     self._thread.start()
     return self._server
 
+  def wait_until_stopped(self):
+    if self._thread is None:
+      raise RuntimeError("test RP fixture is not running")
+    self._thread.join()
+
   def smoke_request(self) -> None:
     if self._server is None:
       raise RuntimeError("RP fixture is not running")
-    connection = http.client.HTTPConnection("127.0.0.1", self._server.server_port, timeout=2)
+    host = str(self._server.server_address[0])
+    port = int(self._server.server_address[1])
+    connection = http.client.HTTPConnection(host, port, timeout=2)
     try:
       connection.request("GET", "/not-a-route")
       response = connection.getresponse()
@@ -138,13 +197,16 @@ class RPFixture:
     return {}
 
   def _redirect_uri(self) -> str:
+    callback_path = self.config.callback_route
+    if self.config.public_origin is not None:
+      return self.config.public_origin + callback_path
     assert self._server is not None
     host, port = self._server.server_address
-    return f"http://{host}:{port}{self.config.redirect_path}"
+    return f"http://{host}:{port}{callback_path}"
 
   def _issuer_metadata(self) -> dict:
     metadata_url = self.config.issuer.rstrip("/") + "/.well-known/openid-configuration"
-    with _open_local(Request(metadata_url, headers={"Accept": "application/json"}), timeout=3) as response:
+    with _open_issuer_request(Request(metadata_url, headers={"Accept": "application/json"}), timeout=3) as response:
       if response.status != 200:
         raise ValueError("issuer metadata unavailable")
       metadata = json.loads(response.read(32769))
@@ -152,11 +214,25 @@ class RPFixture:
         or not all(isinstance(metadata.get(name), str) for name in
             ("authorization_endpoint", "token_endpoint", "jwks_uri"))):
       raise ValueError("issuer metadata invalid")
+    issuer_parts = urlsplit(self.config.issuer)
+    try:
+      issuer_origin = (issuer_parts.scheme, issuer_parts.hostname,
+          issuer_parts.port or (443 if issuer_parts.scheme == "https" else 80))
+    except ValueError as error:
+      raise ValueError("issuer URL invalid") from error
     for name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
       endpoint = urlsplit(metadata[name])
-      issuer = urlsplit(self.config.issuer)
-      if endpoint.scheme != "http" or endpoint.hostname != issuer.hostname or endpoint.port != issuer.port:
-        raise ValueError("issuer endpoint outside configured loopback issuer")
+      try:
+        endpoint_origin = (endpoint.scheme, endpoint.hostname,
+            endpoint.port or (443 if endpoint.scheme == "https" else 80))
+      except ValueError as error:
+        raise ValueError("issuer endpoint invalid") from error
+      allowed_scheme = endpoint.scheme == "https" or (
+          endpoint.scheme == "http" and endpoint.hostname in ("127.0.0.1", "::1"))
+      if (not allowed_scheme or endpoint_origin != issuer_origin
+          or endpoint.username is not None or endpoint.password is not None
+          or endpoint.query or endpoint.fragment):
+        raise ValueError("issuer endpoint outside configured issuer origin")
     return metadata
 
   def _login(self, handler):
@@ -185,7 +261,10 @@ class RPFixture:
         "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256"})
     handler.send_response(302)
     handler.send_header("Location", metadata["authorization_endpoint"] + "?" + parameters)
-    handler.send_header("Set-Cookie", f"rp_browser={browser}; HttpOnly; SameSite=Lax; Path=/")
+    cookie_path = self.config.route_prefix or "/"
+    secure = "; Secure" if self.config.public_origin is not None else ""
+    handler.send_header("Set-Cookie",
+        f"rp_browser={browser}; HttpOnly; SameSite=Lax; Path={cookie_path}{secure}")
     handler.send_header("Cache-Control", "no-store")
     handler.send_header("Content-Length", "0")
     handler.end_headers()
@@ -243,7 +322,7 @@ class RPFixture:
         "code_verifier": verifier}).encode("ascii")
     request = Request(endpoint, data=body, headers={
         "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, method="POST")
-    with _open_local(request, timeout=3) as response:
+    with _open_issuer_request(request, timeout=3) as response:
       if response.status != 200:
         raise ValueError("token exchange failed")
       result = json.loads(response.read(32769))
@@ -279,7 +358,7 @@ class RPFixture:
     claims = object_json(decode(pieces[1]))
     if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
       raise ValueError("invalid ID token algorithm")
-    with _open_local(Request(jwks_uri, headers={"Accept": "application/json"}), timeout=3) as response:
+    with _open_issuer_request(Request(jwks_uri, headers={"Accept": "application/json"}), timeout=3) as response:
       if response.status != 200:
         raise ValueError("issuer keys unavailable")
       jwks = json.loads(response.read(65537))
@@ -321,20 +400,60 @@ class RPFixture:
 
 
 def main(argv: list[str] | None = None) -> int:
-  parser = argparse.ArgumentParser(description="Test-only relying-party fixture startup smoke")
-  parser.add_argument("--smoke", action="store_true", required=True,
-                      help="start, probe, and stop a loopback listener without issuer access")
+  parser = argparse.ArgumentParser(description="Test-only OIDC relying-party fixture")
+  modes = parser.add_mutually_exclusive_group(required=True)
+  modes.add_argument("--smoke", action="store_true",
+      help="start, probe, and stop a loopback listener without issuer access")
+  modes.add_argument("--serve", action="store_true",
+      help="serve the explicitly configured test RP on a loopback or tailnet address")
+  parser.add_argument("--issuer", help="exact configured issuer URL")
+  parser.add_argument("--client-id", help="public OIDC client identifier")
+  parser.add_argument("--public-origin", help="exact external HTTPS origin, without a path")
+  parser.add_argument("--route-prefix", help="fixed public RP path prefix, e.g. /rp")
+  parser.add_argument("--bind-host", help="literal listener address; no wildcard or hostname")
+  parser.add_argument("--port", type=int, default=18081,
+      help="listener port (18081 for tailnet mode; zero is loopback-only)")
+  parser.add_argument("--session-ttl-seconds", type=int, default=60)
   args = parser.parse_args(argv)
-  fixture = RPFixture(FixtureConfig("http://127.0.0.1:1/issuer", "local-smoke"))
+  if args.smoke:
+    if any((args.issuer, args.client_id, args.public_origin, args.route_prefix,
+            args.bind_host)) or args.port != 18081 or args.session_ttl_seconds != 60:
+      parser.error("--smoke does not accept serving configuration")
+    fixture = RPFixture(FixtureConfig("http://127.0.0.1:1/issuer", "local-smoke"))
+    try:
+      fixture.start()
+      fixture.smoke_request()
+    except Exception:
+      print("RP fixture smoke failed", file=sys.stderr)
+      return 1
+    finally:
+      fixture.close()
+    print("RP fixture smoke passed")
+    return 0
+
+  if (not args.issuer or not args.client_id or not args.public_origin
+      or args.route_prefix is None or not args.bind_host):
+    parser.error("--serve requires issuer, client ID, public origin, route prefix, and bind host")
   try:
-    fixture.start()
-    fixture.smoke_request()
-  except Exception:
-    print("RP fixture smoke failed", file=sys.stderr)
-    return 1
+    fixture = RPFixture(FixtureConfig(args.issuer, args.client_id,
+        session_ttl_seconds=args.session_ttl_seconds,
+        public_origin=args.public_origin, route_prefix=args.route_prefix))
+    server = fixture.start(bind_host=args.bind_host, bind_port=args.port)
+  except (OSError, ValueError):
+    print("RP fixture configuration or listener failed", file=sys.stderr)
+    return 2
+
+  def stop(_signum, _frame):
+    raise SystemExit(0)
+
+  signal.signal(signal.SIGTERM, stop)
+  print(f"RP fixture ready; port={server.server_port}", flush=True)
+  try:
+    fixture.wait_until_stopped()
+  except KeyboardInterrupt:
+    return 0
   finally:
     fixture.close()
-  print("RP fixture smoke passed")
   return 0
 
 

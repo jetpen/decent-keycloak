@@ -1,6 +1,6 @@
 # `keycloakctl` offline foundation
 
-> **Historical foundation reference, not the current Issue #74 CLI contract.** The readiness/qualification examples and remote-phase descriptions below document an earlier mixed-scope design. The current Issue #74 checkpoint is local-only: `full` accepts `dev`/`ci`, runs local preparation/build/test, and seals only a local-only run-intent receipt. It does not implement readiness/qualification phases or the proposed #73 owner-approved qualification intent. See [the current offline/local migration map](issue-74-offline-migration-map.md) for this candidate's contract.
+> **Historical foundation reference, not the current Issue #74 CLI contract.** The readiness/qualification examples and remote-phase descriptions below document an earlier mixed-scope design. The current checkpoint is local-only: `full` accepts `dev`, `ci`, `readiness`, and `qualification` profiles for local preparation/build/test and seals a local-only run-intent receipt. Readiness/qualification profiles do not enable remote lifecycle or qualification execution, and the proposed #73 owner-approved qualification intent is not implemented. See [the current offline/local migration map](issue-74-offline-migration-map.md) for this candidate's contract.
 
 **This PR is an offline-foundation checkpoint for Issue #74, not completion of
 that issue.** It adds the local setup/build/test path and a bounded read-only
@@ -85,17 +85,18 @@ Do not pass secrets in config or argv. Raw configuration values, authorization
 flags, and paths are not written to the manifest or echoed in refusals.
 
 Only remote profiles accept `remote`. Its non-secret inputs can be incomplete
-at setup. The current preflight guard requires a valid configured Tailscale SSH
-user and an exact expected Tailscale DNS name (`target_dns_name`), distinct
-target/proxy Tailscale IPv4 addresses, one public HTTPS origin
-of the form `https://<DNS-host>[:port]`
-(maximum 267 characters: DNS host at most 253 characters; optional canonical
-port 1–65535), with no credentials, path, query or fragment, and
-`route_attested: true` for the operator's route, ACL and forwarded-header review.
-The default SSH target name is `ben-x260`; `target_host` can override it. Set
-`target_dns_name` to the exact expected Tailscale `Self.DNSName` (without a
-trailing dot); this is checked separately from the SSH target alias. The `.invalid`
-examples are intentionally non-runnable.
+at setup. Before live preflight, the config must provide the canonical
+Keycloak issuer/App Link origin in `public_origin`, a separate test-RP HTTPS
+origin in `rp_public_origin` with a different DNS hostname, a valid configured
+Tailscale SSH user and exact expected Tailscale DNS name (`target_dns_name`),
+distinct target/proxy Tailscale IPv4 addresses, and `route_attested: true` for
+the operator's route, ACL and forwarded-header review. Both origins use the form
+`https://<DNS-host>[:port]` (maximum 267 characters: DNS host at most 253
+characters; optional canonical port 1–65535), with no credentials, path, query
+or fragment. The default SSH target name is `ben-x260`; `target_host` can
+override it. Set `target_dns_name` to the exact expected Tailscale
+`Self.DNSName` (without a trailing dot); this is checked separately from the
+SSH target alias. The `.invalid` examples are intentionally non-runnable.
 
 Read-only `preflight` is repeatable for local and live profiles. For local
 `dev`/`ci` runs, it requires Python 3.11.13, Java 21, Maven, and Git, then validates
@@ -109,9 +110,9 @@ exactly `true`. Probe output is
 not printed, no images are built/pulled/run/removed, no Tailscale command is
 invoked, and no run state is written. Success prints only `preflight passed`.
 
-## Historical live-profile design reference (not implemented by this candidate)
+## Historical remote-phase design reference (not implemented by this candidate)
 
-The following live-profile descriptions are retained as design history only. They are not supported by the current CLI: this candidate's `full` command accepts only local `dev`/`ci` profiles, performs local preparation/build/test, and stops with a local-only run-intent receipt. Remote readiness, qualification, publish, deploy, and teardown are deferred.
+The following remote/live-phase descriptions are retained as design history only. This candidate's `full` command accepts `readiness` and `qualification` for local preparation/build/test, but stops before remote lifecycle or qualification execution with a local-only run-intent receipt. Remote readiness execution, qualification cases, publish, deploy, and teardown remain deferred.
 
 For live readiness/qualification profiles preflight retains the existing local
 `tailscale version` and `podman --version` checks, then uses `tailscale ssh` with the configured target user and host.
@@ -130,14 +131,19 @@ user/host are validated config fields.
 This implements only the bounded local-toolchain/engine subclaim plus the
 existing live target-identity/rootless-container subclaims of criterion 6;
 criterion 6 remains partial. The local `dev`/`ci` check does not verify target
-identity or the planned topology. The planned topology uses tailnet listeners on ports 18080 and
-18081, public routes `/keycloak` and `/rp`, and Wallet App Links at
-`/.well-known/assetlinks.json`; this command does not verify that topology. It
-does not verify proxy Tailscale identity, fixed-port availability, actual
-reviewed ACL or forwarded-header evidence beyond the operator's `route_attested`
-boolean, public DNS/TLS, the App Links document, or configured origin/proxy-route
-behavior. Those checks, as well as all deployment and live qualification
-activity, remain out of scope for this bounded local check.
+identity or the planned topology. The current diagnostic route proposal uses
+the canonical Keycloak issuer/App Link authority
+`https://benx1.tailca8b51.ts.net/realms/<realm>`, a separately served
+`/.well-known/assetlinks.json` on `benx1`, and the RP fixture at a distinct
+`https://ben-x260.tailca8b51.ts.net/rp` authority. This proposal is pending owner
+review before any deployment. `/keycloak` is not a second issuer and remains
+private/unconfigured. The exact realm/path allowlist, forwarded-header
+contract, ACL, and route attestation remain pending; this command does not
+verify that topology. It does not verify proxy Tailscale identity, fixed-port
+availability, reviewed ACL or forwarded-header evidence beyond the operator's
+`route_attested` boolean, public DNS/TLS, the App Links document, or configured
+origin/proxy-route behavior. Those checks, as well as all deployment and live
+qualification activity, remain out of scope for this bounded local check.
 
 ## Local build and remaining gated phases
 
