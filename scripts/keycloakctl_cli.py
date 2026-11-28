@@ -17,6 +17,7 @@ import sys
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 
@@ -197,7 +198,11 @@ def validate_artifact_bytes(baseline_raw: bytes, projection_raw: bytes,
     canonical_projection = json.dumps(
         projection, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         allow_nan=False).encode("utf-8")
+    route = baseline["route"]
+    route_hosts = (urlsplit(route["public_origin"]).hostname,
+                   urlsplit(route["rp_public_origin"]).hostname)
     if (projection_raw != canonical_projection
+        or route_hosts[0] == route_hosts[1]
         or sha256(config_raw).hexdigest() != baseline["runtime_config"]["sha256"]
         or sha256(projection_raw).hexdigest() != baseline["case_inventory"]["sha256"]
         or baseline["case_inventory"]["case_ids"] != case_ids
@@ -411,9 +416,15 @@ def guard_phase(phase: str, state: dict, config: dict | None) -> None:
 
   if phase == "preflight" and profile in LIVE_PROFILES:
     remote = (config or {}).get("remote", {})
-    required = {"target_user", "target_dns_name", "target_ip", "proxy_ip", "public_origin"}
+    required = {"target_user", "target_dns_name", "target_ip", "proxy_ip",
+                "public_origin", "rp_public_origin"}
+    issuer_host = urlsplit(remote.get("public_origin", "")).hostname
+    rp_host = urlsplit(remote.get("rp_public_origin", "")).hostname
     if (not required <= remote.keys() or remote.get("route_attested") is not True
-        or remote["target_ip"] == remote["proxy_ip"] or remote["public_origin"].endswith(".invalid")):
+        or remote["target_ip"] == remote["proxy_ip"]
+        or remote["public_origin"].endswith(".invalid")
+        or remote["rp_public_origin"].endswith(".invalid")
+        or issuer_host == rp_host):
       raise Rejected("preflight requires matching operator inputs and route attestation")
 
 
@@ -1118,6 +1129,21 @@ def perform_test(state: dict, config: dict | None) -> None:
   if fixture_smoke.returncode or fixture_smoke.stdout.strip() != "RP fixture smoke passed":
     record_test_failure(state, "rp-fixture-smoke")
     raise Unavailable("RP fixture image smoke failed")
+
+  fixture_help_command = [engine, "run", "--rm", "--network=none",
+      fixture_image_id, "--help"]
+  try:
+    fixture_help = subprocess.run(fixture_help_command, cwd=ROOT, capture_output=True,
+        text=True, check=False, timeout=120)
+  except (OSError, subprocess.TimeoutExpired):
+    record_test_failure(state, "rp-fixture-smoke")
+    raise Unavailable("RP fixture image service CLI smoke failed") from None
+  required_service_options = ("--serve", "--issuer", "--client-id", "--public-origin",
+                              "--route-prefix", "--bind-host", "--port")
+  if (fixture_help.returncode
+      or any(option not in fixture_help.stdout for option in required_service_options)):
+    record_test_failure(state, "rp-fixture-smoke")
+    raise Unavailable("RP fixture image service CLI smoke failed")
 
   diff_command = [sys.executable, "scripts/lifecycle.py", "diff-check"]
   try:

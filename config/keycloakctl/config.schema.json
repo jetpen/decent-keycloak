@@ -37,6 +37,13 @@
         "proxy_ip": {"$ref": "#/properties/remote/properties/target_ip"},
         "public_origin": {
           "type": "string",
+          "description": "Canonical Keycloak issuer/App Link HTTPS origin, without a path.",
+          "maxLength": 267,
+          "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?![\\s\\S])"
+        },
+        "rp_public_origin": {
+          "type": "string",
+          "description": "Separate test-RP HTTPS origin, without a path; hostname must differ from public_origin.",
           "maxLength": 267,
           "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?![\\s\\S])"
         },

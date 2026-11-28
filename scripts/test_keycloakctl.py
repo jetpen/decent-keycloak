@@ -1857,6 +1857,9 @@ if args[0] == "build": print("build complete")
 elif args[:3] == ["image", "inspect", "--format"]:
   image = args[-1]
   print(image if image.startswith("sha256:") else ("1" if "provider" in image else "2") * 64)
+elif args[:3] == ["run", "--rm", "--network=none"] and args[-1] == "--help":
+  print("--serve --issuer --client-id --public-origin --route-prefix --bind-host --port")
+  raise SystemExit(int(os.environ.get("RP_HELP_EXIT", "0")))
 elif args[:3] == ["run", "--rm", "--network=none"]:
   image = next(value for value in args if value.startswith("sha256:"))
   if image.startswith("sha256:" + "1" * 64):
@@ -1885,6 +1888,9 @@ else: raise SystemExit(91)
     failed_fixture_smoke_run = self.setup_run()
     fixture_build = self.cli("build", "--run-id", failed_fixture_smoke_run)
     self.assertEqual(0, fixture_build.returncode, fixture_build.stderr)
+    failed_fixture_help_run = self.setup_run()
+    fixture_help_build = self.cli("build", "--run-id", failed_fixture_help_run)
+    self.assertEqual(0, fixture_help_build.returncode, fixture_help_build.stderr)
     failed_compile_run = self.setup_run()
     compile_build = self.cli("build", "--run-id", failed_compile_run)
     self.assertEqual(0, compile_build.returncode, compile_build.stderr)
@@ -1952,17 +1958,19 @@ if __name__ == "__main__":
     engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
     smoke_commands = [command for command in engine_commands
                       if command[:3] == ["run", "--rm", "--network=none"]]
-    self.assertEqual(2, len(smoke_commands))
+    self.assertEqual(3, len(smoke_commands))
     self.assertEqual(["run", "--rm", "--network=none", "--entrypoint",
                       "/opt/keycloak/bin/kc.sh", "sha256:" + "1" * 64, "--version"],
                      smoke_commands[0])
     self.assertEqual(["run", "--rm", "--network=none", "sha256:" + "2" * 64, "--smoke"],
                      smoke_commands[1])
+    self.assertEqual(["run", "--rm", "--network=none", "sha256:" + "2" * 64, "--help"],
+                     smoke_commands[2])
 
     resumed = self.cli("test", "--run-id", run_id)
     self.assertEqual((0, "test verified\n", ""), (resumed.returncode, resumed.stdout, resumed.stderr))
     self.assertEqual("passed\n", test_log.read_text())
-    self.assertEqual(2, sum(command[:3] == ["run", "--rm", "--network=none"]
+    self.assertEqual(3, sum(command[:3] == ["run", "--rm", "--network=none"]
                              for command in map(json.loads, engine_log.read_text().splitlines())))
     java_test_source = next((self.repo / "src/test/java").rglob("*.java"))
     java_test_source.write_text(java_test_source.read_text() + chr(10) + "// test input changed")
@@ -1997,7 +2005,7 @@ if __name__ == "__main__":
     self.assertFalse(test_log.exists())
     self.assertEqual(["java-tests", "surefire"], step_log.read_text().splitlines()[-2:])
     engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
-    self.assertEqual(2, sum(command[:3] == ["run", "--rm", "--network=none"]
+    self.assertEqual(3, sum(command[:3] == ["run", "--rm", "--network=none"]
                              for command in engine_commands))
 
     self.env["MAVEN_EXIT"] = "0"
@@ -2012,7 +2020,21 @@ if __name__ == "__main__":
     self.assertEqual("rp-fixture-smoke", fixture_failure["phase"])
     self.assertFalse((self.run_directory(failed_fixture_smoke_run) / "test.json").exists())
     engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
-    self.assertEqual(4, sum(command[:3] == ["run", "--rm", "--network=none"]
+    self.assertEqual(5, sum(command[:3] == ["run", "--rm", "--network=none"]
+                             for command in engine_commands))
+
+    self.env["RP_SMOKE_EXIT"] = "0"
+    self.env["RP_HELP_EXIT"] = "19"
+    failed_fixture_help = self.cli("test", "--run-id", failed_fixture_help_run)
+    self.assertEqual((3, "", "error: RP fixture image service CLI smoke failed\n"),
+                     (failed_fixture_help.returncode, failed_fixture_help.stdout,
+                      failed_fixture_help.stderr))
+    fixture_help_failure = json.loads(next(self.run_directory(failed_fixture_help_run)
+                                           .glob("failure-*.json")).read_text())
+    self.assertEqual("rp-fixture-smoke", fixture_help_failure["phase"])
+    self.assertFalse((self.run_directory(failed_fixture_help_run) / "test.json").exists())
+    engine_commands = [json.loads(line) for line in engine_log.read_text().splitlines()]
+    self.assertEqual(8, sum(command[:3] == ["run", "--rm", "--network=none"]
                              for command in engine_commands))
 
     self.env["PYTHON_COMPILE_EXIT"] = "17"
@@ -2029,6 +2051,7 @@ if __name__ == "__main__":
 
     self.env["PYTHON_COMPILE_EXIT"] = "0"
     self.env["RP_SMOKE_EXIT"] = "0"
+    self.env["RP_HELP_EXIT"] = "0"
     self.env["DIFF_CHECK_EXIT"] = "21"
     failed_diff = self.cli("test", "--run-id", failed_diff_run)
     self.assertEqual((3, "", "error: diff check failed\n"),
@@ -2544,7 +2567,8 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
         "target_host": "ben-x260", "target_dns_name": "ben-x260.tailnet.ts.net",
         "target_user": "ben",
         "target_ip": "100.64.12.100", "proxy_ip": "100.127.12.101",
-        "public_origin": "https://fictional-keycloak.example.org", "route_attested": True,
+        "public_origin": "https://fictional-keycloak.example.org",
+        "rp_public_origin": "https://fictional-rp.example.org", "route_attested": True,
     }}
 
   def test_full_resume_accepts_only_the_same_local_run(self):
@@ -2668,8 +2692,13 @@ if os.environ.get("FAIL_TOOL") == "podman": raise SystemExit(1)
 
   def test_remote_preflight_rejects_missing_or_placeholder_operator_inputs(self):
     config = self.live_config()
+    missing_rp_origin = dict(config["remote"])
+    missing_rp_origin.pop("rp_public_origin")
     for remote in ({}, {**config["remote"], "route_attested": False},
                    {**config["remote"], "public_origin": "https://readiness.example.invalid"},
+                   {**config["remote"], "rp_public_origin": "https://rp.example.invalid"},
+                   {**config["remote"], "rp_public_origin": "https://fictional-keycloak.example.org:8443"},
+                   missing_rp_origin,
                    {**config["remote"], "proxy_ip": config["remote"]["target_ip"]}):
       with self.subTest(remote=remote):
         path = self.config_file({**config, "remote": remote})
@@ -2816,6 +2845,7 @@ class ArtifactValidationCliTest(unittest.TestCase):
                           "operator_scope_ref": "restricted/operators"},
         "route": {"route_id": "route-17", "configuration_sha256": "3" * 64,
                   "public_origin": "https://keycloak.example.net:8443/",
+                  "rp_public_origin": "https://rp.example.net",
                   "forwarded_header_contract_sha256": "4" * 64,
                   "owner_attestation_ref": "restricted/route"},
         "software_constraints": {"keycloak_source_ref": "source/keycloak", "rp_fixture_source_ref": "source/rp",
@@ -2999,8 +3029,19 @@ class ArtifactValidationCliTest(unittest.TestCase):
         self.write_artifacts(baseline=invalid)
         self.assert_rejected_without_leak()
 
+    for origin in ("http://rp.example.net/", "https://user@rp.example.net/",
+                   "https://rp.example.net/", "https://rp.example.net/path",
+                   "https://rp.example.net/?token=x", "https://rp.example.net/#fragment",
+                   "mailto:operator@example.net", "https://keycloak.example.net:9443/"):
+      with self.subTest(rp_origin=origin):
+        invalid = json.loads(json.dumps(self.baseline))
+        invalid["route"]["rp_public_origin"] = origin
+        self.write_artifacts(baseline=invalid)
+        self.assert_rejected_without_leak()
+
     valid = json.loads(json.dumps(self.baseline))
     valid["route"]["public_origin"] = "https://keycloak.example.net:8443/"
+    valid["route"]["rp_public_origin"] = "https://rp.example.net:9443"
     self.write_artifacts(baseline=valid)
     result = self.validate()
     self.assertEqual((0, "artifacts valid\n", ""), (result.returncode, result.stdout, result.stderr))
